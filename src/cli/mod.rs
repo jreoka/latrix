@@ -73,11 +73,17 @@ pub enum Cmd {
     Deploy(DeployArgs),
     /// Cluster overview: machines, apps, recent events
     Status,
-    /// List apps
-    Apps,
+    /// List apps (also: apps list, apps show <app>, apps destroy <app>)
+    #[command(visible_alias = "app")]
+    Apps {
+        #[command(subcommand)]
+        action: Option<AppsCmd>,
+    },
     /// Show an app's instances, URLs, volumes and releases
+    #[command(visible_alias = "show", alias = "info")]
     Ps { app: String },
     /// Show / follow an app's logs from all instances
+    #[command(alias = "log")]
     Logs {
         app: String,
         /// Keep streaming new lines
@@ -114,18 +120,11 @@ pub enum Cmd {
     Rollback { app: String, version: Option<u64> },
     /// List an app's releases
     Releases { app: String },
-    /// Delete an app and its instances
-    Destroy {
-        app: String,
-        /// Don't ask for confirmation
-        #[arg(short, long)]
-        yes: bool,
-        /// Also delete the app's volume data on every machine
-        #[arg(long)]
-        purge_volumes: bool,
-    },
+    /// Delete an app: its instances, images and volume data
+    #[command(visible_alias = "rm", alias = "delete")]
+    Destroy(DestroyArgs),
     /// Manage secrets (environment variables kept out of latrix.toml)
-    #[command(subcommand)]
+    #[command(subcommand, alias = "secret")]
     Secrets(SecretsCmd),
     /// Open a shell (or run a command) inside an instance
     Console {
@@ -135,7 +134,7 @@ pub enum Cmd {
         cmd: Vec<String>,
     },
     /// Add, create, drain and update machines
-    #[command(subcommand)]
+    #[command(subcommand, visible_alias = "machines")]
     Machine(MachineCmd),
     /// Cloud provider API tokens and sizes/prices
     #[command(subcommand)]
@@ -172,12 +171,24 @@ pub enum Cmd {
         /// Only this machine
         machine: Option<String>,
     },
-    /// List volumes and their replicas
-    Volumes,
+    /// List volumes, including data left on disk by removed apps (also: volumes prune)
+    #[command(visible_alias = "volume", alias = "vol")]
+    Volumes {
+        #[command(subcommand)]
+        action: Option<VolumesCmd>,
+    },
     /// List TLS certificates
-    Certs,
+    #[command(alias = "cert")]
+    Certs {
+        #[command(subcommand)]
+        action: Option<ListCmd>,
+    },
     /// Recent cluster events (deploys, failovers, moves, updates)
-    Events,
+    #[command(alias = "event")]
+    Events {
+        #[command(subcommand)]
+        action: Option<ListCmd>,
+    },
     /// Show or change cluster settings (updates window, ACME email, ...)
     Settings {
         /// key=value pairs to set, e.g. update_window=01:00-04:00 acme_email=me@example.com
@@ -237,6 +248,54 @@ pub enum Cmd {
     Agent(AgentCmd),
 }
 
+#[derive(Args, Clone)]
+pub struct DestroyArgs {
+    pub app: String,
+    /// Don't ask for confirmation
+    #[arg(short, long)]
+    pub yes: bool,
+    /// Keep the app's volume data on the machines (deleted by default)
+    #[arg(long)]
+    pub keep_volumes: bool,
+    /// (old flag; volume data is now deleted by default)
+    #[arg(long, hide = true)]
+    pub purge_volumes: bool,
+}
+
+#[derive(Subcommand)]
+pub enum AppsCmd {
+    /// List apps
+    #[command(alias = "ls")]
+    List,
+    /// Show an app's instances, URLs, volumes and releases
+    #[command(alias = "ps", alias = "info")]
+    Show { app: String },
+    /// Delete an app: its instances, images and volume data
+    #[command(alias = "rm", alias = "delete")]
+    Destroy(DestroyArgs),
+}
+
+#[derive(Subcommand)]
+pub enum VolumesCmd {
+    /// List volumes (and unattached data left on disk)
+    #[command(alias = "ls")]
+    List,
+    /// Delete volume data that no app uses any more
+    #[command(alias = "clean")]
+    Prune {
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ListCmd {
+    /// List them (same as without a subcommand)
+    #[command(alias = "ls")]
+    List,
+}
+
 #[derive(Args)]
 pub struct DeployArgs {
     /// Path to latrix.toml
@@ -264,8 +323,10 @@ pub enum SecretsCmd {
     /// Set secrets: latrix secrets set myapp KEY=value OTHER=value
     Set { app: String, pairs: Vec<String> },
     /// Remove secrets
+    #[command(alias = "rm", alias = "delete")]
     Unset { app: String, names: Vec<String> },
     /// List secret names
+    #[command(alias = "ls")]
     List { app: String },
 }
 
@@ -321,8 +382,10 @@ pub enum MachineCmd {
         agent_binary: Option<PathBuf>,
     },
     /// List machines with load, updates and cost
+    #[command(alias = "ls")]
     List,
     /// Drain a machine (moves everything off), then remove it
+    #[command(alias = "rm", alias = "delete")]
     Remove {
         name: String,
         /// Remove without draining
@@ -463,6 +526,7 @@ pub enum K8sCmd {
 #[derive(Subcommand)]
 pub enum ClusterCmd {
     /// List configured clusters
+    #[command(alias = "ls")]
     List,
     /// Make a cluster the default
     Use { name: String },

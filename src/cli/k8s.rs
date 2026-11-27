@@ -791,7 +791,9 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
             deploy(&t, &app, &base, args.message).await
         }
         Cmd::Status => status(name, &t).await,
-        Cmd::Apps => status(name, &t).await,
+        Cmd::Apps { action: None | Some(AppsCmd::List) } => status(name, &t).await,
+        Cmd::Apps { action: Some(AppsCmd::Show { app }) } => ps(&k, &app).await,
+        Cmd::Apps { action: Some(AppsCmd::Destroy(a)) } => destroy(&k, &t, a).await,
         Cmd::Ps { app } => ps(&k, &app).await,
         Cmd::Releases { app } => {
             print_history(&load_history(&k, &app).await?);
@@ -876,24 +878,7 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
             };
             release(&k, target.config, target.image, format!("rollback to v{}", target.version)).await
         }
-        Cmd::Destroy { app, yes, purge_volumes } => {
-            if !yes {
-                print!("Destroy app '{app}' in namespace {}? Type the app name to confirm: ", t.namespace);
-                std::io::stdout().flush()?;
-                let mut line = String::new();
-                std::io::stdin().read_line(&mut line)?;
-                if line.trim() != app {
-                    bail!("aborted");
-                }
-            }
-            let sel = format!("app.kubernetes.io/name={app}");
-            k.run(&["delete", "deployment,statefulset,service,ingress,hpa,configmap,secret", "-l", &sel, "--ignore-not-found"]).await?;
-            if purge_volumes {
-                k.run(&["delete", "pvc", "-l", &sel, "--ignore-not-found"]).await?;
-            }
-            println!("destroyed {app}{}", if purge_volumes { "" } else { " (PersistentVolumeClaims kept; --purge-volumes deletes them)" });
-            Ok(())
-        }
+        Cmd::Destroy(a) => destroy(&k, &t, a).await,
         Cmd::Secrets(s) => {
             let (app, set, unset, list) = match s {
                 SecretsCmd::Set { app, pairs } => {
@@ -944,19 +929,19 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
             let st = k.interactive(&refs)?;
             std::process::exit(st.code().unwrap_or(1));
         }
-        Cmd::Volumes => {
+        Cmd::Volumes { .. } => {
             let out = k.run(&["get", "pvc", "-l", MANAGED]).await?;
             print!("{}", if out.trim().is_empty() { "no volumes\n".to_string() } else { out });
             Ok(())
         }
-        Cmd::Certs => {
+        Cmd::Certs { .. } => {
             match k.run(&["get", "certificates"]).await {
                 Ok(out) => print!("{out}"),
                 Err(_) => println!("cert-manager is not installed. Set up HTTPS with `latrix k8s setup-tls --email you@example.com`"),
             }
             Ok(())
         }
-        Cmd::Events => {
+        Cmd::Events { .. } => {
             print!("{}", k.run(&["get", "events", "--sort-by=.lastTimestamp"]).await?);
             Ok(())
         }
@@ -976,6 +961,31 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
             bail!("not supported for Kubernetes targets")
         }
     }
+}
+
+async fn destroy(k: &Kube, t: &K8sTarget, a: DestroyArgs) -> Result<()> {
+    let app = a.app.clone();
+    let purge = !a.keep_volumes;
+    if !a.yes {
+        print!(
+            "Destroy app '{app}' in namespace {}{}? Type the app name to confirm: ",
+            t.namespace,
+            if purge { " and DELETE its volumes" } else { " (keeping its volumes)" }
+        );
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().read_line(&mut line)?;
+        if line.trim() != app {
+            bail!("aborted");
+        }
+    }
+    let sel = format!("app.kubernetes.io/name={app}");
+    k.run(&["delete", "deployment,statefulset,service,ingress,hpa,configmap,secret", "-l", &sel, "--ignore-not-found"]).await?;
+    if purge {
+        k.run(&["delete", "pvc", "-l", &sel, "--ignore-not-found"]).await?;
+    }
+    println!("destroyed {app}{}", if purge { "" } else { " (PersistentVolumeClaims kept)" });
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

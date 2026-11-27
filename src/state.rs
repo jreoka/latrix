@@ -253,6 +253,10 @@ pub struct Settings {
     /// estimate exceeds it.
     #[serde(default)]
     pub monthly_budget: f64,
+    /// Volume data no app uses (on a given machine) is deleted automatically
+    /// after this many days. 0 = on the next scan.
+    #[serde(default = "three")]
+    pub volume_retention_days: f64,
     /// Let latrix buy, resize and delete servers by itself (needs a provider token).
     #[serde(default)]
     pub autopilot: bool,
@@ -264,6 +268,9 @@ pub struct Settings {
     pub max_machines: u32,
 }
 
+fn three() -> f64 {
+    3.0
+}
 fn one() -> u32 {
     1
 }
@@ -289,6 +296,7 @@ impl Default for Settings {
             acme_staging: false,
             base_domain: String::new(),
             monthly_budget: 0.0,
+            volume_retention_days: 3.0,
             autopilot: false,
             min_machines: 1,
             max_machines: 5,
@@ -416,6 +424,9 @@ pub struct NodeReport {
     pub maintenance_done: Option<String>,
     #[serde(default)]
     pub build_cache_gb: f64,
+    /// Events raised on this machine since the last report.
+    #[serde(default)]
+    pub events: Vec<Event>,
     /// False when this machine's Docker daemon is not answering.
     #[serde(default = "yes")]
     pub docker_ok: bool,

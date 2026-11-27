@@ -68,6 +68,7 @@ pub struct Agent {
     pub sampler: metrics::Sampler,
     pub autopilot: autopilot::Shared,
     pub mesh_up: std::sync::atomic::AtomicBool,
+    pub outbox: Mutex<Vec<Event>>,
 }
 
 impl Agent {
@@ -99,12 +100,21 @@ impl Agent {
             "warn" => warn!("{msg}"),
             _ => info!("{msg}"),
         }
-        let mut ev = self.events.lock().unwrap();
-        ev.push_back(Event {
+        let e = Event {
             ts: now(),
             level: level.into(),
             message: msg,
-        });
+        };
+        // Followers forward their events to the leader with the next report.
+        if !self.is_leader() {
+            let mut out = self.outbox.lock().unwrap();
+            out.push(e.clone());
+            if out.len() > 50 {
+                out.remove(0);
+            }
+        }
+        let mut ev = self.events.lock().unwrap();
+        ev.push_back(e);
         while ev.len() > 200 {
             ev.pop_front();
         }
@@ -281,6 +291,7 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
         sampler: Default::default(),
         autopilot: Default::default(),
         mesh_up: std::sync::atomic::AtomicBool::new(false),
+        outbox: Mutex::new(vec![]),
     });
 
     if !dev {

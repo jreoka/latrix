@@ -208,6 +208,7 @@ impl Agent {
             maintenance_done: self.maintenance_done.lock().unwrap().clone(),
             build_cache_gb: self.rt.build_cache_gb(),
             docker_ok: self.rt.docker_ok(),
+            events: vec![],
         }
     }
 
@@ -309,10 +310,11 @@ pub async fn report_loop(agent: Arc<Agent>) {
     loop {
         tick.tick().await;
         let Some(leader) = agent.leader() else { continue };
-        let report = agent.build_report();
         if leader == agent.me.machine_id {
             continue; // the leader reads its own report directly
         }
+        let mut report = agent.build_report();
+        report.events = std::mem::take(&mut *agent.outbox.lock().unwrap());
         let Some(ip) = agent.ip_of(leader) else { continue };
         let url = format!("http://{ip}:{API_PORT}/v1/local/report");
         let res = agent

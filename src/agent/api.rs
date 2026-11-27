@@ -56,6 +56,7 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/v1/local/build", post(builder::handle_build))
         .route("/v1/local/logs", get(runtime::handle_logs))
         .route("/v1/local/volume-data", get(super::transfer::get_volume).post(super::transfer::put_volume))
+        .route("/v1/local/unused-volumes", get(super::volumes::handle_unused).delete(super::volumes::handle_unused))
         .route("/v1/local/image", get(super::transfer::get_image).post(super::transfer::put_image));
 
     let cluster = Router::new()
@@ -203,7 +204,18 @@ async fn post_state(State(agent): AgentState, Json(s): Json<ClusterState>) -> Js
     Json(agent.accept_state(s))
 }
 
-async fn report(State(agent): AgentState, Json(r): Json<NodeReport>) -> Json<ReportAck> {
+async fn report(State(agent): AgentState, Json(mut r): Json<NodeReport>) -> Json<ReportAck> {
+    if !r.events.is_empty() {
+        let name = agent.snapshot().machines.get(&r.machine).map(|m| m.name.clone()).unwrap_or_default();
+        let mut ev = agent.events.lock().unwrap();
+        for mut e in std::mem::take(&mut r.events) {
+            e.message = format!("{name}: {}", e.message);
+            ev.push_back(e);
+        }
+        while ev.len() > 200 {
+            ev.pop_front();
+        }
+    }
     agent
         .reports
         .lock()
@@ -708,6 +720,8 @@ async fn deploy(
             };
             for vc in &cfg.volumes {
                 let id = Volume::dir_name(&app, &vc.name);
+                // A pending purge from an earlier destroy must not hit the new app's data.
+                s.tombstones.remove(&id);
                 let sync_secs = util::parse_duration(&vc.sync).map(|d| d.as_secs()).unwrap_or(30).max(5);
                 match s.volumes.get_mut(&id) {
                     Some(v) => {
@@ -764,6 +778,8 @@ async fn destroy_app(
                 s.volumes.remove(&v);
                 if q.purge_volumes {
                     s.tombstones.insert(v, now());
+                } else {
+                    s.tombstones.remove(&v);
                 }
             }
             s.tombstones.retain(|_, t| now().saturating_sub(*t) < 7 * 86400);

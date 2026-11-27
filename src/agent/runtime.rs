@@ -823,12 +823,20 @@ pub async fn registry_loop(agent: Arc<Agent>) {
 /// and keep the BuildKit cache within a disk-aware budget.
 pub async fn gc_loop(agent: Arc<Agent>) {
     tokio::time::sleep(Duration::from_secs(120)).await;
-    let mut tick = tokio::time::interval(Duration::from_secs(3600));
+    let mut last_full = Instant::now() - Duration::from_secs(7200);
+    let mut known: HashSet<String> = agent.snapshot().apps.keys().cloned().collect();
     loop {
-        tick.tick().await;
-        if let Err(e) = gc_once(&agent).await {
-            warn!("cache cleanup: {e:#}");
+        // Hourly, and soon after an app is destroyed (its images go right away).
+        let apps: HashSet<String> = agent.snapshot().apps.keys().cloned().collect();
+        let removed = known.iter().any(|a| !apps.contains(a));
+        known = apps;
+        if removed || last_full.elapsed() > Duration::from_secs(3600) {
+            last_full = Instant::now();
+            if let Err(e) = gc_once(&agent).await {
+                warn!("cache cleanup: {e:#}");
+            }
         }
+        tokio::time::sleep(Duration::from_secs(60)).await;
     }
 }
 

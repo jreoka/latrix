@@ -307,6 +307,8 @@ latrix --cluster prod status
 | `latrix rollback <app> [version]` | back to the previous (or a given) release |
 | `latrix secrets set <app> KEY=value` | secrets as env vars (triggers a rolling restart) |
 | `latrix console <app> [-- cmd]` | shell into an instance |
+| `latrix destroy <app> [--keep-volumes]` | delete an app, its images and its volume data |
+| `latrix volumes [prune]` | volumes, plus data no app uses (deleted automatically after `volume_retention_days`, default 3) |
 | `latrix up [--budget 30]` | buy the cheapest server and turn on the autopilot |
 | `latrix backup [app] [--all] [--stop]` / `latrix restore <file>` | full app backups to your computer |
 | `latrix import fly <app>` | move a Fly.io app (config, secrets, image, data, domains) |
@@ -319,7 +321,8 @@ latrix --cluster prod status
 | `latrix cluster list\|use\|forget` | switch between clusters |
 | `latrix k8s add\|export\|setup-tls` | use a Kubernetes cluster as a target |
 
-Every command has `--help`.
+Every command has `--help`. Common spellings work too: `apps list`,
+`app ls`, `volume list`, `machines ls`, `rm <app>`, and so on.
 
 ### Settings
 
@@ -330,6 +333,7 @@ latrix settings acme_email=me@example.com
 latrix settings base_domain=apps.example.com  # every app gets <app>.apps.example.com (wildcard DNS)
 latrix settings monthly_budget=40           # shown next to the cost estimate; warns when over
 latrix settings rebalance=false autoscale=false
+latrix settings volume_retention_days=0      # delete volume data no app uses right away (default: after 3 days)
 ```
 
 ## How it works

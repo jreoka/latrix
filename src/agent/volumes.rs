@@ -24,6 +24,19 @@ pub struct VolumeState {
     last_running: Mutex<HashMap<String, u64>>,
     sized_at: Mutex<HashMap<String, u64>>,
     kick: Notify,
+    /// Volume dirs on this machine that no app uses: id -> (first seen, size MB).
+    unused: Mutex<HashMap<String, (u64, u64)>>,
+    unused_loaded: std::sync::atomic::AtomicBool,
+}
+
+/// Volume data on a machine that no app uses (any more).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UnusedVolume {
+    pub volume: String,
+    pub size_mb: u64,
+    pub unused_since: u64,
+    /// When it is deleted automatically (0 = never).
+    pub delete_at: u64,
 }
 
 impl VolumeState {
@@ -48,6 +61,18 @@ pub async fn run(agent: Arc<Agent>) {
     let _ = std::fs::create_dir_all(volumes_dir(&agent));
     if !agent.dev {
         tokio::spawn(rsync_daemon(agent.clone()));
+    }
+    {
+        let agent = agent.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            loop {
+                if let Err(e) = scan_unused(&agent).await {
+                    warn!("unused volume scan: {e:#}");
+                }
+                tokio::time::sleep(Duration::from_secs(600)).await;
+            }
+        });
     }
     loop {
         tokio::select! {
@@ -216,4 +241,165 @@ async fn sync_once(agent: &Arc<Agent>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn unused_file(agent: &Agent) -> PathBuf {
+    agent.data.join("unused-volumes.json")
+}
+
+fn load_unused(agent: &Agent) {
+    if agent.vols.unused_loaded.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    if let Ok(t) = std::fs::read_to_string(unused_file(agent)) {
+        if let Ok(m) = serde_json::from_str::<HashMap<String, (u64, u64)>>(&t) {
+            *agent.vols.unused.lock().unwrap() = m;
+        }
+    }
+}
+
+fn save_unused(agent: &Agent) {
+    let m = agent.vols.unused.lock().unwrap().clone();
+    if let Ok(b) = serde_json::to_vec(&m) {
+        let _ = crate::util::write_atomic(&unused_file(agent), &b);
+    }
+}
+
+/// Is this volume dir used on this machine (as the live copy or a replica)?
+fn in_use(s: &crate::state::ClusterState, me: u32, id: &str) -> bool {
+    s.volumes
+        .get(id)
+        .map(|v| v.primary == me || v.replicas.contains(&me) || v.moving_to == Some(me))
+        .unwrap_or(false)
+}
+
+/// Only judge data unused when this machine's view of the cluster is current.
+fn state_is_current(agent: &Agent) -> bool {
+    let s = agent.snapshot();
+    agent.leader().is_some()
+        && s.machines.contains_key(&agent.me.machine_id)
+        && s.version >= agent.max_seen_version.load(std::sync::atomic::Ordering::SeqCst)
+        && agent.started.elapsed() > Duration::from_secs(120)
+}
+
+pub fn retention_secs(s: &crate::state::ClusterState) -> u64 {
+    (s.settings.volume_retention_days.max(0.0) * 86400.0) as u64
+}
+
+/// Find volume data no app uses on this machine; after the retention period
+/// delete it. Also clears temporary leftovers of restores.
+pub async fn scan_unused(agent: &Arc<Agent>) -> Result<()> {
+    load_unused(agent);
+    if !state_is_current(agent) {
+        return Ok(());
+    }
+    let s = agent.snapshot();
+    let me = agent.me.machine_id;
+    let t = now();
+    let retention = retention_secs(&s);
+    let base = volumes_dir(agent);
+    let mut seen = vec![];
+    for entry in std::fs::read_dir(&base)?.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with('.') {
+            // half-finished restores; remove after a day
+            let old = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .map(|m| m.elapsed().unwrap_or_default() > Duration::from_secs(86400))
+                .unwrap_or(false);
+            if old {
+                let _ = std::fs::remove_dir_all(entry.path()).or_else(|_| std::fs::remove_file(entry.path()));
+            }
+            continue;
+        }
+        if !entry.path().is_dir() {
+            continue;
+        }
+        if in_use(&s, me, &name) {
+            continue;
+        }
+        seen.push(name.clone());
+        let first = agent.vols.unused.lock().unwrap().get(&name).map(|x| x.0);
+        match first {
+            None => {
+                let size = cmd("du", &["-sm", &entry.path().display().to_string()])
+                    .await
+                    .ok()
+                    .and_then(|o| o.split_whitespace().next().and_then(|n| n.parse().ok()))
+                    .unwrap_or(0);
+                agent.vols.unused.lock().unwrap().insert(name.clone(), (t, size));
+                if retention > 0 {
+                    agent.event(
+                        "info",
+                        format!(
+                            "volume data {name} ({size} MB) isn't used by any app here; it will be deleted in {} \
+                             (deploy the app again to keep it, or `latrix volumes prune` to delete it now)",
+                            crate::util::human_duration(retention)
+                        ),
+                    );
+                }
+            }
+            Some(since) if t.saturating_sub(since) >= retention => {
+                info!("deleting unused volume data {name}");
+                std::fs::remove_dir_all(entry.path())?;
+                let size = agent.vols.unused.lock().unwrap().remove(&name).map(|x| x.1).unwrap_or(0);
+                agent.event("info", format!("deleted unused volume data {name} ({size} MB)"));
+            }
+            Some(_) => {}
+        }
+    }
+    agent.vols.unused.lock().unwrap().retain(|k, _| seen.contains(k));
+    save_unused(agent);
+    Ok(())
+}
+
+pub fn unused_list(agent: &Agent) -> Vec<UnusedVolume> {
+    load_unused(agent);
+    let retention = retention_secs(&agent.snapshot());
+    let mut v: Vec<UnusedVolume> = agent
+        .vols
+        .unused
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, (since, size))| UnusedVolume {
+            volume: k.clone(),
+            size_mb: *size,
+            unused_since: *since,
+            delete_at: since + retention,
+        })
+        .collect();
+    v.sort_by(|a, b| a.volume.cmp(&b.volume));
+    v
+}
+
+/// GET: unused volume data on this machine. DELETE ?volume=: delete one now.
+pub async fn handle_unused(
+    axum::extract::State(agent): axum::extract::State<Arc<Agent>>,
+    method: axum::http::Method,
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+    if method == axum::http::Method::DELETE {
+        let Some(id) = q.get("volume").filter(|v| !v.is_empty() && !v.contains('/') && !v.contains("..") && !v.starts_with('.')) else {
+            return (axum::http::StatusCode::BAD_REQUEST, "volume= required").into_response();
+        };
+        if in_use(&agent.snapshot(), agent.me.machine_id, id) {
+            return (axum::http::StatusCode::CONFLICT, format!("{id} is in use")).into_response();
+        }
+        let dir = volumes_dir(&agent).join(id);
+        if dir.is_dir() {
+            if let Err(e) = std::fs::remove_dir_all(&dir) {
+                return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        }
+        agent.vols.unused.lock().unwrap().remove(id);
+        save_unused(&agent);
+        agent.event("info", format!("deleted unused volume data {id}"));
+        return axum::Json(true).into_response();
+    }
+    // Refresh first so the list is current.
+    let _ = scan_unused(&agent).await;
+    axum::Json(unused_list(&agent)).into_response()
 }

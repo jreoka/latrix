@@ -296,7 +296,11 @@ pub async fn run(cli: Cli) -> Result<()> {
     match cli.cmd {
         Cmd::Deploy(args) => deploy_cmd(&cfg, cl, args).await,
         Cmd::Status => status(&cfg, cl).await,
-        Cmd::Apps => apps(&cfg, cl).await,
+        Cmd::Apps { action } => match action {
+            None | Some(AppsCmd::List) => apps(&cfg, cl).await,
+            Some(AppsCmd::Show { app }) => ps(&cfg, cl, &app).await,
+            Some(AppsCmd::Destroy(a)) => destroy(&cfg, cl, a).await,
+        },
         Cmd::Ps { app } => ps(&cfg, cl, &app).await,
         Cmd::Logs { app, follow, tail, instance } => logs(&cfg, cl, &app, follow, tail, instance).await,
         Cmd::Scale { app, count, min, max, cpu, memory } => {
@@ -330,32 +334,21 @@ pub async fn run(cli: Cli) -> Result<()> {
             print_releases(&v);
             Ok(())
         }
-        Cmd::Destroy { app, yes, purge_volumes } => {
-            if !yes {
-                print!("Destroy app '{app}'{}? Type the app name to confirm: ", if purge_volumes { " and DELETE its volume data" } else { "" });
-                std::io::stdout().flush()?;
-                let mut line = String::new();
-                std::io::stdin().lock().read_line(&mut line)?;
-                if line.trim() != app {
-                    bail!("aborted");
-                }
-            }
-            let (_, _, c) = connect(&cfg, cl).await?;
-            let _: bool = c.delete(&format!("/v1/apps/{app}?purge_volumes={purge_volumes}")).await?;
-            println!("destroyed {app}{}", if purge_volumes { "" } else { " (volume data kept in /var/lib/latrix/volumes on the machines)" });
-            Ok(())
-        }
+        Cmd::Destroy(a) => destroy(&cfg, cl, a).await,
         Cmd::Secrets(s) => secrets(&cfg, cl, s).await,
         Cmd::Console { app, cmd } => console(&cfg, cl, &app, cmd).await,
         Cmd::Machine(m) => machine_cmd(&mut cfg, cl, m).await,
-        Cmd::Volumes => volumes(&cfg, cl).await,
+        Cmd::Volumes { action } => match action {
+            None | Some(VolumesCmd::List) => volumes(&cfg, cl).await,
+            Some(VolumesCmd::Prune { yes }) => prune_volumes(&cfg, cl, yes).await,
+        },
         Cmd::Doctor { machine } => doctor::doctor(&cfg, cl, machine.as_deref()).await,
         Cmd::Backup { apps, all, out, no_image, stop } => backup::backup(&cfg, cl, apps, all, out, no_image, stop).await,
         Cmd::Restore { file, as_name } => backup::restore(&cfg, cl, &file, as_name).await,
         Cmd::Import(ImportCmd::Fly { app, as_name, no_data, no_secrets, from_source }) => {
             fly::import(&cfg, cl, fly::ImportOptions { fly_app: app, name: as_name, no_data, no_secrets, from_source }).await
         }
-        Cmd::Certs => {
+        Cmd::Certs { .. } => {
             let (_, _, c) = connect(&cfg, cl).await?;
             let st: StatusView = c.get("/v1/status").await?;
             let rows = st
@@ -375,7 +368,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
-        Cmd::Events => {
+        Cmd::Events { .. } => {
             let (_, _, c) = connect(&cfg, cl).await?;
             let ev: Vec<crate::state::Event> = c.get("/v1/events").await?;
             for e in ev {
@@ -858,10 +851,122 @@ async fn volumes(cfg: &CliConfig, cl: Option<&str>) -> Result<()> {
     let st: StatusView = c.get("/v1/status").await?;
     let vols: Vec<VolumeView> = st.apps.iter().flat_map(|a| a.volumes.clone()).collect();
     if vols.is_empty() {
-        println!("no volumes (add [[volumes]] to an app's latrix.toml)");
+        println!("no volumes in use (add [[volumes]] to an app's latrix.toml)");
     } else {
         print_volume_rows(&vols);
     }
+    let unused = unused_volumes(&c, &st).await;
+    if !unused.is_empty() {
+        println!("\nUNATTACHED DATA (no app uses it; deleted automatically)");
+        let rows = unused
+            .iter()
+            .map(|(m, u)| {
+                vec![
+                    m.clone(),
+                    u.volume.replace("__", "/"),
+                    format!("{} MB", u.size_mb),
+                    ago(u.unused_since),
+                    if u.delete_at <= util::now() {
+                        "on the next scan".into()
+                    } else {
+                        format!("in {}", human_duration(u.delete_at - util::now()))
+                    },
+                ]
+            })
+            .collect();
+        print_table(&["MACHINE", "VOLUME", "SIZE", "UNUSED SINCE", "DELETED"], rows);
+        println!("delete it now with `latrix volumes prune`; change the delay with `latrix settings volume_retention_days=N`");
+    }
+    Ok(())
+}
+
+async fn unused_volumes(c: &Client, st: &StatusView) -> Vec<(String, crate::agent::volumes::UnusedVolume)> {
+    let mut out = vec![];
+    for m in st.machines.iter().filter(|m| m.alive) {
+        if let Ok(list) = c
+            .get::<Vec<crate::agent::volumes::UnusedVolume>>(&format!("/v1/m/{}/unused-volumes", m.machine.id))
+            .await
+        {
+            out.extend(list.into_iter().map(|u| (m.machine.name.clone(), u)));
+        }
+    }
+    out
+}
+
+async fn prune_volumes(cfg: &CliConfig, cl: Option<&str>, yes: bool) -> Result<()> {
+    let (_, _, c) = connect(cfg, cl).await?;
+    let st: StatusView = c.get("/v1/status").await?;
+    let unused = unused_volumes(&c, &st).await;
+    if unused.is_empty() {
+        println!("nothing to prune: all volume data on the machines belongs to an app");
+        return Ok(());
+    }
+    let total: u64 = unused.iter().map(|(_, u)| u.size_mb).sum();
+    for (m, u) in &unused {
+        println!("  {m}: {} ({} MB)", u.volume.replace("__", "/"), u.size_mb);
+    }
+    if !yes {
+        print!("Delete this data ({total} MB)? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        if !matches!(line.trim(), "y" | "Y" | "yes") {
+            bail!("aborted");
+        }
+    }
+    for (m, u) in &unused {
+        let id = st.machines.iter().find(|x| &x.machine.name == m).map(|x| x.machine.id).unwrap_or(0);
+        let r = c
+            .request(reqwest::Method::DELETE, &format!("/v1/m/{id}/unused-volumes?volume={}", u.volume))
+            .send()
+            .await?;
+        if !r.status().is_success() {
+            println!("  ✗ {m}: {}: {}", u.volume, r.text().await.unwrap_or_default());
+        }
+    }
+    println!("deleted {total} MB of unused volume data");
+    Ok(())
+}
+
+async fn destroy(cfg: &CliConfig, cl: Option<&str>, a: DestroyArgs) -> Result<()> {
+    let (_, _, c) = connect(cfg, cl).await?;
+    let app = a.app.clone();
+    let v: AppView = c.get(&format!("/v1/apps/{app}")).await?;
+    let purge = !a.keep_volumes;
+    let vol_desc: Vec<String> = v
+        .volumes
+        .iter()
+        .map(|x| format!("{} ({} MB)", x.volume.name, x.report.as_ref().map(|r| r.size_mb).unwrap_or(0)))
+        .collect();
+    if !a.yes {
+        let what = if vol_desc.is_empty() {
+            String::new()
+        } else if purge {
+            format!(" and DELETE its volume data: {}", vol_desc.join(", "))
+        } else {
+            format!(" (keeping its volume data: {})", vol_desc.join(", "))
+        };
+        if !vol_desc.is_empty() && purge {
+            println!("tip: `latrix backup {app}` first to keep a copy, or use --keep-volumes");
+        }
+        print!("Destroy app '{app}'{what}? Type the app name to confirm: ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        if line.trim() != app {
+            bail!("aborted");
+        }
+    }
+    let _: bool = c.delete(&format!("/v1/apps/{app}?purge_volumes={purge}")).await?;
+    let tail = match (vol_desc.is_empty(), purge) {
+        (true, _) => String::new(),
+        (false, true) => format!(", deleted volume data: {}", vol_desc.join(", ")),
+        (false, false) => format!(
+            "; kept volume data {} (deploy {app} again to reuse it; otherwise it's deleted automatically after the retention period)",
+            vol_desc.join(", ")
+        ),
+    };
+    println!("destroyed {app}{tail}");
     Ok(())
 }
 
