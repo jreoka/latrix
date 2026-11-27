@@ -203,12 +203,14 @@ async fn build(
         a.retain(|x| x != "--progress=plain");
         run_in_pty(&format!("DOCKER_BUILDKIT=1 docker {}", shell_join(&a)), cols, tx).await?;
         let _ = tx.send(format!("\n\x1b[1;34m==>\x1b[0m pushing {image} to the cluster registry\n")).await;
-        run_in_pty(&format!("docker push {}", crate::util::shell_quote(image)), cols, tx).await?;
+        let local = local_alias(image).await?;
+        run_in_pty(&format!("docker push {}", crate::util::shell_quote(&local)), cols, tx).await?;
         return Ok(());
     }
     run_streaming("docker", &args, &[("DOCKER_BUILDKIT", bk)], tx).await?;
     let _ = tx.send(format!("==> pushing {image} to the cluster registry\n")).await;
-    run_streaming("docker", &["push".to_string(), image.to_string()], &[], tx).await?;
+    let local = local_alias(image).await?;
+    run_streaming("docker", &["push".to_string(), local], &[], tx).await?;
     Ok(())
 }
 
@@ -258,6 +260,27 @@ async fn checkout(url: &str, branch: Option<&str>, repo: &Path, tx: &mpsc::Sende
         .unwrap_or_default();
     let _ = tx.send(format!("==> at commit {}\n", sha.trim())).await;
     Ok(())
+}
+
+/// The same image under 127.0.0.1:<registry port>: pushing there always
+/// reaches this machine's registry (no dependence on the mesh, and Docker
+/// trusts 127.0.0.0/8 registries without extra configuration).
+async fn local_alias(image: &str) -> Result<String> {
+    let Some((_, repo)) = image.split_once('/') else { return Ok(image.to_string()) };
+    let local = format!("127.0.0.1:{}/{repo}", crate::util::REGISTRY_PORT);
+    if local != image {
+        cmd("docker", &["tag", image, &local]).await?;
+    }
+    if reqwest::Client::new()
+        .get(format!("http://127.0.0.1:{}/v2/", crate::util::REGISTRY_PORT))
+        .timeout(std::time::Duration::from_secs(5))
+        .send()
+        .await
+        .is_err()
+    {
+        bail!("this machine's image registry isn't running yet (it starts within a minute of the agent); try again, or run `latrix doctor`");
+    }
+    Ok(local)
 }
 
 fn shell_join(args: &[String]) -> String {

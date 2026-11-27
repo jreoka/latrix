@@ -349,6 +349,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Console { app, cmd } => console(&cfg, cl, &app, cmd).await,
         Cmd::Machine(m) => machine_cmd(&mut cfg, cl, m).await,
         Cmd::Volumes => volumes(&cfg, cl).await,
+        Cmd::Doctor { machine } => doctor::doctor(&cfg, cl, machine.as_deref()).await,
         Cmd::Backup { apps, all, out, no_image, stop } => backup::backup(&cfg, cl, apps, all, out, no_image, stop).await,
         Cmd::Restore { file, as_name } => backup::restore(&cfg, cl, &file, as_name).await,
         Cmd::Import(ImportCmd::Fly { app, as_name, no_data, no_secrets, from_source }) => {

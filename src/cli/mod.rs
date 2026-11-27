@@ -5,6 +5,7 @@ pub mod client;
 pub mod commands;
 pub mod compose;
 pub mod deploy;
+pub mod doctor;
 pub mod fly;
 pub mod k8s;
 pub mod machine;
@@ -166,6 +167,11 @@ pub enum Cmd {
     /// Bring apps over from other platforms
     #[command(subcommand)]
     Import(ImportCmd),
+    /// Check every machine (over SSH) and explain anything that's wrong
+    Doctor {
+        /// Only this machine
+        machine: Option<String>,
+    },
     /// List volumes and their replicas
     Volumes,
     /// List TLS certificates

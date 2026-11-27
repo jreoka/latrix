@@ -261,16 +261,26 @@ impl Proxy {
             let rest = &mut list[1..];
             rest.sort_by_key(|(b, _)| (failed.contains_key(&b.instance), load(b)));
         }
-        list.into_iter()
-            .map(|(b, hp)| {
-                let ip = if self.agent.dev { "127.0.0.1".to_string() } else { b.ip.clone() };
-                (format!("{ip}:{hp}"), b.instance.clone())
-            })
-            .collect()
+        let me = self.agent.me.machine_id;
+        let mut out = vec![];
+        for (b, hp) in list {
+            if self.agent.dev {
+                out.push((format!("127.0.0.1:{hp}"), b.instance.clone()));
+            } else if b.machine == me {
+                // Our own instances are always published on 127.0.0.1 (the
+                // mesh IP is for other machines); older containers may only
+                // have the mesh IP.
+                out.push((format!("127.0.0.1:{hp}"), b.instance.clone()));
+                out.push((format!("{}:{hp}", b.ip), b.instance.clone()));
+            } else {
+                out.push((format!("{}:{hp}", b.ip), b.instance.clone()));
+            }
+        }
+        out
     }
 
     async fn connect(&self, backends: &[Backend], port: u16) -> Option<(TcpStream, String)> {
-        for (addr, inst) in self.candidates(backends, port).into_iter().take(3) {
+        for (addr, inst) in self.candidates(backends, port).into_iter().take(4) {
             // The mesh is low-latency: give up quickly and try the next one.
             match tokio::time::timeout(Duration::from_millis(1000), TcpStream::connect(&addr)).await {
                 Ok(Ok(s)) => {

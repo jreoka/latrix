@@ -97,7 +97,7 @@ changed=0
 if [ ! -s "$daemon" ]; then
   cat > "$daemon" <<'JSON'
 {
-  "insecure-registries": ["10.77.0.0/16"],
+  "insecure-registries": ["10.77.0.0/16", "127.0.0.0/8"],
   "live-restore": true,
   "log-driver": "json-file",
   "log-opts": { "max-size": "10m", "max-file": "3" },
@@ -105,7 +105,7 @@ if [ ! -s "$daemon" ]; then
 }
 JSON
   changed=1
-elif ! grep -q '10.77.0.0/16' "$daemon"; then
+elif ! grep -q '10.77.0.0/16' "$daemon" || ! grep -q '127.0.0.0/8' "$daemon"; then
   if command -v python3 >/dev/null 2>&1; then
     cp "$daemon" "$daemon.latrix-backup"
     python3 - "$daemon" <<'PY'
@@ -113,8 +113,9 @@ import json, sys
 p = sys.argv[1]
 d = json.load(open(p))
 regs = d.setdefault("insecure-registries", [])
-if "10.77.0.0/16" not in regs:
-    regs.append("10.77.0.0/16")
+for r in ("10.77.0.0/16", "127.0.0.0/8"):
+    if r not in regs:
+        regs.append(r)
 d.setdefault("live-restore", True)
 d.setdefault("log-opts", {"max-size": "10m", "max-file": "3"})
 json.dump(d, open(p, "w"), indent=2)
@@ -122,7 +123,7 @@ PY
     changed=1
     log "updated existing $daemon (backup in $daemon.latrix-backup)"
   else
-    log "WARNING: $daemon exists; add \"insecure-registries\": [\"10.77.0.0/16\"] to it manually"
+    log "WARNING: $daemon exists; add \"insecure-registries\": [\"10.77.0.0/16\", \"127.0.0.0/8\"] to it manually"
   fi
 fi
 systemctl enable docker >/dev/null 2>&1 || true

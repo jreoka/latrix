@@ -240,7 +240,11 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
     }
     let r = result.ok_or_else(|| anyhow!("build connection closed before finishing"))?;
     if !r.ok {
-        bail!("build failed: {}", r.error.unwrap_or_default());
+        let e = r.error.unwrap_or_default();
+        if e.contains("push") {
+            bail!("build failed: {e}\n  The image built but could not be stored on the cluster; `latrix doctor` shows why.");
+        }
+        bail!("build failed: {e}");
     }
     println!("{} Built {} in {}s", arrow(), r.image, r.seconds);
     Ok((r.image, plan.machine))

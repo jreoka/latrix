@@ -312,6 +312,7 @@ latrix --cluster prod status
 | `latrix import fly <app>` | move a Fly.io app (config, secrets, image, data, domains) |
 | `latrix autopilot on\|off\|status` | automatic buying, resizing and deleting of servers |
 | `latrix machine list\|add\|create\|remove\|drain\|cordon\|uncordon\|update\|ssh` | machines |
+| `latrix doctor [machine]` | check every machine over SSH and explain what's wrong |
 | `latrix volumes`, `latrix certs`, `latrix events` | the rest of the state |
 | `latrix settings [key=value ...]` | cluster settings (see below) |
 | `latrix upgrade` | roll a new latrix version out to every machine (apps keep running) |

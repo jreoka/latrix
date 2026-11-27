@@ -7,7 +7,14 @@ case "$cmd" in
   daemon-reload|enable) exit 0 ;;
   disable) [[ "$*" == *--now* && "$svc" == latrix ]] && pkill -f "latrix agent run"; exit 0 ;;
   is-active) if [ "$svc" = docker ]; then pgrep -x dockerd >/dev/null; else pgrep -f "latrix agent run" >/dev/null; fi ;;
-  start|restart) [ "$svc" = latrix ] && start_latrix; exit 0 ;;
+  start|restart)
+    if [ "$svc" = latrix ]; then start_latrix
+    elif [ "$svc" = docker ] && [ "$cmd" = restart ]; then
+      pkill -x dockerd; for i in $(seq 1 20); do pgrep -x dockerd >/dev/null || break; sleep 1; done
+      rm -f /var/run/docker.pid; setsid dockerd >>/var/log/dockerd.log 2>&1 < /dev/null &
+      for i in $(seq 1 30); do docker info >/dev/null 2>&1 && break; sleep 1; done
+    fi
+    exit 0 ;;
   stop) [ "$svc" = latrix ] && pkill -f "latrix agent run"; exit 0 ;;
   *) exit 0 ;;
 esac

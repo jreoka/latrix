@@ -67,16 +67,25 @@ pub struct Agent {
     pub maintenance_done: Mutex<Option<String>>,
     pub sampler: metrics::Sampler,
     pub autopilot: autopilot::Shared,
+    pub mesh_up: std::sync::atomic::AtomicBool,
 }
 
 impl Agent {
     /// IP that containers' ports, the registry and the API bind to.
+    /// The mesh IP, or 127.0.0.1 in dev mode or while the mesh address is
+    /// missing (so a single machine keeps working; `latrix doctor` reports it).
     pub fn bind_ip(&self) -> String {
-        if self.dev {
+        if self.dev || !self.mesh_up.load(std::sync::atomic::Ordering::Relaxed) {
             "127.0.0.1".into()
         } else {
             self.me.overlay_ip.clone()
         }
+    }
+    /// Is the mesh address actually present on this machine?
+    pub fn check_mesh(&self) -> bool {
+        let up = std::net::TcpListener::bind((self.me.overlay_ip.as_str(), 0)).is_ok();
+        self.mesh_up.store(up, std::sync::atomic::Ordering::Relaxed);
+        up
     }
     pub fn registry(&self) -> String {
         format!("{}:{}", self.bind_ip(), util::REGISTRY_PORT)
@@ -271,11 +280,15 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
         maintenance_done: Mutex::new(maintenance::read_done_marker(&data)),
         sampler: Default::default(),
         autopilot: Default::default(),
+        mesh_up: std::sync::atomic::AtomicBool::new(false),
     });
 
     if !dev {
         if let Err(e) = mesh::sync(&agent).await {
             warn!("mesh setup failed (will retry): {e:#}");
+        }
+        if !agent.check_mesh() {
+            warn!("mesh address {} is missing; serving this machine's apps on 127.0.0.1 until it is back", agent.me.overlay_ip);
         }
     }
 

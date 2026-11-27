@@ -29,6 +29,9 @@ pub struct Runtime {
     stats: Mutex<HashMap<String, (f64, f64)>>,
     build_cache_gb: Mutex<f64>,
     pub builds_running: std::sync::atomic::AtomicUsize,
+    /// When a container was last moved to a new address (rebinds are spaced
+    /// out so routing tables everywhere catch up in between).
+    last_rebind: Mutex<Option<Instant>>,
     /// Consecutive failed reconcile passes (Docker not answering).
     pub docker_failures: std::sync::atomic::AtomicU32,
     /// app -> name of its running container on this machine (for volume sync)
@@ -80,6 +83,8 @@ pub struct Ctr {
     pub status: String,
     pub restarts: u32,
     pub ports: BTreeMap<u16, u16>,
+    /// Host addresses the ports are published on.
+    pub host_ips: Vec<String>,
     pub ip: String,
     pub error: String,
 }
@@ -105,16 +110,20 @@ pub async fn list_containers() -> Result<Vec<Ctr>> {
     for c in v.as_array().cloned().unwrap_or_default() {
         let labels = &c["Config"]["Labels"];
         let mut ports = BTreeMap::new();
+        let mut host_ips: Vec<String> = vec![];
         if let Some(map) = c["NetworkSettings"]["Ports"].as_object() {
             for (k, binds) in map {
                 let Some(cp) = k.strip_suffix("/tcp").and_then(|p| p.parse::<u16>().ok()) else { continue };
-                if let Some(hp) = binds
-                    .as_array()
-                    .and_then(|a| a.first())
-                    .and_then(|b| b["HostPort"].as_str())
-                    .and_then(|p| p.parse::<u16>().ok())
-                {
+                let first = binds.as_array().and_then(|a| a.first());
+                if let Some(hp) = first.and_then(|b| b["HostPort"].as_str()).and_then(|p| p.parse::<u16>().ok()) {
                     ports.insert(cp, hp);
+                }
+                for b in binds.as_array().cloned().unwrap_or_default() {
+                    if let Some(ip) = b["HostIp"].as_str() {
+                        if !host_ips.iter().any(|x| x == ip) {
+                            host_ips.push(ip.to_string());
+                        }
+                    }
                 }
             }
         }
@@ -134,6 +143,7 @@ pub async fn list_containers() -> Result<Vec<Ctr>> {
             status: c["State"]["Status"].as_str().unwrap_or("").to_string(),
             restarts: c["RestartCount"].as_u64().unwrap_or(0) as u32,
             ports,
+            host_ips,
             ip,
             error: c["State"]["Error"].as_str().unwrap_or("").to_string(),
         });
@@ -201,6 +211,16 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
 
     // Start instances that should run here.
     let mine: Vec<Instance> = s.instances_on(me).filter(|i| !i.stopping).cloned().collect();
+    let wanted = wanted_ips(agent);
+    // Move containers to a new address one at a time, and only while
+    // everything else here is healthy (so an app with 2+ instances never
+    // has all of them down at once).
+    let all_healthy = {
+        let health = agent.rt.health.lock().unwrap();
+        mine.iter().all(|i| health.get(&i.id).map(|h| h.healthy).unwrap_or(false))
+    } && agent.rt.busy.lock().unwrap().is_empty()
+        && agent.rt.last_rebind.lock().unwrap().map(|t| t.elapsed() > Duration::from_secs(15)).unwrap_or(true);
+    let mut rebinds = if all_healthy { 0 } else { 1 };
     for inst in &mine {
         if agent.rt.is_busy(&inst.id) {
             continue;
@@ -230,6 +250,48 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
                         }
                     }
                     agent.rt.clear_busy(&inst.id);
+                });
+            }
+            Some(c)
+                if c.status == "running"
+                    && !c.ports.is_empty()
+                    && !wanted.iter().all(|ip| c.host_ips.contains(ip))
+                    && rebinds == 0 =>
+            {
+                // Published on an old address (the mesh went down or came back):
+                // move it to the current one, one container per pass.
+                rebinds += 1;
+                *agent.rt.last_rebind.lock().unwrap() = Some(Instant::now());
+                info!("{} is published on {} instead of {}; recreating it", c.name, c.host_ips.join(","), wanted.join(","));
+                agent.rt.set_busy(&c.instance, "starting");
+                let agent = agent.clone();
+                let c = c.clone();
+                tokio::spawn(async move {
+                    // Graceful stop first: in-flight requests finish, new ones
+                    // go to the other instances.
+                    let _ = cmd("docker", &["stop", "-t", "10", &c.id]).await;
+                    let _ = cmd("docker", &["rm", "-f", &c.id]).await;
+                    agent.rt.clear_busy(&c.instance);
+                });
+            }
+            Some(c)
+                if c.status == "running"
+                    && c.ports.is_empty()
+                    && s.apps
+                        .get(&inst.app)
+                        .and_then(|a| a.release(inst.release))
+                        .map(|r| !r.config.container_ports().is_empty())
+                        .unwrap_or(false) =>
+            {
+                // Running but its published ports are gone (e.g. the address it
+                // was bound to disappeared): recreate it on the current address.
+                warn!("{} lost its port bindings; recreating it", c.name);
+                agent.rt.set_busy(&c.instance, "starting");
+                let agent = agent.clone();
+                let c = c.clone();
+                tokio::spawn(async move {
+                    let _ = cmd("docker", &["rm", "-f", &c.id]).await;
+                    agent.rt.clear_busy(&c.instance);
                 });
             }
             Some(c) if matches!(c.status.as_str(), "exited" | "created" | "dead") => {
@@ -495,6 +557,21 @@ async fn seed_volume(image: &str, dir: &std::path::Path, path: &str) {
     }
 }
 
+/// Addresses app ports are published on: always 127.0.0.1, plus the mesh IP
+/// while it exists.
+fn wanted_ips(agent: &Agent) -> Vec<String> {
+    let mut ips = vec!["127.0.0.1".to_string()];
+    let b = agent.bind_ip();
+    if b != "127.0.0.1" {
+        ips.push(b);
+    }
+    ips
+}
+
+fn free_port() -> Result<u16> {
+    Ok(std::net::TcpListener::bind(("0.0.0.0", 0))?.local_addr()?.port())
+}
+
 async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
     let s = agent.snapshot();
     let app = s.apps.get(&inst.app).context("app no longer exists")?;
@@ -504,7 +581,6 @@ async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
     agent.rt.set_busy(&inst.id, "starting");
 
     let name = container_name(&inst.app, &inst.id);
-    let bind = agent.bind_ip();
     let mut args: Vec<String> = vec![
         "run".into(),
         "-d".into(),
@@ -553,9 +629,15 @@ async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
             ports.push(p);
         }
     }
+    // Same host port on 127.0.0.1 (this machine's proxy, works whatever the
+    // mesh does) and on the mesh IP (other machines), when the mesh is up.
+    let ips = wanted_ips(agent);
     for p in ports {
-        args.push("-p".into());
-        args.push(format!("{bind}::{p}"));
+        let hp = free_port()?;
+        for ip in &ips {
+            args.push("-p".into());
+            args.push(format!("{ip}:{hp}:{p}"));
+        }
     }
     for v in &cfg.volumes {
         let dir = agent.data.join("volumes").join(Volume::dir_name(&inst.app, &v.name));
@@ -639,33 +721,99 @@ pub fn parse_docker_size_mb(s: &str) -> f64 {
     }
 }
 
+/// Docker must trust the mesh registries (10.77.0.0/16) and this machine's
+/// own registry on 127.0.0.1. Note: listing *any* insecure registries in
+/// daemon.json drops Docker's built-in trust of 127.0.0.0/8, so both are
+/// needed. Machines set up by older versions are fixed here.
+pub async fn ensure_docker_config(agent: &Agent) {
+    let path = std::path::Path::new("/etc/docker/daemon.json");
+    let mut v: serde_json::Value = match std::fs::read_to_string(path) {
+        Ok(t) if !t.trim().is_empty() => match serde_json::from_str(&t) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!("cannot parse {}: {e}; not changing it", path.display());
+                return;
+            }
+        },
+        _ => serde_json::json!({}),
+    };
+    let Some(obj) = v.as_object_mut() else { return };
+    let regs = obj.entry("insecure-registries").or_insert_with(|| serde_json::json!([]));
+    let Some(list) = regs.as_array_mut() else { return };
+    let mut changed = false;
+    for r in ["10.77.0.0/16", "127.0.0.0/8"] {
+        if !list.iter().any(|x| x == r) {
+            list.push(serde_json::json!(r));
+            changed = true;
+        }
+    }
+    if !changed {
+        return;
+    }
+    if obj.get("live-restore").is_none() {
+        obj.insert("live-restore".into(), serde_json::json!(true));
+    }
+    let _ = std::fs::copy(path, path.with_extension("json.latrix-backup"));
+    if let Err(e) = std::fs::write(path, serde_json::to_vec_pretty(&v).unwrap_or_default()) {
+        warn!("cannot update {}: {e}", path.display());
+        return;
+    }
+    info!("updated Docker's trusted registries; restarting Docker (containers keep running)");
+    if let Err(e) = cmd("systemctl", &["restart", "docker"]).await {
+        warn!("restarting Docker failed: {e}");
+    }
+    agent.event("info", "fixed Docker's registry settings on this machine".to_string());
+}
+
 /// Keep the local image registry running.
 pub async fn registry_loop(agent: Arc<Agent>) {
+    if !agent.dev {
+        ensure_docker_config(&agent).await;
+    }
     let mut tick = tokio::time::interval(Duration::from_secs(30));
     loop {
         tick.tick().await;
-        let running = cmd("docker", &["inspect", "-f", "{{.State.Running}}", "latrix-registry"])
+        // Always on 127.0.0.1 (builds push there; works even if the mesh is
+        // down), and on the mesh IP once it exists (other machines pull there).
+        let mut ips = vec!["127.0.0.1".to_string()];
+        let mesh_ip = agent.bind_ip();
+        if mesh_ip != "127.0.0.1" && std::net::TcpListener::bind((mesh_ip.as_str(), 0)).is_ok() {
+            ips.push(mesh_ip);
+        }
+        // Check the *live* bindings: when one address is missing after a
+        // Docker restart, Docker silently drops all of a container's ports.
+        let live = cmd("docker", &["inspect", "-f", "{{.State.Running}} {{json .NetworkSettings.Ports}}", "latrix-registry"])
             .await
-            .map(|o| o.trim() == "true")
-            .unwrap_or(false);
-        if running {
+            .unwrap_or_default();
+        let up = live.starts_with("true");
+        let bound: Vec<String> = ips
+            .iter()
+            .filter(|ip| live.contains(&format!("\"HostIp\":\"{ip}\"")))
+            .cloned()
+            .collect();
+        let stale_mesh = !ips.iter().any(|ip| ip != "127.0.0.1") && live.contains("\"HostIp\":\"10.77.");
+        let answers = reqwest::Client::new()
+            .get(format!("http://127.0.0.1:{REGISTRY_PORT}/v2/"))
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+            .is_ok();
+        if up && bound.len() == ips.len() && !stale_mesh && answers {
             continue;
         }
         let _ = cmd("docker", &["rm", "-f", "latrix-registry"]).await;
         let dir = agent.data.join("registry");
         let _ = std::fs::create_dir_all(&dir);
-        let port = format!("{}:{}:5000", agent.bind_ip(), REGISTRY_PORT);
         let vol = format!("{}:/var/lib/registry", dir.display());
-        match cmd(
-            "docker",
-            &[
-                "run", "-d", "--name", "latrix-registry", "--restart", "always", "-p", &port, "-v", &vol,
-                "-e", "REGISTRY_STORAGE_DELETE_ENABLED=true", "registry:2",
-            ],
-        )
-        .await
-        {
-            Ok(_) => info!("started image registry on {}", agent.registry()),
+        let mut args: Vec<String> = ["run", "-d", "--name", "latrix-registry", "--restart", "always"].iter().map(|s| s.to_string()).collect();
+        for ip in &ips {
+            args.push("-p".into());
+            args.push(format!("{ip}:{REGISTRY_PORT}:5000"));
+        }
+        args.extend(["-v".to_string(), vol, "-e".into(), "REGISTRY_STORAGE_DELETE_ENABLED=true".into(), "registry:2".into()]);
+        let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        match cmd("docker", &refs).await {
+            Ok(_) => info!("started image registry on {}", ips.iter().map(|i| format!("{i}:{REGISTRY_PORT}")).collect::<Vec<_>>().join(", ")),
             Err(e) => warn!("could not start registry (retrying): {e}"),
         }
     }

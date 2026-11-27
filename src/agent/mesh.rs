@@ -141,6 +141,7 @@ async fn harden(agent: &Agent) {
 }
 
 pub async fn sync_loop(agent: Arc<Agent>) {
+    let mut failures = 0u32;
     let mut rx = agent.changed.subscribe();
     let mut tick = tokio::time::interval(Duration::from_secs(20));
     loop {
@@ -148,8 +149,28 @@ pub async fn sync_loop(agent: Arc<Agent>) {
             _ = tick.tick() => {},
             _ = rx.changed() => {},
         }
-        if let Err(e) = sync(&agent).await {
-            warn!("mesh sync: {e:#}");
+        let res = sync(&agent).await;
+        let was_up = agent.mesh_up.load(std::sync::atomic::Ordering::Relaxed);
+        let up = agent.check_mesh();
+        if was_up != up {
+            agent.event(
+                if up { "info" } else { "warn" },
+                if up {
+                    format!("mesh address {} is up again", agent.me.overlay_ip)
+                } else {
+                    format!("mesh address {} is missing; this machine's apps are served locally only (run `latrix doctor`)", agent.me.overlay_ip)
+                },
+            );
+        }
+        match res {
+            Ok(()) => failures = 0,
+            Err(e) => {
+                warn!("mesh sync: {e:#}");
+                failures += 1;
+                if failures == 3 || failures.is_multiple_of(180) {
+                    agent.event("warn", format!("mesh network setup is failing on this machine: {e:#} (run `latrix doctor`)"));
+                }
+            }
         }
     }
 }
