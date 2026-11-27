@@ -86,9 +86,13 @@ fn default_port() -> u16 {
 impl CliConfig {
     pub fn path() -> PathBuf {
         if let Ok(p) = std::env::var("LATRIX_CONFIG") {
-            return PathBuf::from(p);
+            let trimmed = p.trim();
+            if !trimmed.is_empty() {
+                return PathBuf::from(trimmed);
+            }
         }
         dirs::config_dir()
+            .or_else(|| dirs::home_dir().map(|h| h.join(".config")))
             .unwrap_or_else(|| PathBuf::from("."))
             .join("latrix")
             .join("config.toml")
@@ -105,14 +109,16 @@ impl CliConfig {
 
     pub fn save(&self) -> Result<()> {
         let p = Self::path();
-        crate::util::write_atomic(&p, toml::to_string_pretty(self)?.as_bytes())?;
-        crate::agent::set_private(&p);
+        if let Some(parent) = p.parent().filter(|d| !d.as_os_str().is_empty()) {
+            crate::util::create_private_dir_all(parent)?;
+        }
+        crate::util::write_atomic_private(&p, toml::to_string_pretty(self)?.as_bytes())?;
         Ok(())
     }
 
     /// Resolve which cluster a command targets.
     pub fn cluster_name(&self, flag: Option<&str>) -> Result<String> {
-        if let Some(f) = flag {
+        if let Some(f) = flag.map(str::trim).filter(|s| !s.is_empty()) {
             if !self.clusters.contains_key(f) {
                 bail!("unknown cluster '{f}' (see `latrix cluster list`)");
             }

@@ -7,12 +7,12 @@
 //! nothing is lost. If the primary dies unexpectedly, the freshest replica is
 //! promoted (you lose at most one sync interval of writes).
 
-use super::{cmd, set_private, Agent};
+use super::{cmd_timeout, Agent};
 use crate::state::{Volume, VolumeReport};
-use crate::util::{now, RSYNC_PORT};
+use crate::util::{self, now, OVERLAY_PREFIX, RSYNC_PORT};
 use anyhow::{bail, Result};
-use std::collections::HashMap;
-use std::path::PathBuf;
+use std::collections::{BTreeMap, HashMap};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -27,6 +27,10 @@ pub struct VolumeState {
     /// Volume dirs on this machine that no app uses: id -> (first seen, size MB).
     unused: Mutex<HashMap<String, (u64, u64)>>,
     unused_loaded: std::sync::atomic::AtomicBool,
+    /// Per-volume async lock shared by sync, snapshot, restore, and put_volume.
+    vol_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Serializes scan_unused across background task and HTTP requests.
+    scan_lock: tokio::sync::Mutex<()>,
 }
 
 /// Volume data on a machine that no app uses (any more).
@@ -46,6 +50,45 @@ impl VolumeState {
     /// Wake the sync loop (e.g. right after a container stopped).
     pub fn kick(&self) {
         self.kick.notify_one();
+    }
+    pub fn volume_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.vol_locks
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+    /// Report replicated volumes present on this machine (with local data) so a
+    /// newly elected leader can safely pick a synced replica on unplanned failover.
+    pub fn replica_volumes(
+        &self,
+        data: &Path,
+        s: &crate::state::ClusterState,
+        me: u32,
+    ) -> BTreeMap<String, u64> {
+        let mut out = BTreeMap::new();
+        let base = data.join("volumes");
+        for v in s.volumes.values().filter(|v| v.replicas.contains(&me)) {
+            if !util::safe_id(&v.id) {
+                continue;
+            }
+            let dir = base.join(&v.id);
+            let has_entries = std::fs::read_dir(&dir)
+                .ok()
+                .and_then(|mut rd| rd.next())
+                .is_some();
+            if has_entries {
+                let ts = std::fs::metadata(&dir)
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs().max(1))
+                    .unwrap_or(1);
+                out.insert(v.id.clone(), ts);
+            }
+        }
+        out
     }
 }
 
@@ -100,20 +143,21 @@ pub async fn run(agent: Arc<Agent>) {
 async fn rsync_daemon(agent: Arc<Agent>) {
     let conf = agent.data.join("rsyncd.conf");
     let secrets = agent.data.join("rsyncd.secrets");
+    let overlay_cidr = format!("{OVERLAY_PREFIX}.0.0/16");
     let text = format!(
         "uid = root\ngid = root\nuse chroot = yes\nmax connections = 16\naddress = {ip}\nport = {RSYNC_PORT}\n\
-         log file = {log}\n\n[volumes]\n    path = {path}\n    read only = no\n    auth users = latrix\n    \
-         secrets file = {secrets}\n    hosts allow = 10.77.0.0/16\n",
+         max verbosity = 0\n\n[volumes]\n    path = {path}\n    read only = no\n    auth users = latrix\n    \
+         secrets file = {secrets}\n    hosts allow = {overlay_cidr}\n    exclude = .*\n    refuse options = devices specials\n",
         ip = agent.me.overlay_ip,
-        log = agent.data.join("rsyncd.log").display(),
         path = volumes_dir(&agent).display(),
         secrets = secrets.display(),
     );
-    if std::fs::write(&conf, text).is_err() || std::fs::write(&secrets, format!("latrix:{}\n", password(&agent))).is_err() {
+    if util::write_atomic(&conf, text.as_bytes()).is_err()
+        || util::write_atomic_private(&secrets, format!("latrix:{}\n", password(&agent)).as_bytes()).is_err()
+    {
         warn!("cannot write rsync config");
         return;
     }
-    set_private(&secrets);
     loop {
         let child = tokio::process::Command::new("rsync")
             .args(["--daemon", "--no-detach", &format!("--config={}", conf.display())])
@@ -131,18 +175,45 @@ async fn rsync_daemon(agent: Arc<Agent>) {
 }
 
 async fn rsync_to(agent: &Agent, vol: &Volume, ip: &str) -> Result<()> {
+    if !util::safe_id(&vol.id) {
+        bail!("invalid volume id '{}'", vol.id);
+    }
     let src = format!("{}/", volumes_dir(agent).join(&vol.id).display());
     let dst = format!("rsync://latrix@{ip}:{RSYNC_PORT}/volumes/{}/", vol.id);
-    let out = tokio::process::Command::new("rsync")
-        .args(["-a", "--delete", "--numeric-ids", "--partial", "--timeout=120", &src, &dst])
+    let fut = tokio::process::Command::new("rsync")
+        .args([
+            "-a",
+            "--delete",
+            "--numeric-ids",
+            "--partial",
+            "--contimeout=30",
+            "--timeout=120",
+            "--",
+            &src,
+            &dst,
+        ])
         .env("RSYNC_PASSWORD", password(agent))
         .stdin(std::process::Stdio::null())
-        .output()
-        .await?;
+        .kill_on_drop(true)
+        .output();
+    let out = match tokio::time::timeout(Duration::from_secs(600), fut).await {
+        Ok(res) => res?,
+        Err(_) => bail!("rsync to {ip} timed out after 600s"),
+    };
     if !out.status.success() {
         bail!("rsync to {ip} failed: {}", String::from_utf8_lossy(&out.stderr).trim());
     }
     Ok(())
+}
+
+/// Live Docker check that no container for `app` is still running or shutting down.
+async fn docker_app_running(app: &str) -> bool {
+    let filter = format!("label=latrix.app={app}");
+    match cmd_timeout("docker", &["ps", "-q", "--filter", &filter], Duration::from_secs(10)).await {
+        Ok(out) => !out.trim().is_empty(),
+        // Fail safe (assume running) if Docker didn't answer so we don't declare a false final sync.
+        Err(_) => true,
+    }
 }
 
 async fn sync_once(agent: &Arc<Agent>) -> Result<()> {
@@ -151,11 +222,19 @@ async fn sync_once(agent: &Arc<Agent>) -> Result<()> {
     let t = now();
     let mut seen = vec![];
     for vol in s.volumes.values().filter(|v| v.primary == me) {
+        if !util::safe_id(&vol.id) {
+            continue;
+        }
         seen.push(vol.id.clone());
+        let vlock = agent.vols.volume_lock(&vol.id);
+        let Ok(_guard) = vlock.try_lock_owned() else {
+            continue; // restore or snapshot in progress on this volume
+        };
         let dir = volumes_dir(agent).join(&vol.id);
         let _ = std::fs::create_dir_all(&dir);
         let running = agent.rt.running_container(&vol.app);
-        if running.is_some() {
+        let active_work = agent.rt.app_has_active_work(&vol.app, &s, me);
+        if active_work {
             agent.vols.last_running.lock().unwrap().insert(vol.id.clone(), t);
         }
         let last_running = agent.vols.last_running.lock().unwrap().get(&vol.id).copied().unwrap_or(0);
@@ -172,19 +251,31 @@ async fn sync_once(agent: &Arc<Agent>) -> Result<()> {
             });
         rep.synced.retain(|m, _| vol.replicas.contains(m));
         rep.synced_version.retain(|m, _| vol.replicas.contains(m));
-        let idle_needed = running.is_none()
+        let idle_needed = !active_work
             && (rep.idle_synced_at <= last_running
                 || rep.idle_synced_at == 0
                 || (vol.moving_to.is_some() && rep.idle_synced_version < vol.moving_version));
         let version_at_start = s.version;
-        let due: Vec<u32> = vol
+        let mut due: Vec<u32> = vol
             .replicas
             .iter()
             .copied()
             .filter(|r| idle_needed || t.saturating_sub(rep.synced.get(r).copied().unwrap_or(0)) >= vol.sync_secs)
             .collect();
+        // Prioritize the planned move target first so slow/dead replicas can't delay it.
+        if let Some(target) = vol.moving_to {
+            if let Some(pos) = due.iter().position(|r| *r == target) {
+                due.swap(0, pos);
+            }
+        }
 
         if !due.is_empty() {
+            // Confirm via live Docker check before starting a final idle sync.
+            let truly_idle_before = if idle_needed {
+                !docker_app_running(&vol.app).await
+            } else {
+                false
+            };
             // Let the app write a consistent snapshot first, if it asked to.
             if let Some(ctr) = &running {
                 let pre = s
@@ -194,25 +285,32 @@ async fn sync_once(agent: &Arc<Agent>) -> Result<()> {
                     .and_then(|c| c.volumes.iter().find(|v| v.name == vol.name))
                     .and_then(|v| v.pre_sync.clone());
                 if let Some(pre) = pre {
-                    if let Err(e) = tokio::time::timeout(
+                    if let Err(e) = cmd_timeout(
+                        "docker",
+                        &["exec", ctr, "sh", "-c", &pre],
                         Duration::from_secs(120),
-                        cmd("docker", &["exec", ctr, "sh", "-c", &pre]),
                     )
                     .await
-                    .unwrap_or_else(|_| Err(anyhow::anyhow!("timed out")))
                     {
                         warn!("pre_sync for {} failed: {e}", vol.id);
                     }
                 }
             }
             let mut all_ok = true;
+            let mut target_ok = vol.moving_to.is_none();
             for r in &due {
-                let Some(ip) = agent.ip_of(*r) else { continue };
+                let Some(ip) = agent.ip_of(*r) else {
+                    all_ok = false;
+                    continue;
+                };
                 match rsync_to(agent, vol, &ip).await {
                     Ok(()) => {
                         rep.synced.insert(*r, now());
                         rep.synced_version.insert(*r, version_at_start);
                         rep.error = None;
+                        if vol.moving_to == Some(*r) {
+                            target_ok = true;
+                        }
                     }
                     Err(e) => {
                         all_ok = false;
@@ -220,40 +318,59 @@ async fn sync_once(agent: &Arc<Agent>) -> Result<()> {
                     }
                 }
             }
-            if idle_needed && all_ok && agent.rt.running_container(&vol.app).is_none() {
+            let move_ready = if vol.moving_to.is_some() { target_ok } else { all_ok };
+            if truly_idle_before
+                && move_ready
+                && !agent.rt.app_has_active_work(&vol.app, &agent.snapshot(), me)
+                && !docker_app_running(&vol.app).await
+            {
                 rep.idle_synced_at = now();
                 rep.idle_synced_version = version_at_start;
                 info!("final sync of volume {} complete", vol.id);
             }
-        } else if idle_needed && vol.replicas.is_empty() {
+        } else if idle_needed && vol.replicas.is_empty() && !docker_app_running(&vol.app).await {
             rep.idle_synced_at = now();
             rep.idle_synced_version = version_at_start;
         }
 
         let sized = agent.vols.sized_at.lock().unwrap().get(&vol.id).copied().unwrap_or(0);
         if t.saturating_sub(sized) > 300 {
-            if let Ok(out) = cmd("du", &["-sm", &dir.display().to_string()]).await {
-                rep.size_mb = out.split_whitespace().next().and_then(|n| n.parse().ok()).unwrap_or(0);
+            if let Ok(out) = cmd_timeout("du", &["-sm", "--", &dir.display().to_string()], Duration::from_secs(30)).await {
+                rep.size_mb = out
+                    .split_once('\t')
+                    .map(|(n, _)| n)
+                    .or_else(|| out.split_whitespace().next())
+                    .and_then(|n| n.trim().parse().ok())
+                    .unwrap_or(0);
             }
             agent.vols.sized_at.lock().unwrap().insert(vol.id.clone(), t);
         }
         agent.vols.reports.lock().unwrap().insert(vol.id.clone(), rep);
     }
     agent.vols.reports.lock().unwrap().retain(|k, _| seen.contains(k));
+    agent.vols.last_running.lock().unwrap().retain(|k, _| seen.contains(k));
+    agent.vols.sized_at.lock().unwrap().retain(|k, _| seen.contains(k));
 
-    // Volumes destroyed with --purge-volumes.
-    for id in s.tombstones.keys() {
-        if id.contains('/') || id.contains("..") {
-            continue;
-        }
-        let dir = volumes_dir(agent).join(id);
-        if dir.exists() && !s.volumes.contains_key(id) {
-            info!("purging volume data {}", dir.display());
-            let _ = std::fs::remove_dir_all(&dir);
-        }
-        let snaps = snapshots_dir(agent).join(id);
-        if snaps.exists() && !s.volumes.contains_key(id) {
-            let _ = std::fs::remove_dir_all(&snaps);
+    // Volumes destroyed with --purge-volumes (only once state is current and volume is truly unused).
+    if state_is_current(agent) {
+        let fresh_s = agent.snapshot();
+        for id in fresh_s.tombstones.keys() {
+            if !util::safe_id(id) || fresh_s.volumes.contains_key(id) {
+                continue;
+            }
+            let app = id.split("__").next().unwrap_or_default();
+            if !app.is_empty() && agent.rt.app_has_active_work(app, &fresh_s, me) {
+                continue;
+            }
+            let dir = volumes_dir(agent).join(id);
+            if dir.exists() {
+                info!("purging volume data {}", dir.display());
+                let _ = std::fs::remove_dir_all(&dir);
+            }
+            let snaps = snapshots_dir(agent).join(id);
+            if snaps.exists() {
+                let _ = std::fs::remove_dir_all(&snaps);
+            }
         }
     }
     Ok(())
@@ -305,14 +422,15 @@ pub fn retention_secs(s: &crate::state::ClusterState) -> u64 {
 /// Find volume data no app uses on this machine; after the retention period
 /// delete it. Also clears temporary leftovers of restores.
 pub async fn scan_unused(agent: &Arc<Agent>) -> Result<()> {
+    let Ok(_scan_guard) = agent.vols.scan_lock.try_lock() else {
+        return Ok(());
+    };
     load_unused(agent);
     if !state_is_current(agent) {
         return Ok(());
     }
-    let s = agent.snapshot();
     let me = agent.me.machine_id;
     let t = now();
-    let retention = retention_secs(&s);
     let base = volumes_dir(agent);
     let mut seen = vec![];
     for entry in std::fs::read_dir(&base)?.flatten() {
@@ -329,21 +447,33 @@ pub async fn scan_unused(agent: &Arc<Agent>) -> Result<()> {
             }
             continue;
         }
-        if !entry.path().is_dir() {
+        // Use file_type() so symlinks aren't followed.
+        if !entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) || !util::safe_id(&name) {
             continue;
         }
+        let s = agent.snapshot();
         if in_use(&s, me, &name) {
             continue;
         }
+        let retention = retention_secs(&s);
         seen.push(name.clone());
         let first = agent.vols.unused.lock().unwrap().get(&name).map(|x| x.0);
         match first {
             None => {
-                let size = cmd("du", &["-sm", &entry.path().display().to_string()])
-                    .await
-                    .ok()
-                    .and_then(|o| o.split_whitespace().next().and_then(|n| n.parse().ok()))
-                    .unwrap_or(0);
+                let size = cmd_timeout(
+                    "du",
+                    &["-sm", "--", &entry.path().display().to_string()],
+                    Duration::from_secs(60),
+                )
+                .await
+                .ok()
+                .and_then(|o| {
+                    o.split_once('\t')
+                        .map(|(n, _)| n)
+                        .or_else(|| o.split_whitespace().next())
+                        .and_then(|n| n.trim().parse().ok())
+                })
+                .unwrap_or(0);
                 agent.vols.unused.lock().unwrap().insert(name.clone(), (t, size));
                 if retention > 0 {
                     agent.event(
@@ -357,8 +487,20 @@ pub async fn scan_unused(agent: &Arc<Agent>) -> Result<()> {
                 }
             }
             Some(since) if t.saturating_sub(since) >= retention => {
+                // Re-check live state immediately before deleting (in case app was redeployed while `du` ran).
+                let fresh = agent.snapshot();
+                let app = name.split("__").next().unwrap_or_default();
+                if !state_is_current(agent)
+                    || in_use(&fresh, me, &name)
+                    || (!app.is_empty() && agent.rt.app_has_active_work(app, &fresh, me))
+                {
+                    continue;
+                }
                 info!("deleting unused volume data {name}");
-                std::fs::remove_dir_all(entry.path())?;
+                if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                    warn!("could not delete unused volume data {name}: {e}");
+                    continue;
+                }
                 let _ = std::fs::remove_dir_all(snapshots_dir(agent).join(&name));
                 let size = agent.vols.unused.lock().unwrap().remove(&name).map(|x| x.1).unwrap_or(0);
                 agent.event("info", format!("deleted unused volume data {name} ({size} MB)"));
@@ -384,7 +526,7 @@ pub fn unused_list(agent: &Agent) -> Vec<UnusedVolume> {
             volume: k.clone(),
             size_mb: *size,
             unused_since: *since,
-            delete_at: since + retention,
+            delete_at: since.saturating_add(retention),
         })
         .collect();
     v.sort_by(|a, b| a.volume.cmp(&b.volume));
@@ -399,10 +541,14 @@ pub async fn handle_unused(
 ) -> axum::response::Response {
     use axum::response::IntoResponse;
     if method == axum::http::Method::DELETE {
-        let Some(id) = q.get("volume").filter(|v| !v.is_empty() && !v.contains('/') && !v.contains("..") && !v.starts_with('.')) else {
+        let Some(id) = q.get("volume").filter(|v| util::safe_id(v)) else {
             return (axum::http::StatusCode::BAD_REQUEST, "volume= required").into_response();
         };
-        if in_use(&agent.snapshot(), agent.me.machine_id, id) {
+        let snap = agent.snapshot();
+        let app = id.split("__").next().unwrap_or_default();
+        if in_use(&snap, agent.me.machine_id, id)
+            || (!app.is_empty() && agent.rt.app_has_active_work(app, &snap, agent.me.machine_id))
+        {
             return (axum::http::StatusCode::CONFLICT, format!("{id} is in use")).into_response();
         }
         let dir = volumes_dir(&agent).join(id);
@@ -411,6 +557,7 @@ pub async fn handle_unused(
                 return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
             }
         }
+        let _ = std::fs::remove_dir_all(snapshots_dir(&agent).join(id));
         agent.vols.unused.lock().unwrap().remove(id);
         save_unused(&agent);
         agent.event("info", format!("deleted unused volume data {id}"));
@@ -459,8 +606,22 @@ pub fn trim_snapshots(agent: &Agent, keep: usize) {
     }
 }
 
+struct RemoveDirOnDrop(PathBuf);
+impl Drop for RemoveDirOnDrop {
+    fn drop(&mut self) {
+        if self.0.exists() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+}
+
 /// Take a snapshot of one volume now (runs the app's pre_sync hook first).
 pub async fn take_snapshot(agent: &Agent, vol: &crate::state::Volume) -> Result<String> {
+    if !util::safe_id(&vol.id) {
+        bail!("invalid volume id '{}'", vol.id);
+    }
+    let vlock = agent.vols.volume_lock(&vol.id);
+    let _guard = vlock.lock_owned().await;
     let s = agent.snapshot();
     if let Some(ctr) = agent.rt.running_container(&vol.app) {
         let pre = s
@@ -470,28 +631,44 @@ pub async fn take_snapshot(agent: &Agent, vol: &crate::state::Volume) -> Result<
             .and_then(|c| c.volumes.iter().find(|v| v.name == vol.name))
             .and_then(|v| v.pre_sync.clone());
         if let Some(pre) = pre {
-            let _ = cmd("docker", &["exec", &ctr, "sh", "-c", &pre]).await;
+            if let Err(e) = cmd_timeout(
+                "docker",
+                &["exec", &ctr, "sh", "-c", &pre],
+                Duration::from_secs(120),
+            )
+            .await
+            {
+                warn!("pre_sync before snapshot of {} failed: {e}", vol.id);
+            }
         }
     }
     let dir = snapshots_dir(agent).join(&vol.id);
     std::fs::create_dir_all(&dir)?;
-    let name = crate::cli::backup::stamp(now());
+    let ts = now();
+    let base_name = format!("{}-{:02}", crate::cli::backup::stamp(ts), ts % 60);
+    let name = if dir.join(&base_name).exists() {
+        format!("{base_name}-{}", util::random_id(3))
+    } else {
+        base_name
+    };
     let prev = list_snapshots(agent, &vol.id).into_iter().last();
     let src = format!("{}/", volumes_dir(agent).join(&vol.id).display());
-    let tmp = dir.join(format!(".{name}"));
-    let mut args = vec!["-a".to_string(), "--delete".into()];
+    let tmp = dir.join(format!(".{name}-{}", util::random_id(4)));
+    let tmp_guard = RemoveDirOnDrop(tmp.clone());
+    let mut args = vec!["-a".to_string(), "--delete".into(), "--numeric-ids".into()];
     if let Some(p) = &prev {
         if p != &name {
             args.push(format!("--link-dest={}", dir.join(p).display()));
         }
     }
+    args.push("--".into());
     args.push(src);
     args.push(format!("{}/", tmp.display()));
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    cmd("rsync", &refs).await?;
+    cmd_timeout("rsync", &refs, Duration::from_secs(600)).await?;
     let final_dir = dir.join(&name);
-    let _ = std::fs::remove_dir_all(&final_dir);
     std::fs::rename(&tmp, &final_dir)?;
+    std::mem::forget(tmp_guard);
     let keep = s.settings.volume_snapshots.max(1) as usize;
     let snaps = list_snapshots(agent, &vol.id);
     if snaps.len() > keep {
@@ -510,12 +687,20 @@ async fn snapshot_due(agent: &Arc<Agent>) -> Result<()> {
         return Ok(());
     }
     for vol in s.volumes.values().filter(|v| v.primary == agent.me.machine_id && v.moving_to.is_none()) {
+        // Ignore hidden temp dirs (e.g. from a crashed snapshot) so they never suppress daily snapshots.
         let newest = std::fs::read_dir(snapshots_dir(agent).join(&vol.id))
             .ok()
-            .and_then(|rd| rd.flatten().filter_map(|e| e.metadata().ok()?.modified().ok()).max());
+            .and_then(|rd| {
+                rd.flatten()
+                    .filter(|e| !e.file_name().to_string_lossy().starts_with('.'))
+                    .filter_map(|e| e.metadata().ok()?.modified().ok())
+                    .max()
+            });
         let due = newest.map(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(86400 - 600)).unwrap_or(true);
         if due {
-            take_snapshot(agent, vol).await?;
+            if let Err(e) = take_snapshot(agent, vol).await {
+                warn!("daily snapshot of {} failed: {e:#}", vol.id);
+            }
         }
     }
     Ok(())
@@ -537,7 +722,7 @@ pub async fn handle_snapshots(
     use axum::http::StatusCode;
     use axum::response::IntoResponse;
     let bad = |m: &str| (StatusCode::BAD_REQUEST, axum::Json(crate::api_types::ApiErrorBody { error: m.into() })).into_response();
-    let Some(id) = q.get("volume").filter(|v| !v.is_empty() && !v.contains('/') && !v.contains("..")).cloned() else {
+    let Some(id) = q.get("volume").filter(|v| util::safe_id(v)).cloned() else {
         return bad("volume= required");
     };
     if method == axum::http::Method::GET {
@@ -546,15 +731,17 @@ pub async fn handle_snapshots(
         let dir = snapshots_dir(&agent).join(&id);
         let mut sizes: HashMap<String, u64> = HashMap::new();
         if !snaps.is_empty() {
-            let mut args = vec!["-sm".to_string()];
+            let mut args = vec!["-sm".to_string(), "--".into()];
             args.extend(snaps.iter().map(|n| dir.join(n).display().to_string()));
             let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            if let Ok(out) = cmd("du", &refs).await {
+            if let Ok(out) = cmd_timeout("du", &refs, Duration::from_secs(30)).await {
                 for line in out.lines() {
-                    let mut it = line.split_whitespace();
-                    if let (Some(n), Some(p)) = (it.next(), it.next()) {
-                        let name = p.rsplit('/').next().unwrap_or("").to_string();
-                        sizes.insert(name, n.parse().unwrap_or(0));
+                    if let Some((n, p)) = line.split_once('\t') {
+                        let name = Path::new(p.trim())
+                            .file_name()
+                            .map(|f| f.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        sizes.insert(name, n.trim().parse().unwrap_or(0));
                     }
                 }
             }
@@ -573,17 +760,41 @@ pub async fn handle_snapshots(
             Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
         },
         Some("restore") => {
-            let Some(snap) = q.get("snapshot").filter(|n| list_snapshots(&agent, &id).contains(n)).cloned() else {
+            if vol.primary != agent.me.machine_id {
+                return (StatusCode::CONFLICT, format!("this machine is not the primary for {id}")).into_response();
+            }
+            let Some(snap) = q.get("snapshot").filter(|n| util::safe_id(n) && list_snapshots(&agent, &id).contains(n)).cloned() else {
                 return bad("unknown snapshot");
             };
-            if agent.rt.running_container(&vol.app).is_some() {
+            let vlock = agent.vols.volume_lock(&id);
+            let _guard = vlock.lock_owned().await;
+            if agent.rt.app_has_active_work(&vol.app, &agent.snapshot(), agent.me.machine_id)
+                || docker_app_running(&vol.app).await
+            {
                 return (StatusCode::CONFLICT, format!("{} is running here; scale it to 0 first", vol.app)).into_response();
             }
+            let base = volumes_dir(&agent);
+            let _ = std::fs::create_dir_all(&base);
             let src = format!("{}/", snapshots_dir(&agent).join(&id).join(&snap).display());
-            let dst = format!("{}/", volumes_dir(&agent).join(&id).display());
-            let _ = std::fs::create_dir_all(volumes_dir(&agent).join(&id));
-            match cmd("rsync", &["-a", "--delete", &src, &dst]).await {
+            let staged = base.join(format!(".{id}-snaprestore-{}", util::random_id(6)));
+            let staged_guard = RemoveDirOnDrop(staged.clone());
+            let _ = std::fs::create_dir_all(&staged);
+            let dst = format!("{}/", staged.display());
+            match cmd_timeout("rsync", &["-a", "--numeric-ids", "--", &src, &dst], Duration::from_secs(600)).await {
                 Ok(_) => {
+                    let live_dir = base.join(&id);
+                    let old_dir = base.join(format!(".{id}-old-{}", util::random_id(6)));
+                    if live_dir.exists() {
+                        if let Err(e) = std::fs::rename(&live_dir, &old_dir) {
+                            return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+                        }
+                    }
+                    if let Err(e) = std::fs::rename(&staged, &live_dir) {
+                        let _ = std::fs::rename(&old_dir, &live_dir);
+                        return (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response();
+                    }
+                    std::mem::forget(staged_guard);
+                    let _ = std::fs::remove_dir_all(&old_dir);
                     agent.vols.kick();
                     agent.event("info", format!("volume {id} rolled back to snapshot {snap}"));
                     axum::Json(true).into_response()

@@ -32,10 +32,12 @@ fn free_port() -> Result<u16> {
 impl Tunnel {
     pub fn open(m: &MachineSsh, local_port: Option<u16>) -> Result<Tunnel> {
         let port = match local_port {
+            Some(0) => bail!("local port must be non-zero"),
             Some(p) => p,
             None => free_port()?,
         };
         let ssh = Ssh::new(&m.ssh, m.port, m.key.clone());
+        crate::util::validate_ssh_target(&ssh.target)?;
         let mut args = vec![
             "-N".to_string(),
             "-o".into(),
@@ -49,6 +51,7 @@ impl Tunnel {
             m.port.to_string(),
         ];
         args.extend(ssh.common_args());
+        args.push("--".into());
         args.push(ssh.target.clone());
         let mut child = std::process::Command::new("ssh")
             .args(&args)
@@ -59,14 +62,6 @@ impl Tunnel {
             .map_err(|e| anyhow!("could not run ssh: {e}"))?;
         let start = Instant::now();
         loop {
-            if std::net::TcpStream::connect_timeout(
-                &format!("127.0.0.1:{port}").parse().unwrap(),
-                Duration::from_millis(200),
-            )
-            .is_ok()
-            {
-                return Ok(Tunnel { child, port });
-            }
             if let Ok(Some(st)) = child.try_wait() {
                 let mut err = String::new();
                 if let Some(mut e) = child.stderr.take() {
@@ -75,12 +70,40 @@ impl Tunnel {
                 }
                 bail!("ssh tunnel to {} exited ({st}): {}", m.ssh, err.trim());
             }
+            if std::net::TcpStream::connect_timeout(
+                &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+                Duration::from_millis(200),
+            )
+            .is_ok()
+            {
+                // Verify ssh is still alive (not an unrelated process already on `port`).
+                if let Ok(Some(st)) = child.try_wait() {
+                    let mut err = String::new();
+                    if let Some(mut e) = child.stderr.take() {
+                        use std::io::Read;
+                        let _ = e.read_to_string(&mut err);
+                    }
+                    bail!("ssh tunnel to {} exited ({st}): {}", m.ssh, err.trim());
+                }
+                // Drain stderr in the background so verbose ssh messages can never fill the pipe buffer.
+                if let Some(mut stderr) = child.stderr.take() {
+                    std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+                    });
+                }
+                return Ok(Tunnel { child, port });
+            }
             if start.elapsed() > Duration::from_secs(20) {
                 let _ = child.kill();
+                let _ = child.wait();
                 bail!("timed out opening ssh tunnel to {}", m.ssh);
             }
             std::thread::sleep(Duration::from_millis(150));
         }
+    }
+
+    pub fn exited(&mut self) -> Option<std::process::ExitStatus> {
+        self.child.try_wait().ok().flatten()
     }
 }
 
@@ -97,6 +120,7 @@ pub struct Client {
 impl Client {
     pub async fn connect(p: &ClusterProfile) -> Result<Client> {
         let http = reqwest::Client::builder()
+            .no_proxy()
             .connect_timeout(Duration::from_secs(10))
             .build()?;
         if p.local {

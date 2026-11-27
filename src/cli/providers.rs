@@ -4,11 +4,26 @@
 
 use super::profile::CliConfig;
 use crate::state::ProviderRef;
-use crate::util::{print_table, random_id};
+use crate::util::{self, print_table, random_id};
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+#[derive(Debug)]
+struct ProviderApiError {
+    url: String,
+    status: reqwest::StatusCode,
+    body: String,
+}
+
+impl std::fmt::Display for ProviderApiError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}: {}: {}", self.url, self.status, self.body)
+    }
+}
+
+impl std::error::Error for ProviderApiError {}
 
 pub struct Created {
     pub ip: String,
@@ -24,20 +39,34 @@ pub fn canonical(p: &str) -> Result<&'static str> {
     }
 }
 
+fn validate_provider_id(id: &str) -> Result<&str> {
+    let id = id.trim();
+    if id.is_empty()
+        || id.len() > 64
+        || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        bail!("invalid provider server id '{id}'");
+    }
+    Ok(id)
+}
+
 pub fn token(cfg: &CliConfig, provider: &str) -> Result<String> {
     let p = canonical(provider)?;
     let env = if p == "hetzner" { "HCLOUD_TOKEN" } else { "DIGITALOCEAN_TOKEN" };
     std::env::var(env)
         .ok()
-        .or_else(|| cfg.providers.get(p).cloned())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .or_else(|| cfg.providers.get(p).map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
         .ok_or_else(|| anyhow!("no API token for {p}: run `latrix provider set {p} <token>` or set {env}"))
 }
 
 /// Fallback when the provider's image list can't be read.
-fn fallback_image(provider: &str) -> &'static str {
+fn fallback_image(provider: &str) -> Result<&'static str> {
     match provider {
-        "hetzner" => "ubuntu-24.04",
-        _ => "ubuntu-24-04-x64",
+        "hetzner" => Ok("ubuntu-24.04"),
+        "digitalocean" => Ok("ubuntu-24-04-x64"),
+        other => bail!("unknown provider '{other}'"),
     }
 }
 
@@ -83,6 +112,55 @@ pub fn pick_do_ubuntu(images: &Value) -> Option<String> {
     )
 }
 
+async fn hetzner_paginated(
+    http: &reqwest::Client,
+    token: &str,
+    base_url: &str,
+    array_key: &str,
+) -> Result<Vec<Value>> {
+    let sep = if base_url.contains('?') { '&' } else { '?' };
+    let mut all = vec![];
+    for page in 1..=50u32 {
+        let url = format!("{base_url}{sep}per_page=50&page={page}");
+        let v = api(http, reqwest::Method::GET, &url, token, None).await?;
+        if let Some(arr) = v[array_key].as_array() {
+            all.extend(arr.iter().cloned());
+        }
+        match v["meta"]["pagination"]["next_page"].as_u64() {
+            Some(next) if next > page as u64 => {}
+            _ => break,
+        }
+    }
+    Ok(all)
+}
+
+async fn do_paginated(
+    http: &reqwest::Client,
+    token: &str,
+    first_url: &str,
+    array_key: &str,
+) -> Result<Vec<Value>> {
+    let sep = if first_url.contains('?') { '&' } else { '?' };
+    let mut next_url = Some(format!("{first_url}{sep}per_page=200"));
+    let mut all = vec![];
+    for _ in 0..50 {
+        let Some(url) = next_url.take() else { break };
+        let parsed = reqwest::Url::parse(&url)?;
+        if parsed.scheme() != "https" || parsed.host_str() != Some("api.digitalocean.com") {
+            bail!("unexpected DigitalOcean pagination URL '{url}'");
+        }
+        let v = api(http, reqwest::Method::GET, &url, token, None).await?;
+        if let Some(arr) = v[array_key].as_array() {
+            all.extend(arr.iter().cloned());
+        }
+        next_url = v["links"]["pages"]["next"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+    }
+    Ok(all)
+}
+
 /// The newest Ubuntu LTS the provider offers for this server size, so new
 /// machines don't start on an old release.
 pub async fn latest_ubuntu(provider: &str, token: &str, size: &str) -> String {
@@ -96,18 +174,24 @@ pub async fn latest_ubuntu(provider: &str, token: &str, size: &str) -> String {
                 .ok()
                 .and_then(|v| v["server_types"][0]["architecture"].as_str().map(String::from))
                 .unwrap_or_else(|| "x86".into());
-            api(&http, M::GET, &format!("{base}/images?type=system&per_page=50"), token, None)
+            hetzner_paginated(&http, token, &format!("{base}/images?type=system"), "images")
                 .await
                 .ok()
-                .and_then(|v| pick_hetzner_ubuntu(&v, &arch))
+                .and_then(|list| pick_hetzner_ubuntu(&json!({"images": list}), &arch))
         }
-        _ => api(&http, M::GET, "https://api.digitalocean.com/v2/images?type=distribution&per_page=200", token, None)
-            .await
-            .ok()
-            .and_then(|v| pick_do_ubuntu(&v)),
+        "digitalocean" => do_paginated(
+            &http,
+            token,
+            "https://api.digitalocean.com/v2/images?type=distribution",
+            "images",
+        )
+        .await
+        .ok()
+        .and_then(|list| pick_do_ubuntu(&json!({"images": list}))),
+        _ => None,
     };
     found.unwrap_or_else(|| {
-        let f = fallback_image(provider);
+        let f = fallback_image(provider).unwrap_or("ubuntu-24.04");
         tracing::warn!("could not list {provider} images; using {f} (pass --image to choose)");
         f.to_string()
     })
@@ -118,33 +202,59 @@ pub async fn latest_ubuntu(provider: &str, token: &str, size: &str) -> String {
 /// (~/.ssh/id_ed25519 etc.); if you have none, latrix creates and manages
 /// its own key next to its config, so you don't need to set anything up.
 pub fn ssh_key(key: Option<&str>) -> Result<(String, Option<String>)> {
+    ssh_key_in(key, dirs::home_dir().as_deref(), &managed_key_path())
+}
+
+fn ssh_key_in(
+    key: Option<&str>,
+    home_dir: Option<&Path>,
+    own: &Path,
+) -> Result<(String, Option<String>)> {
     if let Some(k) = key {
-        let pub_path = format!("{k}.pub");
+        let (priv_path, pub_path) = if let Some(stripped) = k.strip_suffix(".pub") {
+            (PathBuf::from(stripped), PathBuf::from(k))
+        } else {
+            (PathBuf::from(k), PathBuf::from(format!("{k}.pub")))
+        };
+        if !priv_path.exists() {
+            bail!("private SSH key '{}' not found", priv_path.display());
+        }
         let pubkey = std::fs::read_to_string(&pub_path)
-            .with_context(|| format!("reading {pub_path} (the public half of --key)"))?;
-        return Ok((pubkey.trim().to_string(), Some(k.to_string())));
+            .with_context(|| format!("reading {} (the public half of --key)", pub_path.display()))?;
+        return Ok((pubkey.trim().to_string(), Some(priv_path.display().to_string())));
     }
-    let home = dirs::home_dir().unwrap_or_default().join(".ssh");
-    for f in ["id_ed25519", "id_ecdsa", "id_rsa"] {
-        if let Ok(k) = std::fs::read_to_string(home.join(format!("{f}.pub"))) {
-            return Ok((k.trim().to_string(), None));
+    if let Some(home) = home_dir {
+        let ssh_dir = home.join(".ssh");
+        for f in ["id_ed25519", "id_ecdsa", "id_rsa"] {
+            let priv_p = ssh_dir.join(f);
+            let pub_p = ssh_dir.join(format!("{f}.pub"));
+            if priv_p.is_file() {
+                if let Ok(k) = std::fs::read_to_string(&pub_p) {
+                    let trimmed = k.trim();
+                    if !trimmed.is_empty() {
+                        return Ok((trimmed.to_string(), None));
+                    }
+                }
+            }
         }
     }
-    let own = managed_key_path();
     let own_pub = PathBuf::from(format!("{}.pub", own.display()));
-    if !own_pub.exists() {
+    if !own.is_file() || !own_pub.is_file() {
         if let Some(dir) = own.parent() {
-            std::fs::create_dir_all(dir)?;
+            util::create_private_dir_all(dir)?;
         }
+        let _ = std::fs::remove_file(own);
+        let _ = std::fs::remove_file(&own_pub);
         let st = std::process::Command::new("ssh-keygen")
             .args(["-q", "-t", "ed25519", "-N", "", "-C", "latrix", "-f"])
-            .arg(&own)
+            .arg(own)
             .stdin(std::process::Stdio::null())
             .status()
             .context("could not run ssh-keygen (is OpenSSH installed?)")?;
         if !st.success() {
             bail!("ssh-keygen failed");
         }
+        crate::agent::set_private(own);
         println!("==> created an SSH key for latrix at {}", own.display());
     }
     let pubkey = std::fs::read_to_string(&own_pub)?;
@@ -160,8 +270,16 @@ pub fn managed_key_path() -> PathBuf {
 }
 
 fn same_key(a: &str, b: &str) -> bool {
-    let f = |s: &str| s.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
-    f(a) == f(b)
+    let norm = |s: &str| -> Option<String> {
+        let mut it = s.split_whitespace();
+        let ty = it.next()?;
+        let data = it.next()?;
+        Some(format!("{ty} {data}"))
+    };
+    match (norm(a), norm(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
 }
 
 async fn api(
@@ -179,7 +297,11 @@ async fn api(
     let status = r.status();
     let text = r.text().await?;
     if !status.is_success() {
-        bail!("{url}: {status}: {}", text.chars().take(400).collect::<String>());
+        return Err(anyhow::Error::new(ProviderApiError {
+            url: url.to_string(),
+            status,
+            body: text.chars().take(400).collect(),
+        }));
     }
     if text.trim().is_empty() {
         return Ok(Value::Null);
@@ -188,14 +310,33 @@ async fn api(
 }
 
 /// Make sure every public key is registered with the provider; returns their ids.
-async fn ensure_keys(http: &reqwest::Client, token: &str, url: &str, pubkeys: &[String]) -> Result<Vec<Value>> {
-    let existing = api(http, reqwest::Method::GET, &format!("{url}?per_page=200"), token, None).await?;
-    let list = existing["ssh_keys"].as_array().cloned().unwrap_or_default();
-    let mut ids = vec![];
+async fn ensure_keys(
+    http: &reqwest::Client,
+    provider: &str,
+    token: &str,
+    url: &str,
+    pubkeys: &[String],
+) -> Result<Vec<Value>> {
+    let list = match provider {
+        "hetzner" => hetzner_paginated(http, token, url, "ssh_keys").await?,
+        "digitalocean" => do_paginated(http, token, url, "ssh_keys").await?,
+        other => bail!("unknown provider '{other}'"),
+    };
+    let mut unique: Vec<&str> = vec![];
     for pk in pubkeys {
+        let t = pk.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if !unique.iter().any(|u| same_key(u, t)) {
+            unique.push(t);
+        }
+    }
+    let mut ids = vec![];
+    for pk in unique {
         match list.iter().find(|k| same_key(k["public_key"].as_str().unwrap_or(""), pk)) {
-            Some(k) => ids.push(k["id"].clone()),
-            None => {
+            Some(k) if !k["id"].is_null() => ids.push(k["id"].clone()),
+            _ => {
                 let k = api(
                     http,
                     reqwest::Method::POST,
@@ -204,7 +345,11 @@ async fn ensure_keys(http: &reqwest::Client, token: &str, url: &str, pubkeys: &[
                     Some(json!({"name": format!("latrix-{}", random_id(5)), "public_key": pk})),
                 )
                 .await?;
-                ids.push(k["ssh_key"]["id"].clone());
+                let id = k["ssh_key"]["id"].clone();
+                if id.is_null() {
+                    bail!("{provider} did not return an SSH key ID when uploading key");
+                }
+                ids.push(id);
             }
         }
     }
@@ -225,7 +370,7 @@ pub async fn create(
     match provider {
         "hetzner" => {
             let base = "https://api.hetzner.cloud/v1";
-            let key_ids = ensure_keys(&http, token, &format!("{base}/ssh_keys"), pubkeys).await?;
+            let key_ids = ensure_keys(&http, "hetzner", token, &format!("{base}/ssh_keys"), pubkeys).await?;
             let res = api(
                 &http,
                 M::POST,
@@ -239,37 +384,56 @@ pub async fn create(
             )
             .await?;
             let id = res["server"]["id"].as_i64().context("no server id in response")?;
-            let start = Instant::now();
-            loop {
-                let s = api(&http, M::GET, &format!("{base}/servers/{id}"), token, None).await?;
-                let srv = &s["server"];
-                let ip = srv["public_net"]["ipv4"]["ip"].as_str().unwrap_or("").to_string();
-                if srv["status"] == "running" && !ip.is_empty() {
-                    let price = srv["server_type"]["prices"]
-                        .as_array()
-                        .and_then(|p| p.iter().find(|x| x["location"] == region).or(p.first()))
-                        .and_then(|p| p["price_monthly"]["gross"].as_str())
-                        .and_then(|p| p.parse::<f64>().ok());
-                    return Ok(Created {
-                        ip,
-                        monthly_cost: price,
-                        provider: ProviderRef {
-                            provider: "hetzner".into(),
-                            id: id.to_string(),
-                            size: size.into(),
-                            region: region.into(),
-                        },
-                    });
+            let pref = ProviderRef {
+                provider: "hetzner".into(),
+                id: id.to_string(),
+                size: size.into(),
+                region: region.into(),
+            };
+            let poll = async {
+                let start = Instant::now();
+                let mut consecutive_errs = 0u32;
+                loop {
+                    match api(&http, M::GET, &format!("{base}/servers/{id}"), token, None).await {
+                        Ok(s) => {
+                            consecutive_errs = 0;
+                            let srv = &s["server"];
+                            let ip = srv["public_net"]["ipv4"]["ip"].as_str().unwrap_or("").to_string();
+                            if srv["status"] == "running" && !ip.is_empty() {
+                                let price = srv["server_type"]["prices"]
+                                    .as_array()
+                                    .and_then(|p| p.iter().find(|x| x["location"] == region).or(p.first()))
+                                    .and_then(|p| p["price_monthly"]["gross"].as_str())
+                                    .and_then(|p| p.parse::<f64>().ok());
+                                return Ok(Created {
+                                    ip,
+                                    monthly_cost: price,
+                                    provider: pref.clone(),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            consecutive_errs += 1;
+                            if consecutive_errs >= 5 {
+                                return Err(e);
+                            }
+                        }
+                    }
+                    if start.elapsed() > Duration::from_secs(300) {
+                        bail!("server {id} did not start within 5 minutes");
+                    }
+                    tokio::time::sleep(Duration::from_secs(4)).await;
                 }
-                if start.elapsed() > Duration::from_secs(300) {
-                    bail!("server {id} did not start within 5 minutes");
-                }
-                tokio::time::sleep(Duration::from_secs(4)).await;
             }
+            .await;
+            if poll.is_err() {
+                let _ = destroy(&pref, token).await;
+            }
+            poll
         }
-        _ => {
+        "digitalocean" => {
             let base = "https://api.digitalocean.com/v2";
-            let key_ids = ensure_keys(&http, token, &format!("{base}/account/keys"), pubkeys).await?;
+            let key_ids = ensure_keys(&http, "digitalocean", token, &format!("{base}/account/keys"), pubkeys).await?;
             let res = api(
                 &http,
                 M::POST,
@@ -282,42 +446,63 @@ pub async fn create(
             )
             .await?;
             let id = res["droplet"]["id"].as_i64().context("no droplet id in response")?;
-            let start = Instant::now();
-            loop {
-                let d = api(&http, M::GET, &format!("{base}/droplets/{id}"), token, None).await?;
-                let dr = &d["droplet"];
-                let ip = dr["networks"]["v4"]
-                    .as_array()
-                    .and_then(|n| n.iter().find(|x| x["type"] == "public"))
-                    .and_then(|x| x["ip_address"].as_str())
-                    .unwrap_or("")
-                    .to_string();
-                if dr["status"] == "active" && !ip.is_empty() {
-                    return Ok(Created {
-                        ip,
-                        monthly_cost: dr["size"]["price_monthly"].as_f64(),
-                        provider: ProviderRef {
-                            provider: "digitalocean".into(),
-                            id: id.to_string(),
-                            size: size.into(),
-                            region: region.into(),
-                        },
-                    });
+            let pref = ProviderRef {
+                provider: "digitalocean".into(),
+                id: id.to_string(),
+                size: size.into(),
+                region: region.into(),
+            };
+            let poll = async {
+                let start = Instant::now();
+                let mut consecutive_errs = 0u32;
+                loop {
+                    match api(&http, M::GET, &format!("{base}/droplets/{id}"), token, None).await {
+                        Ok(d) => {
+                            consecutive_errs = 0;
+                            let dr = &d["droplet"];
+                            let ip = dr["networks"]["v4"]
+                                .as_array()
+                                .and_then(|n| n.iter().find(|x| x["type"] == "public"))
+                                .and_then(|x| x["ip_address"].as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            if dr["status"] == "active" && !ip.is_empty() {
+                                return Ok(Created {
+                                    ip,
+                                    monthly_cost: dr["size"]["price_monthly"].as_f64(),
+                                    provider: pref.clone(),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            consecutive_errs += 1;
+                            if consecutive_errs >= 5 {
+                                return Err(e);
+                            }
+                        }
+                    }
+                    if start.elapsed() > Duration::from_secs(300) {
+                        bail!("droplet {id} did not become active within 5 minutes");
+                    }
+                    tokio::time::sleep(Duration::from_secs(4)).await;
                 }
-                if start.elapsed() > Duration::from_secs(300) {
-                    bail!("droplet {id} did not become active within 5 minutes");
-                }
-                tokio::time::sleep(Duration::from_secs(4)).await;
             }
+            .await;
+            if poll.is_err() {
+                let _ = destroy(&pref, token).await;
+            }
+            poll
         }
+        other => bail!("unknown provider '{other}'"),
     }
 }
 
 pub async fn destroy(p: &ProviderRef, token: &str) -> Result<()> {
+    let id = validate_provider_id(&p.id)?;
     let http = reqwest::Client::new();
     let url = match p.provider.as_str() {
-        "hetzner" => format!("https://api.hetzner.cloud/v1/servers/{}", p.id),
-        "digitalocean" => format!("https://api.digitalocean.com/v2/droplets/{}", p.id),
+        "hetzner" => format!("https://api.hetzner.cloud/v1/servers/{id}"),
+        "digitalocean" => format!("https://api.digitalocean.com/v2/droplets/{id}"),
         other => bail!("unknown provider {other}"),
     };
     api(&http, reqwest::Method::DELETE, &url, token, None).await?;
@@ -346,7 +531,10 @@ pub fn hetzner_offers(v: &Value) -> Vec<Offer> {
             continue;
         }
         for p in t["prices"].as_array().cloned().unwrap_or_default() {
-            let price = p["price_monthly"]["gross"].as_str().and_then(|x| x.parse::<f64>().ok());
+            let price = p["price_monthly"]["gross"]
+                .as_str()
+                .and_then(|x| x.parse::<f64>().ok())
+                .filter(|x| x.is_finite() && *x >= 0.0);
             let (Some(price), Some(loc)) = (price, p["location"].as_str()) else { continue };
             out.push(Offer {
                 provider: "hetzner".into(),
@@ -374,6 +562,9 @@ pub fn do_offers(v: &Value) -> Vec<Offer> {
         if slug.contains("gpu") {
             continue;
         }
+        let Some(price) = s["price_monthly"].as_f64().filter(|x| x.is_finite() && *x >= 0.0) else {
+            continue;
+        };
         for r in s["regions"].as_array().cloned().unwrap_or_default() {
             let Some(r) = r.as_str() else { continue };
             out.push(Offer {
@@ -384,7 +575,7 @@ pub fn do_offers(v: &Value) -> Vec<Offer> {
                 memory_mb: s["memory"].as_u64().unwrap_or(0),
                 disk_gb: s["disk"].as_u64().unwrap_or(0),
                 arch: "x86".into(),
-                price: s["price_monthly"].as_f64().unwrap_or(f64::MAX),
+                price,
             });
         }
     }
@@ -395,12 +586,15 @@ pub fn do_offers(v: &Value) -> Vec<Offer> {
 pub async fn catalog(provider: &str, token: &str) -> Result<Vec<Offer>> {
     let http = reqwest::Client::new();
     match provider {
-        "hetzner" => Ok(hetzner_offers(
-            &api(&http, reqwest::Method::GET, "https://api.hetzner.cloud/v1/server_types?per_page=50", token, None).await?,
-        )),
-        _ => Ok(do_offers(
-            &api(&http, reqwest::Method::GET, "https://api.digitalocean.com/v2/sizes?per_page=200", token, None).await?,
-        )),
+        "hetzner" => {
+            let list = hetzner_paginated(&http, token, "https://api.hetzner.cloud/v1/server_types", "server_types").await?;
+            Ok(hetzner_offers(&json!({"server_types": list})))
+        }
+        "digitalocean" => {
+            let list = do_paginated(&http, token, "https://api.digitalocean.com/v2/sizes", "sizes").await?;
+            Ok(do_offers(&json!({"sizes": list})))
+        }
+        other => bail!("unknown provider '{other}'"),
     }
 }
 
@@ -416,12 +610,12 @@ pub fn cheapest<'a>(
 ) -> Option<&'a Offer> {
     offers
         .iter()
+        .filter(|o| o.price.is_finite() && o.price >= 0.0)
         .filter(|o| o.arch == arch && o.memory_mb >= min_memory_mb && o.cpus >= min_cpus)
         .filter(|o| max_price.map(|m| o.price <= m + 1e-9).unwrap_or(true))
         .min_by(|a, b| {
             a.price
-                .partial_cmp(&b.price)
-                .unwrap_or(std::cmp::Ordering::Equal)
+                .total_cmp(&b.price)
                 .then((!prefer.contains(&a.location)).cmp(&!prefer.contains(&b.location)))
                 .then(b.memory_mb.cmp(&a.memory_mb))
         })
@@ -437,30 +631,40 @@ pub fn provider_arch(arch: &str) -> &'static str {
 
 /// Server state at the provider ("running", "off", ...), or None if it no longer exists.
 pub async fn server_status(p: &ProviderRef, token: &str) -> Result<Option<String>> {
+    let id = validate_provider_id(&p.id)?;
     let http = reqwest::Client::new();
     let (url, field) = match p.provider.as_str() {
-        "hetzner" => (format!("https://api.hetzner.cloud/v1/servers/{}", p.id), "server"),
-        _ => (format!("https://api.digitalocean.com/v2/droplets/{}", p.id), "droplet"),
+        "hetzner" => (format!("https://api.hetzner.cloud/v1/servers/{id}"), "server"),
+        "digitalocean" => (format!("https://api.digitalocean.com/v2/droplets/{id}"), "droplet"),
+        other => bail!("unknown provider '{other}'"),
     };
     match api(&http, reqwest::Method::GET, &url, token, None).await {
         Ok(v) => Ok(v[field]["status"].as_str().map(String::from)),
-        Err(e) if e.to_string().contains("404") => Ok(None),
-        Err(e) => Err(e),
+        Err(e) => {
+            if let Some(api_err) = e.downcast_ref::<ProviderApiError>() {
+                if api_err.status == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(None);
+                }
+            }
+            Err(e)
+        }
     }
 }
 
 /// Hard-reboot a server through the provider API.
 pub async fn reboot(p: &ProviderRef, token: &str) -> Result<()> {
+    let id = validate_provider_id(&p.id)?;
     let http = reqwest::Client::new();
     match p.provider.as_str() {
         "hetzner" => {
-            let url = format!("https://api.hetzner.cloud/v1/servers/{}/actions/reset", p.id);
+            let url = format!("https://api.hetzner.cloud/v1/servers/{id}/actions/reset");
             api(&http, reqwest::Method::POST, &url, token, None).await?;
         }
-        _ => {
-            let url = format!("https://api.digitalocean.com/v2/droplets/{}/actions", p.id);
+        "digitalocean" => {
+            let url = format!("https://api.digitalocean.com/v2/droplets/{id}/actions");
             api(&http, reqwest::Method::POST, &url, token, Some(json!({"type": "power_cycle"}))).await?;
         }
+        other => bail!("unknown provider '{other}'"),
     }
     Ok(())
 }
@@ -469,11 +673,11 @@ pub async fn reboot(p: &ProviderRef, token: &str) -> Result<()> {
 pub async fn sizes(provider: &str, token: &str) -> Result<()> {
     let http = reqwest::Client::new();
     let mut rows = vec![];
-    match provider {
+    let price_col = match provider {
         "hetzner" => {
-            let v = api(&http, reqwest::Method::GET, "https://api.hetzner.cloud/v1/server_types?per_page=50", token, None).await?;
-            for t in v["server_types"].as_array().cloned().unwrap_or_default() {
-                if t["deprecated"].as_bool().unwrap_or(false) {
+            let list = hetzner_paginated(&http, token, "https://api.hetzner.cloud/v1/server_types", "server_types").await?;
+            for t in list {
+                if t["deprecated"].as_bool().unwrap_or(false) || !t["deprecation"].is_null() {
                     continue;
                 }
                 let prices = t["prices"].as_array().cloned().unwrap_or_default();
@@ -481,6 +685,7 @@ pub async fn sizes(provider: &str, token: &str) -> Result<()> {
                     .first()
                     .and_then(|p| p["price_monthly"]["gross"].as_str())
                     .and_then(|p| p.parse::<f64>().ok())
+                    .filter(|p| p.is_finite() && *p >= 0.0)
                     .unwrap_or(0.0);
                 let locs: Vec<String> = prices.iter().filter_map(|p| p["location"].as_str().map(String::from)).collect();
                 rows.push((
@@ -496,14 +701,18 @@ pub async fn sizes(provider: &str, token: &str) -> Result<()> {
                     ],
                 ));
             }
+            "EUR/MONTH"
         }
-        _ => {
-            let v = api(&http, reqwest::Method::GET, "https://api.digitalocean.com/v2/sizes?per_page=200", token, None).await?;
-            for s in v["sizes"].as_array().cloned().unwrap_or_default() {
+        "digitalocean" => {
+            let list = do_paginated(&http, token, "https://api.digitalocean.com/v2/sizes", "sizes").await?;
+            for s in list {
                 if !s["available"].as_bool().unwrap_or(true) {
                     continue;
                 }
-                let price = s["price_monthly"].as_f64().unwrap_or(0.0);
+                let price = s["price_monthly"]
+                    .as_f64()
+                    .filter(|p| p.is_finite() && *p >= 0.0)
+                    .unwrap_or(0.0);
                 let regions: Vec<String> = s["regions"]
                     .as_array()
                     .map(|r| r.iter().filter_map(|x| x.as_str().map(String::from)).collect())
@@ -521,11 +730,13 @@ pub async fn sizes(provider: &str, token: &str) -> Result<()> {
                     ],
                 ));
             }
+            "USD/MONTH"
         }
-    }
-    rows.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        other => bail!("unknown provider '{other}'"),
+    };
+    rows.sort_by(|a, b| a.0.total_cmp(&b.0));
     print_table(
-        &["SIZE", "CPUS", "MEMORY", "DISK", "ARCH", "$/MONTH", "REGIONS"],
+        &["SIZE", "CPUS", "MEMORY", "DISK", "ARCH", price_col, "REGIONS"],
         rows.into_iter().map(|r| r.1).take(40).collect(),
     );
     Ok(())
@@ -553,14 +764,12 @@ mod tests {
     fn generates_a_key_when_the_user_has_none() {
         let dir = std::env::temp_dir().join(format!("latrix-keytest-{}", random_id(6)));
         std::fs::create_dir_all(&dir).unwrap();
-        // Only this test touches HOME / LATRIX_CONFIG.
-        std::env::set_var("HOME", &dir);
-        std::env::set_var("LATRIX_CONFIG", dir.join("cfg/config.toml"));
-        let (pubkey, path) = ssh_key(None).unwrap();
+        let own = dir.join("cfg").join("id_ed25519");
+        let (pubkey, path) = ssh_key_in(None, Some(&dir), &own).unwrap();
         assert!(pubkey.starts_with("ssh-ed25519 "));
-        assert_eq!(path.as_deref(), Some(dir.join("cfg/id_ed25519").to_str().unwrap()));
+        assert_eq!(path.as_deref(), Some(own.to_str().unwrap()));
         // second call reuses it
-        assert_eq!(ssh_key(None).unwrap().0, pubkey);
+        assert_eq!(ssh_key_in(None, Some(&dir), &own).unwrap().0, pubkey);
         let _ = std::fs::remove_dir_all(dir);
     }
 

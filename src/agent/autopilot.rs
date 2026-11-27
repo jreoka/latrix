@@ -29,7 +29,7 @@ use crate::state::*;
 use crate::util::{now, random_id};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -76,7 +76,8 @@ pub struct Memory {
     pub low: u32,
     pub cooldown_until: u64,
     pub warned: HashMap<String, u64>,
-    pub rebooted: HashSet<u32>,
+    /// Machine ID -> unix timestamp of the last successful provider reboot.
+    pub rebooted: HashMap<u32, u64>,
 }
 
 /// Shared with the API for `latrix autopilot status`.
@@ -85,6 +86,18 @@ pub struct Shared {
     pub status: Mutex<Status>,
     pub busy: AtomicBool,
     pub wake: tokio::sync::Notify,
+    pub key_lock: tokio::sync::Mutex<()>,
+}
+
+struct BusyGuard(Arc<Agent>);
+
+impl Drop for BusyGuard {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.0.autopilot.status.lock() {
+            st.working_on = None;
+        }
+        self.0.autopilot.busy.store(false, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -110,14 +123,23 @@ fn machine_cpu(live: &LiveView, m: &Machine) -> f64 {
     live.reports.get(&m.id).map(|r| r.metrics.cpus).filter(|x| *x > 0.0).unwrap_or(m.cpus).max(1.0)
 }
 
-/// How many machines the apps need for redundancy.
+/// How many machines the apps need for redundancy or non-colocatable workloads.
 pub fn wanted_machines(s: &ClusterState) -> u32 {
-    let wants_two = s.apps.values().any(|a| {
-        a.config()
-            .map(|c| (!c.stateful() && a.count >= 2) || c.volumes.iter().any(|v| v.copies >= 2))
-            .unwrap_or(false)
-    });
-    let w = if wants_two { 2 } else { 1 };
+    let mut w = 1u32;
+    for a in s.apps.values() {
+        let Some(c) = a.config() else { continue };
+        if !c.stateful() && a.count >= 2 {
+            w = w.max(2);
+        }
+        if let Some(copies) = c.volumes.iter().map(|v| v.copies).max() {
+            if copies >= 2 {
+                w = w.max(copies);
+            }
+        }
+        if super::scheduler::direct(c) && a.count > 1 {
+            w = w.max(a.count);
+        }
+    }
     w.max(s.settings.min_machines).min(s.settings.max_machines.max(1))
 }
 
@@ -142,7 +164,10 @@ pub fn capacity(s: &ClusterState, live: &LiveView) -> Capacity {
     }
     let overloaded = ready
         .iter()
-        .filter(|m| s.reserved_mb(m.id) as f64 > (machine_mem(live, m) - OVERHEAD_MB) * 0.95)
+        .filter(|m| {
+            let usable = (machine_mem(live, m) - OVERHEAD_MB).max(0.0);
+            usable > 0.0 && s.reserved_mb(m.id) as f64 > usable * 0.95
+        })
         .map(|m| m.name.clone())
         .collect();
     let util = if cap_mem <= 0.0 || cap_cpu <= 0.0 {
@@ -214,6 +239,57 @@ pub fn decide(
     (c, d)
 }
 
+fn can_safely_remove_for_scaledown(s: &ClusterState, live: &LiveView, id: u32) -> bool {
+    // Never remove a machine that is the target of an active volume migration.
+    if s.volumes.values().any(|v| v.moving_to == Some(id)) {
+        return false;
+    }
+    let remaining: Vec<&Machine> = s
+        .machines
+        .values()
+        .filter(|m| m.id != id && m.status == MachineStatus::Ready && live.is_alive(m.id))
+        .collect();
+    if remaining.is_empty() {
+        return false;
+    }
+    // Check that every volume currently on `id` can still meet its copy count and has a
+    // remaining alive Ready machine in an allowed region with enough usable memory.
+    for v in s.volumes.values().filter(|v| v.primary == id) {
+        let Some(app) = s.apps.get(&v.app) else { continue };
+        let Some(cfg) = app.config() else { continue };
+        let eligible: Vec<&&Machine> = remaining
+            .iter()
+            .filter(|m| {
+                cfg.allows_region(m.region.as_deref())
+                    && (machine_mem(live, m) - OVERHEAD_MB).max(0.0) >= cfg.scale.memory_mb() as f64
+            })
+            .collect();
+        if eligible.is_empty() {
+            return false;
+        }
+        if v.copies >= 2 && (eligible.len() as u32) < v.copies {
+            return false;
+        }
+    }
+    // Check that direct-UDP apps running on `id` still have enough remaining machines.
+    for a in s.apps.values() {
+        let Some(cfg) = a.config() else { continue };
+        if a.count == 0 || !super::scheduler::direct(cfg) {
+            continue;
+        }
+        if s.instances_on(id).any(|i| i.app == a.name && !i.stopping) {
+            let eligible = remaining
+                .iter()
+                .filter(|m| cfg.allows_region(m.region.as_deref()))
+                .count();
+            if eligible < a.count as usize {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn decide_with(
     s: &ClusterState,
     live: &LiveView,
@@ -259,7 +335,7 @@ fn decide_with(
             .max(c.largest_mb as f64 * 1.2)
             + OVERHEAD_MB)
             .max(MIN_SERVER_MB as f64);
-        let shortfall_cpu = (c.req_cpu / 0.7 - c.cap_cpu).clamp(1.0, 16.0);
+        let shortfall_cpu = (c.req_cpu / 0.7 - c.cap_cpu).max(1.0);
         if let Some((app, regions, mb)) = missing {
             // A server where the app must run (cheapest there that fits it).
             let here: Vec<Offer> = offers.iter().filter(|o| regions.contains(&o.location)).cloned().collect();
@@ -274,6 +350,37 @@ fn decide_with(
                 None => nothing(&format!("{reason}, but no server there fits the monthly budget")),
             };
         }
+        let only_overloaded = !too_few && c.utilization <= UP_UTIL && !c.overloaded.is_empty();
+        if only_overloaded && !s.settings.rebalance {
+            let unplaced = s.apps.values().any(|a| {
+                let running = s.instances_of(&a.name).filter(|i| !i.stopping).count() as u32;
+                running < a.count
+            });
+            if !unplaced {
+                return nothing("a machine is overloaded, but rebalance is off so adding capacity would not move running apps");
+            }
+        }
+        // If scaling up due to overloaded machines that are all in pinned regions, buy there.
+        let pool: Vec<Offer> = if only_overloaded {
+            let overloaded_regions: Vec<String> = s
+                .machines
+                .values()
+                .filter(|m| c.overloaded.contains(&m.name))
+                .filter_map(|m| pinned_region(s, m))
+                .collect();
+            if !overloaded_regions.is_empty() {
+                let filtered: Vec<Offer> = offers
+                    .iter()
+                    .filter(|o| overloaded_regions.contains(&o.location))
+                    .cloned()
+                    .collect();
+                if filtered.is_empty() { offers.to_vec() } else { filtered }
+            } else {
+                offers.to_vec()
+            }
+        } else {
+            offers.to_vec()
+        };
         let reason = if too_few {
             format!("apps want {} machines for redundancy, have {}", c.wanted_machines, c.machines)
         } else if !c.overloaded.is_empty() {
@@ -281,7 +388,7 @@ fn decide_with(
         } else {
             format!("apps need {:.0}% of current capacity", c.utilization * 100.0)
         };
-        return match providers::cheapest(offers, need_mem as u64, shortfall_cpu, arch, &prefer, room) {
+        return match providers::cheapest(&pool, need_mem as u64, shortfall_cpu, arch, &prefer, room) {
             Some(o) => Decision::ScaleUp { offer: o.clone(), reason, replaces: None },
             None => nothing(&format!(
                 "{reason}, but no server fits the monthly budget ({:.2} used of {:.2})",
@@ -303,6 +410,7 @@ fn decide_with(
         .machines
         .values()
         .filter(|m| managed(m) && !m.temporary && m.id != leader && m.status == MachineStatus::Ready && live.alive.contains(&m.id))
+        .filter(|m| !s.volumes.values().any(|v| v.moving_to == Some(m.id)))
         .filter(|m| {
             // Never the last machine in a region an app is pinned to.
             match pinned_region(s, m) {
@@ -321,13 +429,49 @@ fn decide_with(
     });
     if c.machines as u32 > c.wanted_machines {
         for m in &candidates {
+            if !can_safely_remove_for_scaledown(s, live, m.id) {
+                continue;
+            }
             let cap_mem = c.cap_mem_mb - (machine_mem(live, m) - OVERHEAD_MB).max(0.0);
             let cap_cpu = c.cap_cpu - machine_cpu(live, m);
             if cap_mem <= 0.0 || cap_cpu <= 0.0 {
                 continue;
             }
+            // Ensure at least one SINGLE remaining machine can hold the largest instance.
+            let max_single_remaining = s
+                .machines
+                .values()
+                .filter(|o| o.id != m.id && o.status == MachineStatus::Ready && live.is_alive(o.id))
+                .map(|o| (machine_mem(live, o) - OVERHEAD_MB).max(0.0))
+                .fold(0.0_f64, f64::max);
+            // If `m` is in a pinned region, verify remaining machines in that region can fit apps pinned there.
+            if let Some(reg) = pinned_region(s, m) {
+                let reg_cap: f64 = s
+                    .machines
+                    .values()
+                    .filter(|o| {
+                        o.id != m.id
+                            && o.status == MachineStatus::Ready
+                            && live.is_alive(o.id)
+                            && o.region.as_deref() == Some(reg.as_str())
+                    })
+                    .map(|o| (machine_mem(live, o) - OVERHEAD_MB).max(0.0))
+                    .sum();
+                let reg_req: f64 = s
+                    .apps
+                    .values()
+                    .filter_map(|a| {
+                        let cfg = a.config()?;
+                        (a.count > 0 && cfg.regions.len() == 1 && cfg.regions[0] == reg)
+                            .then_some(a.count as f64 * cfg.scale.memory_mb() as f64)
+                    })
+                    .sum();
+                if reg_cap <= 0.0 || reg_req / reg_cap >= AFTER_REMOVE_UTIL {
+                    continue;
+                }
+            }
             let after = (c.req_mem_mb / cap_mem).max(c.req_cpu / cap_cpu);
-            if after < AFTER_REMOVE_UTIL && c.largest_mb as f64 <= cap_mem {
+            if after < AFTER_REMOVE_UTIL && c.largest_mb as f64 <= max_single_remaining {
                 return Decision::ScaleDown {
                         machine: m.id,
                         reason: format!(
@@ -341,7 +485,7 @@ fn decide_with(
             }
         }
     }
-    if mem.low >= RIGHTSIZE_STREAK {
+    if mem.low >= RIGHTSIZE_STREAK && (s.settings.max_machines == 0 || total < s.settings.max_machines) {
         for m in &candidates {
             let Some(price) = m.monthly_cost else { continue };
             let load_mem = s.reserved_mb(m.id) as f64;
@@ -350,6 +494,25 @@ fn decide_with(
             let local = offers_in(offers, pinned_region(s, m).as_deref());
             if let Some(o) = providers::cheapest(&local, need as u64, (load_cpu * 1.5).max(1.0), arch, &prefer, None) {
                 if o.price < price * 0.7 && o.memory_mb < m.memory_mb {
+                    if budget > 0.0 && c.monthly_cost - price + o.price > budget {
+                        continue;
+                    }
+                    let new_usable = (o.memory_mb as f64 - OVERHEAD_MB).max(0.0);
+                    let new_cap_mem = c.cap_mem_mb - (machine_mem(live, m) - OVERHEAD_MB).max(0.0) + new_usable;
+                    let new_cap_cpu = c.cap_cpu - machine_cpu(live, m) + o.cpus.max(1.0);
+                    let max_single_after = s
+                        .machines
+                        .values()
+                        .filter(|x| x.id != m.id && x.status == MachineStatus::Ready && live.is_alive(x.id))
+                        .map(|x| (machine_mem(live, x) - OVERHEAD_MB).max(0.0))
+                        .fold(new_usable, f64::max);
+                    if new_cap_mem <= 0.0 || new_cap_cpu <= 0.0 {
+                        continue;
+                    }
+                    let after = (c.req_mem_mb / new_cap_mem).max(c.req_cpu / new_cap_cpu);
+                    if after >= AFTER_REMOVE_UTIL || c.largest_mb as f64 > max_single_after {
+                        continue;
+                    }
                     return Decision::ScaleUp {
                             offer: o.clone(),
                             reason: format!(
@@ -374,13 +537,20 @@ fn ssh_dir(agent: &Agent) -> std::path::PathBuf {
 
 /// The leader's own SSH key, used to set up servers it creates.
 pub async fn leader_key(agent: &Agent) -> Result<(String, String)> {
+    let _guard = agent.autopilot.key_lock.lock().await;
     let dir = ssh_dir(agent);
-    std::fs::create_dir_all(&dir)?;
+    crate::util::create_private_dir_all(&dir)?;
     let key = dir.join("id_ed25519");
+    let pub_key = dir.join("id_ed25519.pub");
     if !key.exists() {
+        let _ = std::fs::remove_file(&pub_key);
         cmd("ssh-keygen", &["-q", "-t", "ed25519", "-N", "", "-C", "latrix-autopilot", "-f", &key.display().to_string()]).await?;
     }
-    let public = std::fs::read_to_string(dir.join("id_ed25519.pub"))?.trim().to_string();
+    super::set_private(&key);
+    let public = std::fs::read_to_string(&pub_key)
+        .with_context(|| format!("reading {}", pub_key.display()))?
+        .trim()
+        .to_string();
     Ok((key.display().to_string(), public))
 }
 
@@ -402,6 +572,13 @@ pub async fn provision(
     provider: Option<ProviderRef>,
     monthly_cost: Option<f64>,
 ) -> Result<Machine> {
+    let ip: std::net::IpAddr = public_ip
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid public IP '{public_ip}'"))?;
+    if ip.is_loopback() || ip.is_unspecified() {
+        bail!("invalid public IP '{public_ip}'");
+    }
     let progress = |msg: &str| {
         info!("provisioning {name}: {msg}");
         agent.autopilot.status.lock().unwrap().working_on = Some(format!("{name}: {msg}"));
@@ -424,9 +601,20 @@ pub async fn provision(
     }
     progress("installing latrix");
     let exe = std::env::current_exe()?;
-    let tmp = format!("/tmp/latrix-upload-{}", random_id(6));
-    ssh.upload(&exe, &tmp).await?;
-    ssh.run(&format!("install -m 0755 {tmp} /usr/local/bin/latrix && rm -f {tmp}")).await?;
+    let tmp = format!("/root/.latrix-upload-{}", random_id(8));
+    if let Err(e) = ssh.upload(&exe, &tmp).await {
+        let _ = ssh.run(&format!("rm -f {tmp}")).await;
+        return Err(e);
+    }
+    if let Err(e) = ssh
+        .run(&format!(
+            "chmod 0755 {tmp} && {tmp} --version >/dev/null && install -m 0755 {tmp} /usr/local/bin/latrix && rm -f {tmp}"
+        ))
+        .await
+    {
+        let _ = ssh.run(&format!("rm -f {tmp}")).await;
+        return Err(e);
+    }
     progress("installing Docker, WireGuard and the firewall");
     ssh.run_input("bash -s", Some(BOOTSTRAP.as_bytes())).await?;
     let pubkey = ssh.run("/usr/local/bin/latrix agent keygen").await?.trim().to_string();
@@ -434,7 +622,7 @@ pub async fn provision(
     progress("joining the mesh");
     let req = JoinRequest {
         name: name.into(),
-        public_ip: public_ip.into(),
+        public_ip: ip.to_string(),
         wg_pubkey: pubkey,
         os: facts.os,
         arch: facts.arch,
@@ -512,7 +700,9 @@ async fn buy(agent: &Arc<Agent>, offer: &Offer, replaces: Option<u32>, temporary
                 ),
             );
             if let Some(old) = replaces {
-                mark_for_removal(agent, old, "replaced by a cheaper server").await?;
+                if let Err(e) = mark_for_removal(agent, old, "replaced by a cheaper server").await {
+                    warn!("autopilot: new server {} is online, but draining replaced machine #{old} failed: {e:#}", m.name);
+                }
             }
             Ok(m)
         }
@@ -563,20 +753,55 @@ async fn finish_removals(agent: &Arc<Agent>) {
         .cloned()
         .collect();
     for m in done {
-        remove_and_destroy(agent, &m, "removed").await;
+        remove_and_destroy(agent, &m, "removed", false).await;
     }
 }
 
-async fn remove_and_destroy(agent: &Arc<Agent>, m: &Machine, verb: &str) {
+/// Mark orphaned temporary surge servers for removal so they cannot bill indefinitely
+/// after a crash, leader failover, or toggling autopilot off.
+async fn cleanup_orphaned_temp_machines(agent: &Arc<Agent>) {
+    let s = agent.snapshot();
+    let active_temp = s.surge.as_ref().and_then(|sg| sg.temp_machine);
+    let orphans: Vec<u32> = s
+        .machines
+        .values()
+        .filter(|m| {
+            m.temporary
+                && m.status == MachineStatus::Ready
+                && m.id != agent.me.machine_id
+                && Some(m.id) != active_temp
+                && now().saturating_sub(m.joined_at) > 300
+        })
+        .map(|m| m.id)
+        .collect();
+    for id in orphans {
+        let _ = mark_for_removal(agent, id, "orphaned temporary maintenance server").await;
+    }
+}
+
+async fn remove_and_destroy(agent: &Arc<Agent>, m: &Machine, verb: &str, force_dead: bool) {
     let id = m.id;
     let removed = agent
         .mutate(|s| {
+            // Never destroy a machine that still owns a primary volume or is a volume migration target.
+            if s.volumes.values().any(|v| v.primary == id || v.moving_to == Some(id)) {
+                return Ok(false);
+            }
+            if !force_dead {
+                let Some(cur) = s.machines.get(&id) else { return Ok(false) };
+                if cur.status != MachineStatus::Cordoned || s.instances_on(id).next().is_some() {
+                    return Ok(false);
+                }
+            }
             let ids: Vec<String> = s.instances_on(id).map(|i| i.id.clone()).collect();
             for i in ids {
                 s.instances.remove(&i);
             }
             for v in s.volumes.values_mut() {
                 v.replicas.retain(|r| *r != id);
+            }
+            if s.surge.as_ref().and_then(|sg| sg.temp_machine) == Some(id) {
+                s.surge = None;
             }
             Ok(s.machines.remove(&id).is_some())
         })
@@ -602,33 +827,109 @@ async fn remove_and_destroy(agent: &Arc<Agent>, m: &Machine, verb: &str) {
 /// Reboot unresponsive servers the autopilot manages; replace them if that doesn't help.
 async fn heal(agent: &Arc<Agent>, live: &LiveView<'_>, mem: &mut Memory) {
     let s = agent.snapshot();
+    let has_quorum = s.machines.len() <= 1 || live.alive.len() * 2 > s.machines.len();
+    mem.rebooted.retain(|id, _| s.machines.contains_key(id));
     for m in s.machines.values().filter(|m| managed(m)) {
+        if m.id == agent.me.machine_id {
+            continue;
+        }
         let dead = live.dead_for(m.id);
         if dead == 0 {
             mem.rebooted.remove(&m.id);
             continue;
         }
+        // Do not hard-reboot or destroy a machine that is mid-OS-maintenance/reboot.
+        if m.status == MachineStatus::Maintenance {
+            continue;
+        }
         let (Some(p), Some(token)) = (&m.provider, m.provider.as_ref().and_then(|p| s.provider_tokens.get(&p.provider))) else {
             continue;
         };
-        if dead >= 15 * 60 && !mem.rebooted.contains(&m.id) {
-            mem.rebooted.insert(m.id);
+        let rebooted_at = mem.rebooted.get(&m.id).copied();
+        if dead >= 15 * 60 && rebooted_at.is_none() {
             match providers::server_status(p, token).await {
                 Ok(None) => {
-                    remove_and_destroy(agent, m, "forgot deleted server").await;
+                    // Provider confirmed the VM no longer exists (HTTP 404).
+                    if s.volumes.values().any(|v| v.primary == m.id || v.moving_to == Some(m.id)) {
+                        agent.event(
+                            "warn",
+                            format!("autopilot: {} was deleted at {} but still owns primary volume(s); manual intervention required", m.name, p.provider),
+                        );
+                    } else {
+                        remove_and_destroy(agent, m, "forgot deleted server", true).await;
+                    }
                 }
                 Ok(Some(_)) => {
+                    if !has_quorum {
+                        let key = format!("no-quorum-{}", m.id);
+                        let last = mem.warned.get(&key).copied().unwrap_or(0);
+                        if now().saturating_sub(last) > 1800 {
+                            mem.warned.insert(key, now());
+                            agent.event(
+                                "warn",
+                                format!(
+                                    "autopilot: {} unreachable for 15m, but cluster lacks majority ({}/{} alive) — skipping automatic reboot",
+                                    m.name,
+                                    live.alive.len(),
+                                    s.machines.len()
+                                ),
+                            );
+                        }
+                        continue;
+                    }
                     let r = providers::reboot(p, token).await;
+                    if r.is_ok() {
+                        mem.rebooted.insert(m.id, now());
+                    }
                     agent.event(
                         if r.is_ok() { "info" } else { "warn" },
-                        format!("autopilot: {} unreachable for 15 minutes, rebooting it{}", m.name, r.err().map(|e| format!(" (failed: {e:#})")).unwrap_or_default()),
+                        format!(
+                            "autopilot: {} unreachable for 15 minutes, rebooting it{}",
+                            m.name,
+                            r.err().map(|e| format!(" (failed: {e:#})")).unwrap_or_default()
+                        ),
                     );
                 }
                 Err(e) => warn!("autopilot: status of {}: {e:#}", m.name),
             }
-        } else if dead >= 45 * 60 && m.id != agent.me.machine_id {
-            agent.event("warn", format!("autopilot: {} still down after a reboot, replacing it", m.name));
-            remove_and_destroy(agent, m, "replaced dead").await;
+        } else if let Some(rb_at) = rebooted_at {
+            if now().saturating_sub(rb_at) >= 30 * 60 && dead >= 45 * 60 {
+                if !has_quorum {
+                    let key = format!("no-quorum-del-{}", m.id);
+                    let last = mem.warned.get(&key).copied().unwrap_or(0);
+                    if now().saturating_sub(last) > 1800 {
+                        mem.warned.insert(key, now());
+                        agent.event(
+                            "warn",
+                            format!(
+                                "autopilot: {} still down after reboot, but cluster lacks majority ({}/{} alive) — refusing automatic server deletion",
+                                m.name,
+                                live.alive.len(),
+                                s.machines.len()
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                if s.volumes.values().any(|v| v.primary == m.id || v.moving_to == Some(m.id)) {
+                    let key = format!("vol-primary-{}", m.id);
+                    let last = mem.warned.get(&key).copied().unwrap_or(0);
+                    if now().saturating_sub(last) > 1800 {
+                        mem.warned.insert(key, now());
+                        agent.event(
+                            "warn",
+                            format!(
+                                "autopilot: {} still down after reboot, but still owns primary volume(s) — refusing automatic server deletion",
+                                m.name
+                            ),
+                        );
+                    }
+                    continue;
+                }
+                agent.event("warn", format!("autopilot: {} still down 30 minutes after reboot, replacing it", m.name));
+                remove_and_destroy(agent, m, "replaced dead", true).await;
+                mem.rebooted.remove(&m.id);
+            }
         }
     }
 }
@@ -647,6 +948,14 @@ fn buy_temporary(agent: &Arc<Agent>, s: &ClusterState, offers: &[Offer], for_mac
         agent.event("warn", "autopilot: no server type fits the work to hold during maintenance; updating in place");
         return;
     };
+    if agent
+        .autopilot
+        .busy
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
     agent.event(
         "info",
         format!(
@@ -657,29 +966,44 @@ fn buy_temporary(agent: &Arc<Agent>, s: &ClusterState, offers: &[Offer], for_mac
             offer.price / 730.0
         ),
     );
-    agent.autopilot.busy.store(true, Ordering::SeqCst);
     let a = agent.clone();
     tokio::spawn(async move {
+        let _guard = BusyGuard(a.clone());
         match buy(&a, &offer, None, true).await {
             Ok(m) => {
                 let id = m.id;
-                let _ = a
+                let attached = a
                     .mutate(move |s| {
-                        if let Some(mm) = s.machines.get_mut(&id) {
-                            mm.temporary = true;
+                        let valid_surge = s
+                            .surge
+                            .as_ref()
+                            .map(|sg| sg.phase == "buying" && sg.temp_machine.is_none())
+                            .unwrap_or(false);
+                        if valid_surge {
+                            if let Some(mm) = s.machines.get_mut(&id) {
+                                mm.temporary = true;
+                            }
+                            if let Some(sg) = s.surge.as_mut() {
+                                sg.temp_machine = Some(id);
+                                sg.phase = "ready".into();
+                            }
+                            Ok(true)
+                        } else {
+                            Ok(false)
                         }
-                        Ok(())
                     })
-                    .await;
-                set_surge(&a, Some(id), "ready").await;
+                    .await
+                    .unwrap_or(false);
+                if !attached {
+                    warn!("autopilot: surge ended while provisioning temporary server {}; cleaning it up", m.name);
+                    remove_and_destroy(&a, &m, "cleaned up unneeded temporary server", true).await;
+                }
             }
             Err(e) => {
                 a.event("warn", format!("autopilot: temporary server failed ({e:#}); updating in place"));
                 set_surge(&a, None, "failed").await;
             }
         }
-        a.autopilot.status.lock().unwrap().working_on = None;
-        a.autopilot.busy.store(false, Ordering::SeqCst);
     });
 }
 
@@ -698,6 +1022,7 @@ async fn set_surge(agent: &Arc<Agent>, temp: Option<u32>, phase: &str) {
         .await;
 }
 
+#[cfg(test)]
 fn catalog_stale(
     cached_at: Option<Instant>,
     cached_tokens: &std::collections::BTreeMap<String, String>,
@@ -713,10 +1038,9 @@ fn catalog_stale(
 pub async fn run(agent: Arc<Agent>) {
     tokio::time::sleep(Duration::from_secs(90)).await;
     let mut mem = Memory::default();
-    let mut catalog_at: Option<Instant> = None;
-    let mut catalog_tokens: std::collections::BTreeMap<String, String> = Default::default();
-    let mut catalog_offers: Vec<Offer> = vec![];
+    let mut provider_cache: HashMap<String, (Instant, String, Vec<Offer>)> = HashMap::new();
     let mut price_error: Option<String> = None;
+    let mut last_decide: Option<Instant> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     loop {
         tokio::select! {
@@ -733,6 +1057,12 @@ pub async fn run(agent: Arc<Agent>) {
         if let Ok((_, public)) = leader_key(&agent).await {
             st.leader_ssh_key = public;
         }
+        // Always finish already-scheduled removals and clean up orphaned temporary servers,
+        // even if autopilot was just toggled off mid-drain or mid-surge.
+        if !agent.autopilot.busy.load(Ordering::SeqCst) {
+            finish_removals(&agent).await;
+            cleanup_orphaned_temp_machines(&agent).await;
+        }
         if !s.settings.autopilot {
             st.last_decision = "autopilot is off".into();
             *agent.autopilot.status.lock().unwrap() = st;
@@ -741,41 +1071,56 @@ pub async fn run(agent: Arc<Agent>) {
         if agent.autopilot.busy.load(Ordering::SeqCst) {
             continue;
         }
-        finish_removals(&agent).await;
         let live = agent.live();
         heal(&agent, &live.view(), &mut mem).await;
 
-        // Prices change rarely; refresh hourly or whenever provider tokens change.
-        if catalog_stale(catalog_at, &catalog_tokens, &s.provider_tokens, Instant::now()) {
-            let mut offers = vec![];
-            let mut fetched = std::collections::BTreeMap::new();
-            price_error = None;
-            for (p, token) in &s.provider_tokens {
+        // Refresh provider price catalogs independently per provider (hourly or on token change).
+        provider_cache.retain(|p, _| s.provider_tokens.contains_key(p));
+        let now_inst = Instant::now();
+        let mut refreshed_any = false;
+        let mut last_err = None;
+        for (p, token) in &s.provider_tokens {
+            let stale = match provider_cache.get(p) {
+                None => true,
+                Some((at, tok, _)) => {
+                    tok != token || now_inst.saturating_duration_since(*at) > Duration::from_secs(3600)
+                }
+            };
+            if stale {
+                refreshed_any = true;
                 match providers::catalog(p, token).await {
                     Ok(o) => {
-                        offers.extend(o);
-                        fetched.insert(p.clone(), token.clone());
+                        provider_cache.insert(p.clone(), (Instant::now(), token.clone(), o));
                     }
                     Err(e) => {
                         warn!("autopilot: {p} prices: {e:#}");
                         let short = if e.to_string().contains("401") { "the API token was rejected".to_string() } else { format!("{e:#}") };
-                        price_error = Some(format!("could not read {p} prices: {short}"));
+                        last_err = Some(format!("could not read {p} prices: {short}"));
                     }
                 }
             }
-            if !offers.is_empty() || s.provider_tokens.is_empty() {
-                catalog_at = Some(Instant::now());
-                catalog_tokens = fetched;
-                catalog_offers = offers;
-            }
         }
-        let offers = catalog_offers.clone();
+        if refreshed_any {
+            price_error = last_err;
+        }
+        let offers: Vec<Offer> = provider_cache.values().flat_map(|(_, _, o)| o.iter().cloned()).collect();
         let s = agent.snapshot();
         if let Some(sg) = s.surge.clone().filter(|sg| sg.phase == "buying" && sg.temp_machine.is_none()) {
             if !agent.autopilot.busy.load(Ordering::SeqCst) {
                 buy_temporary(&agent, &s, &offers, sg.for_machine);
             }
         }
+        // Only advance minute-based scale-up/scale-down streaks once per ~60s even if woken frequently.
+        let due_decide = last_decide
+            .map(|t| Instant::now().saturating_duration_since(t) >= Duration::from_secs(55))
+            .unwrap_or(true);
+        if !due_decide {
+            let working = agent.autopilot.status.lock().unwrap().working_on.clone();
+            st.working_on = working;
+            *agent.autopilot.status.lock().unwrap() = st;
+            continue;
+        }
+        last_decide = Some(Instant::now());
         let (cap, decision) = decide(&s, &live.view(), &offers, agent.me.machine_id, &mut mem, now());
         let arch = s
             .machines
@@ -808,27 +1153,34 @@ pub async fn run(agent: Arc<Agent>) {
                 }
             }
             Decision::ScaleUp { offer, reason, replaces } => {
-                st.last_decision = format!(
-                    "{}: {reason} → buying {} {} in {} ({:.2}/month)",
-                    if replaces.is_some() { "right-sizing" } else { "scaling up" },
-                    offer.provider,
-                    offer.size,
-                    offer.location,
-                    offer.price
-                );
-                agent.event("info", format!("autopilot: {}", st.last_decision));
-                mem.cooldown_until = now() + 10 * 60;
-                mem.high = 0;
-                mem.low = 0;
-                agent.autopilot.busy.store(true, Ordering::SeqCst);
-                let a = agent.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = buy(&a, &offer, replaces, false).await {
-                        a.event("warn", format!("autopilot: adding a server failed: {e:#}"));
-                    }
-                    a.autopilot.status.lock().unwrap().working_on = None;
-                    a.autopilot.busy.store(false, Ordering::SeqCst);
-                });
+                if agent
+                    .autopilot
+                    .busy
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_err()
+                {
+                    st.last_decision = "another provisioning operation is already in progress".into();
+                } else {
+                    st.last_decision = format!(
+                        "{}: {reason} → buying {} {} in {} ({:.2}/month)",
+                        if replaces.is_some() { "right-sizing" } else { "scaling up" },
+                        offer.provider,
+                        offer.size,
+                        offer.location,
+                        offer.price
+                    );
+                    agent.event("info", format!("autopilot: {}", st.last_decision));
+                    mem.cooldown_until = now() + 10 * 60;
+                    mem.high = 0;
+                    mem.low = 0;
+                    let a = agent.clone();
+                    tokio::spawn(async move {
+                        let _guard = BusyGuard(a.clone());
+                        if let Err(e) = buy(&a, &offer, replaces, false).await {
+                            a.event("warn", format!("autopilot: adding a server failed: {e:#}"));
+                        }
+                    });
+                }
             }
         }
         let working = agent.autopilot.status.lock().unwrap().working_on.clone();
@@ -841,7 +1193,7 @@ pub async fn run(agent: Arc<Agent>) {
 mod tests {
     use super::*;
     use crate::config::AppConfig;
-    use std::collections::HashMap as Map;
+    use std::collections::{HashMap as Map, HashSet};
 
     fn machine(id: u32, mem: u64, managed: bool, price: f64) -> Machine {
         Machine {
@@ -1061,5 +1413,34 @@ mod tests {
             Decision::ScaleUp { offer, .. } => assert_eq!(offer.size, "s-1vcpu-1gb"),
             other => panic!("expected 1GB droplet, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn scale_down_respects_largest_app_and_volume_primary() {
+        // Two machines: m1 (2GB user) + m2 (8GB managed). App needs 3GB -> removing m2 would leave no machine able to fit 3GB!
+        let mut s = ClusterState::default();
+        s.machines.insert(1, machine(1, 2048, false, 0.0));
+        s.machines.insert(2, machine(2, 8192, true, 16.0));
+        app(&mut s, "big", 1, "3GB");
+        let dec = run(&s, &mut Memory::default(), DOWN_STREAK);
+        assert!(
+            !matches!(dec, Decision::ScaleDown { machine: 2, .. }),
+            "must not scale down the only machine that can fit a 3GB app: {dec:?}"
+        );
+
+        // Stateful app with copies = 3 wants 3 machines even though count = 1.
+        let mut s2 = ClusterState::default();
+        s2.machines.insert(1, machine(1, 4096, false, 0.0));
+        s2.machines.insert(2, machine(2, 4096, true, 4.0));
+        app(&mut s2, "db", 1, "256MB");
+        s2.apps.get_mut("db").unwrap().releases[0].config.volumes.push(crate::config::VolumeConfig {
+            name: "data".into(),
+            path: "/data".into(),
+            copies: 3,
+            sync: "60s".into(),
+            pre_sync: None,
+            size: None,
+        });
+        assert_eq!(wanted_machines(&s2), 3);
     }
 }

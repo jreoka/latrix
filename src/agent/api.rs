@@ -48,19 +48,26 @@ impl IntoResponse for ApiError {
 type ApiResult<T> = Result<Json<T>, ApiError>;
 
 pub fn router(agent: Arc<Agent>) -> Router {
+    let streaming = Router::new()
+        .route("/v1/local/build", post(builder::handle_build))
+        .route("/v1/local/volume-data", get(super::transfer::get_volume).post(super::transfer::put_volume))
+        .route("/v1/local/image", get(super::transfer::get_image).post(super::transfer::put_image))
+        .route("/v1/local/exec", post(super::transfer::exec_container))
+        .route("/v1/m/{id}/{*rest}", any(machine_forward))
+        .layer(axum::extract::DefaultBodyLimit::disable());
+
+    let state_sync = Router::new()
+        .route("/v1/local/state", get(get_state).post(post_state))
+        .layer(axum::extract::DefaultBodyLimit::max(32 * 1024 * 1024));
+
     let local = Router::new()
         .route("/v1/local/ping", get(ping))
-        .route("/v1/local/state", get(get_state).post(post_state))
         .route("/v1/local/report", post(report))
         .route("/v1/local/routes", get(routes))
-        .route("/v1/local/build", post(builder::handle_build))
         .route("/v1/local/logs", get(runtime::handle_logs))
-        .route("/v1/local/volume-data", get(super::transfer::get_volume).post(super::transfer::put_volume))
         .route("/v1/local/unused-volumes", get(super::volumes::handle_unused).delete(super::volumes::handle_unused))
         .route("/v1/local/snapshots", get(super::volumes::handle_snapshots).post(super::volumes::handle_snapshots))
-        .route("/v1/local/self-update", post(super::selfupdate::handle))
-        .route("/v1/local/image", get(super::transfer::get_image).post(super::transfer::put_image))
-        .route("/v1/local/exec", post(super::transfer::exec_container));
+        .route("/v1/local/self-update", post(super::selfupdate::handle));
 
     let cluster = Router::new()
         .route("/v1/status", get(status))
@@ -94,12 +101,38 @@ pub fn router(agent: Arc<Agent>) -> Router {
 
     Router::new()
         .route("/", get(dashboard))
-        .route("/v1/m/{id}/{*rest}", any(machine_forward))
+        .merge(streaming)
+        .merge(state_sync)
         .merge(local)
         .merge(cluster)
         .layer(middleware::from_fn_with_state(agent.clone(), auth))
-        .layer(axum::extract::DefaultBodyLimit::disable())
         .with_state(agent)
+}
+
+fn is_loopback_host(host: &str) -> bool {
+    let h = host.trim();
+    let h = if let Some(rest) = h.strip_prefix('[') {
+        rest.split_once(']').map(|(v, _)| v).unwrap_or(h)
+    } else if let Some((name, port)) = h.rsplit_once(':') {
+        if port.chars().all(|c| c.is_ascii_digit()) {
+            name
+        } else {
+            h
+        }
+    } else {
+        h
+    };
+    let h = h.trim_end_matches('.').to_ascii_lowercase();
+    h == "127.0.0.1" || h == "localhost" || h == "::1"
+}
+
+fn is_loopback_origin(origin: &str) -> bool {
+    let rest = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+        .unwrap_or("");
+    let host = rest.split('/').next().unwrap_or("");
+    !host.is_empty() && is_loopback_host(host)
 }
 
 async fn auth(State(agent): AgentState, req: Request, next: Next) -> Response {
@@ -108,13 +141,42 @@ async fn auth(State(agent): AgentState, req: Request, next: Next) -> Response {
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip().is_loopback())
         .unwrap_or(false);
-    let token_ok = req
+    let token_ok = !agent.me.token.is_empty()
+        && req
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("Bearer "))
+            .map(|provided| util::constant_time_eq(provided.as_bytes(), agent.me.token.as_bytes()))
+            .unwrap_or(false);
+    if token_ok {
+        return next.run(req).await;
+    }
+    // Without the cluster token, only allow read-only dashboard & local health
+    // checks from loopback with strict Host/Origin validation (prevents local
+    // privilege escalation, DNS rebinding, and cross-site CSRF).
+    let path = req.uri().path();
+    let readonly_dashboard = req.method() == axum::http::Method::GET
+        && matches!(path, "/" | "/v1/status" | "/v1/local/ping");
+    let host_ok = req
         .headers()
-        .get(header::AUTHORIZATION)
+        .get(header::HOST)
         .and_then(|v| v.to_str().ok())
-        .map(|v| v.strip_prefix("Bearer ").unwrap_or(v) == agent.me.token)
-        .unwrap_or(false);
-    if local || token_ok {
+        .map(is_loopback_host)
+        .unwrap_or(true);
+    let origin_ok = req
+        .headers()
+        .get(header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .map(is_loopback_origin)
+        .unwrap_or(true);
+    let fetch_site_ok = req
+        .headers()
+        .get("sec-fetch-site")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| !v.eq_ignore_ascii_case("cross-site"))
+        .unwrap_or(true);
+    if local && readonly_dashboard && host_ok && origin_ok && fetch_site_ok {
         next.run(req).await
     } else {
         ApiError(StatusCode::UNAUTHORIZED, "missing or invalid cluster token".into()).into_response()
@@ -146,6 +208,15 @@ async fn machine_forward(
     Path((id, rest)): Path<(u32, String)>,
     req: Request,
 ) -> Response {
+    if rest.is_empty()
+        || rest.starts_with('/')
+        || rest.contains('\\')
+        || rest.contains('?')
+        || rest.contains('#')
+        || rest.split('/').any(|seg| seg.is_empty() || seg == "." || seg == "..")
+    {
+        return ApiError(StatusCode::BAD_REQUEST, "invalid forwarded path".into()).into_response();
+    }
     let Some(ip) = agent.ip_of(id) else {
         return ApiError(StatusCode::NOT_FOUND, format!("unknown machine #{id}")).into_response();
     };
@@ -157,18 +228,52 @@ async fn machine_forward(
 
 /// Stream a request to another agent and stream the response back.
 pub async fn forward(agent: &Agent, ip: &str, path_q: &str, req: Request) -> Response {
-    let url = format!("http://{ip}:{API_PORT}{path_q}");
+    let hops: u8 = req
+        .headers()
+        .get("x-latrix-hops")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if hops >= 2 {
+        return ApiError(
+            StatusCode::LOOP_DETECTED,
+            "forwarding loop detected (leader election still converging — retry shortly)".into(),
+        )
+        .into_response();
+    }
+    let url = super::host_port_url(ip, API_PORT, path_q);
     let (parts, body) = req.into_parts();
+    let mut nominated: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for val in parts.headers.get_all(header::CONNECTION) {
+        if let Ok(s) = val.to_str() {
+            for t in s.split(',') {
+                let t = t.trim().to_ascii_lowercase();
+                if !t.is_empty() {
+                    nominated.insert(t);
+                }
+            }
+        }
+    }
     let mut rb = agent
         .http
         .request(parts.method, &url)
-        .bearer_auth(&agent.me.token);
+        .bearer_auth(&agent.me.token)
+        .header("x-latrix-hops", (hops + 1).to_string());
     for (k, v) in parts.headers.iter() {
+        let name = k.as_str();
         if k == header::HOST
             || k == header::AUTHORIZATION
             || k == header::CONTENT_LENGTH
             || k == header::CONNECTION
             || k == header::TRANSFER_ENCODING
+            || k == header::UPGRADE
+            || k == header::TE
+            || k == header::TRAILER
+            || name == "keep-alive"
+            || name == "proxy-authenticate"
+            || name == "proxy-authorization"
+            || name == "x-latrix-hops"
+            || nominated.contains(name)
         {
             continue;
         }
@@ -179,7 +284,13 @@ pub async fn forward(agent: &Agent, ip: &str, path_q: &str, req: Request) -> Res
         Ok(resp) => {
             let mut b = Response::builder().status(resp.status());
             for (k, v) in resp.headers() {
-                if k == header::TRANSFER_ENCODING || k == header::CONNECTION || k == header::CONTENT_LENGTH {
+                if k == header::TRANSFER_ENCODING
+                    || k == header::CONNECTION
+                    || k == header::CONTENT_LENGTH
+                    || k == header::TE
+                    || k == header::TRAILER
+                    || k.as_str() == "keep-alive"
+                {
                     continue;
                 }
                 b = b.header(k, v);
@@ -215,12 +326,25 @@ async fn get_state(State(agent): AgentState) -> Json<ClusterState> {
 }
 
 async fn post_state(State(agent): AgentState, Json(s): Json<ClusterState>) -> Json<bool> {
-    Json(agent.accept_state(s))
+    Json(agent.accept_state(s).await)
 }
 
-async fn report(State(agent): AgentState, Json(mut r): Json<NodeReport>) -> Json<ReportAck> {
+async fn report(State(agent): AgentState, Json(mut r): Json<NodeReport>) -> ApiResult<ReportAck> {
+    if !agent.is_leader() {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "not leader".into(),
+        ));
+    }
+    let snap = agent.snapshot();
+    let Some(machine) = snap.machines.get(&r.machine) else {
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("unknown machine #{}", r.machine),
+        ));
+    };
     if !r.events.is_empty() {
-        let name = agent.snapshot().machines.get(&r.machine).map(|m| m.name.clone()).unwrap_or_default();
+        let name = machine.name.clone();
         let mut ev = agent.events.lock().unwrap();
         for mut e in std::mem::take(&mut r.events) {
             e.message = format!("{name}: {}", e.message);
@@ -238,9 +362,9 @@ async fn report(State(agent): AgentState, Json(mut r): Json<NodeReport>) -> Json
         .lock()
         .unwrap()
         .insert(r.machine, (Instant::now(), r));
-    Json(ReportAck {
-        version: agent.snapshot().version,
-    })
+    Ok(Json(ReportAck {
+        version: snap.version,
+    }))
 }
 
 async fn routes(State(agent): AgentState) -> Json<Routes> {
@@ -478,41 +602,60 @@ async fn join(State(agent): AgentState, Json(req): Json<JoinRequest>) -> ApiResu
 
 /// Add a machine to the cluster state (idempotent for the same name + key).
 pub fn register_machine(s: &mut ClusterState, req: &JoinRequest) -> anyhow::Result<Machine> {
+    validate_name("machine", &req.name)?;
+    let public_ip = req.public_ip.trim();
+    if public_ip.parse::<std::net::IpAddr>().is_err() {
+        bail!("invalid public_ip '{}'", req.public_ip);
+    }
+    let wg_pubkey = req.wg_pubkey.trim();
+    mesh::validate_wg_pubkey(wg_pubkey)?;
     if let Some(existing) = s.machines.values().find(|m| m.name == req.name) {
-        if existing.wg_pubkey == req.wg_pubkey {
+        if existing.wg_pubkey == wg_pubkey {
             return Ok(existing.clone()); // re-running `machine add` is fine
         }
         bail!("a machine named '{}' already exists", req.name);
     }
-    if let Some(existing) = s.machines.values().find(|m| m.public_ip == req.public_ip) {
+    if let Some(existing) = s.machines.values().find(|m| m.public_ip == public_ip) {
         bail!(
-            "{} is already in the cluster as '{}'",
-            req.public_ip,
+            "{public_ip} is already in the cluster as '{}'",
             existing.name
         );
     }
-    let id = s.next_machine_id.max(s.machines.keys().copied().max().unwrap_or(0)) + 1;
-    s.next_machine_id = id;
+    let used_ips: std::collections::HashSet<&str> =
+        s.machines.values().map(|m| m.overlay_ip.as_str()).collect();
+    let mut id = s.next_machine_id.max(s.machines.keys().copied().max().unwrap_or(0));
+    let (chosen_id, overlay_ip) = (0..(255 * 254))
+        .find_map(|_| {
+            id = id.wrapping_add(1).max(1);
+            let ip = mesh::overlay_ip(id);
+            if !s.machines.contains_key(&id) && !used_ips.contains(ip.as_str()) {
+                Some((id, ip))
+            } else {
+                None
+            }
+        })
+        .ok_or_else(|| anyhow!("no free overlay IPs left in cluster"))?;
+    s.next_machine_id = chosen_id;
     let m = Machine {
-        id,
+        id: chosen_id,
         name: req.name.clone(),
-        public_ip: req.public_ip.clone(),
-        overlay_ip: mesh::overlay_ip(id),
-        wg_pubkey: req.wg_pubkey.clone(),
+        public_ip: public_ip.to_string(),
+        overlay_ip,
+        wg_pubkey: wg_pubkey.to_string(),
         os: req.os.clone(),
         arch: req.arch.clone(),
-        cpus: req.cpus,
+        cpus: if req.cpus.is_finite() && req.cpus >= 0.0 { req.cpus } else { 0.0 },
         memory_mb: req.memory_mb,
         region: req.region.clone(),
         provider: req.provider.clone(),
-        monthly_cost: req.monthly_cost,
+        monthly_cost: req.monthly_cost.filter(|c| c.is_finite() && *c >= 0.0),
         status: MachineStatus::Ready,
         joined_at: now(),
         maintenance: None,
         last_maintenance: now(),
         temporary: false,
     };
-    s.machines.insert(id, m.clone());
+    s.machines.insert(chosen_id, m.clone());
     Ok(m)
 }
 
@@ -559,6 +702,9 @@ async fn machine_action(
                     m.status = MachineStatus::Cordoned;
                 }
                 "uncordon" => {
+                    if m.status == MachineStatus::Maintenance {
+                        bail!("{} is currently running OS maintenance; wait for it to finish before uncordoning", m.name);
+                    }
                     m.status = MachineStatus::Ready;
                     m.maintenance = None;
                 }
@@ -601,12 +747,33 @@ async fn remove_machine(
                     m.name
                 );
             }
+            let primary_vols: Vec<String> = s
+                .volumes
+                .values()
+                .filter(|v| v.primary == m.id || v.moving_to == Some(m.id))
+                .map(|v| format!("{}/{}", v.app, v.name))
+                .collect();
+            if !primary_vols.is_empty() && !q.force {
+                bail!(
+                    "{} still owns volume(s) ({}); drain it first or pass --force",
+                    m.name,
+                    primary_vols.join(", ")
+                );
+            }
             let ids: Vec<String> = s.instances_on(m.id).map(|i| i.id.clone()).collect();
             for id in ids {
                 s.instances.remove(&id);
             }
             for v in s.volumes.values_mut() {
                 v.replicas.retain(|r| *r != m.id);
+                if v.moving_to == Some(m.id) {
+                    v.moving_to = None;
+                }
+            }
+            if let Some(sg) = &s.surge {
+                if sg.for_machine == m.id || sg.temp_machine == Some(m.id) {
+                    s.surge = None;
+                }
             }
             s.machines.remove(&m.id);
             Ok(m)
@@ -672,16 +839,143 @@ async fn build_plan(State(agent): AgentState, Path(app): Path<String>) -> ApiRes
     }))
 }
 
-fn alloc_vip(s: &mut ClusterState) -> String {
+pub fn alloc_vip(s: &mut ClusterState) -> anyhow::Result<String> {
     let used: std::collections::HashSet<String> = s.apps.values().map(|a| a.vip.clone()).collect();
-    loop {
-        s.next_vip += 1;
+    for _ in 0..(255 * 254) {
+        s.next_vip = s.next_vip.wrapping_add(1);
         let n = s.next_vip;
         let vip = format!("{VIP_PREFIX}.{}.{}", (n / 254) % 255, n % 254 + 1);
         if !used.contains(&vip) {
-            return vip;
+            return Ok(vip);
         }
     }
+    bail!("no free internal VIP addresses left in cluster")
+}
+
+/// Validate public port, HTTP domain, and group DNS conflicts against other apps.
+pub fn check_app_conflicts(
+    s: &ClusterState,
+    app: &str,
+    cfg: &crate::config::AppConfig,
+) -> anyhow::Result<()> {
+    for p in cfg.ports.iter().filter(|p| p.public) {
+        let pp = p.public_port.unwrap_or(p.port);
+        let reserved: &[u16] = if p.protocol == "udp" {
+            &[53, util::WG_PORT]
+        } else {
+            &[80, 443, API_PORT, util::REGISTRY_PORT, util::RSYNC_PORT, 22]
+        };
+        if reserved.contains(&pp) {
+            bail!("public {} port {pp} is reserved", p.protocol);
+        }
+        for other in s.apps.values().filter(|a| a.name != app) {
+            if let Some(oc) = other.config() {
+                if oc.ports.iter().any(|o| {
+                    o.public && o.protocol == p.protocol && o.public_port.unwrap_or(o.port) == pp
+                }) {
+                    bail!(
+                        "public {} port {pp} is already used by app '{}'",
+                        p.protocol,
+                        other.name
+                    );
+                }
+            }
+        }
+    }
+    if let Some(h) = &cfg.http {
+        for d in &h.domains {
+            let dn = crate::config::normalize_dns_name(d);
+            for other in s.apps.values().filter(|a| a.name != app) {
+                if let Some(oh) = other.config().and_then(|c| c.http.as_ref()) {
+                    if oh
+                        .domains
+                        .iter()
+                        .any(|od| crate::config::normalize_dns_name(od) == dn)
+                    {
+                        bail!("domain '{dn}' is already used by app '{}'", other.name);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(group) = &cfg.group {
+        let mut names = vec![cfg.service_name().to_string()];
+        names.extend(cfg.aliases.iter().cloned());
+        for other in s.apps.values().filter(|a| a.name != app) {
+            if let Some(oc) = other.config() {
+                if oc.group.as_deref() == Some(group.as_str()) {
+                    let mut onames = vec![oc.service_name().to_string()];
+                    onames.extend(oc.aliases.iter().cloned());
+                    for n in &names {
+                        if onames.contains(n) {
+                            bail!(
+                                "internal name '{n}.{group}.internal' is already used by app '{}'",
+                                other.name
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Ensure all configured volumes for `app` exist in `s.volumes` and remove deleted ones.
+pub fn reconcile_app_volumes(
+    s: &mut ClusterState,
+    view: &LiveView<'_>,
+    app: &str,
+    cfg: &crate::config::AppConfig,
+) -> anyhow::Result<()> {
+    let existing_primary = s.volumes_of(app).next().map(|v| v.primary);
+    let primary = match existing_primary {
+        Some(p) if s.machines.contains_key(&p) => Some(p),
+        _ if !cfg.volumes.is_empty() => scheduler::place(s, view, app, cfg, &[])
+            .or_else(|| s.machines.keys().next().copied()),
+        _ => None,
+    };
+    if !cfg.volumes.is_empty() && primary.is_none() {
+        bail!("no machine available to place volumes for '{app}'");
+    }
+    for vc in &cfg.volumes {
+        let id = Volume::dir_name(app, &vc.name);
+        // A pending purge from an earlier destroy must not hit the new app's data.
+        s.tombstones.remove(&id);
+        let sync_secs = util::parse_duration(&vc.sync)
+            .map(|d| d.as_secs())
+            .unwrap_or(30)
+            .max(5);
+        match s.volumes.get_mut(&id) {
+            Some(v) => {
+                v.copies = vc.copies;
+                v.sync_secs = sync_secs;
+                v.path = vc.path.clone();
+            }
+            None => {
+                s.volumes.insert(
+                    id.clone(),
+                    Volume {
+                        id,
+                        app: app.to_string(),
+                        name: vc.name.clone(),
+                        path: vc.path.clone(),
+                        primary: primary.unwrap(),
+                        replicas: vec![],
+                        copies: vc.copies,
+                        sync_secs,
+                        created_at: now(),
+                        moving_to: None,
+                        moving_since: 0,
+                        moving_version: 0,
+                    },
+                );
+            }
+        }
+    }
+    let names: Vec<String> = cfg.volumes.iter().map(|v| v.name.clone()).collect();
+    s.volumes.retain(|_, v| v.app != app || names.contains(&v.name));
+    Ok(())
 }
 
 fn new_release(app: &mut App, image: String, config: crate::config::AppConfig, sources: Vec<u32>, description: String) -> u64 {
@@ -709,43 +1003,24 @@ async fn deploy(
     Path(app): Path<String>,
     Json(req): Json<DeployRequest>,
 ) -> ApiResult<DeployResponse> {
-    let cfg = req.config.clone();
+    let mut cfg = req.config.clone();
+    if let Some(h) = &mut cfg.http {
+        for d in &mut h.domains {
+            *d = crate::config::normalize_dns_name(d);
+        }
+    }
     cfg.validate()?;
     if cfg.app != app {
         return Err(anyhow!("config is for app '{}', not '{app}'", cfg.app).into());
     }
-    if req.image.trim().is_empty() {
-        return Err(anyhow!("no image to deploy").into());
-    }
+    util::validate_image_ref(&req.image)?;
     let live = agent.live();
-    let dev = agent.dev;
     let version = agent
         .mutate(|s| {
-            // Public port conflicts.
-            for p in cfg.ports.iter().filter(|p| p.public) {
-                let pp = p.public_port.unwrap_or(p.port);
-                let reserved: &[u16] = if p.protocol == "udp" {
-                    &[53, util::WG_PORT]
-                } else {
-                    &[80, 443, API_PORT, util::REGISTRY_PORT, util::RSYNC_PORT, 22]
-                };
-                if reserved.contains(&pp) {
-                    bail!("public {} port {pp} is reserved", p.protocol);
-                }
-                for other in s.apps.values().filter(|a| a.name != app) {
-                    if let Some(oc) = other.config() {
-                        if oc.ports.iter().any(|o| o.public && o.protocol == p.protocol && o.public_port.unwrap_or(o.port) == pp) {
-                            bail!("public {} port {pp} is already used by app '{}'", p.protocol, other.name);
-                        }
-                    }
-                }
-            }
-            if dev && cfg.ports.iter().any(|p| p.public) {
-                // fine on the local cluster too
-            }
+            check_app_conflicts(s, &app, &cfg)?;
             let is_new = !s.apps.contains_key(&app);
             if is_new {
-                let vip = alloc_vip(s);
+                let vip = alloc_vip(s)?;
                 s.apps.insert(
                     app.clone(),
                     App {
@@ -777,51 +1052,7 @@ async fn deploy(
             let desc = if req.description.is_empty() { "deploy".to_string() } else { req.description.clone() };
             let version = new_release(a, req.image.clone(), cfg.clone(), sources, desc);
 
-            // Volumes: create the ones that are new; all of an app's volumes share a primary.
-            let existing_primary = s.volumes_of(&app).next().map(|v| v.primary);
-            let primary = match existing_primary {
-                Some(p) => Some(p),
-                None if !cfg.volumes.is_empty() => {
-                    let view = live.view();
-                    scheduler::place(s, &view, &app, &cfg, &[])
-                        .or_else(|| s.machines.keys().next().copied())
-                }
-                None => None,
-            };
-            for vc in &cfg.volumes {
-                let id = Volume::dir_name(&app, &vc.name);
-                // A pending purge from an earlier destroy must not hit the new app's data.
-                s.tombstones.remove(&id);
-                let sync_secs = util::parse_duration(&vc.sync).map(|d| d.as_secs()).unwrap_or(30).max(5);
-                match s.volumes.get_mut(&id) {
-                    Some(v) => {
-                        v.copies = vc.copies;
-                        v.sync_secs = sync_secs;
-                        v.path = vc.path.clone();
-                    }
-                    None => {
-                        s.volumes.insert(
-                            id.clone(),
-                            Volume {
-                                id,
-                                app: app.clone(),
-                                name: vc.name.clone(),
-                                path: vc.path.clone(),
-                                primary: primary.unwrap(),
-                                replicas: vec![],
-                                copies: vc.copies,
-                                sync_secs,
-                                created_at: now(),
-                                moving_to: None,
-                                moving_since: 0,
-                                moving_version: 0,
-                            },
-                        );
-                    }
-                }
-            }
-            let names: Vec<String> = cfg.volumes.iter().map(|v| v.name.clone()).collect();
-            s.volumes.retain(|_, v| v.app != app || names.contains(&v.name));
+            reconcile_app_volumes(s, &live.view(), &app, &cfg)?;
             Ok(version)
         })
         .await?;
@@ -933,18 +1164,30 @@ async fn rollback(
     Path(app): Path<String>,
     Json(req): Json<RollbackRequest>,
 ) -> ApiResult<DeployResponse> {
+    let live = agent.live();
     let version = agent
         .mutate(|s| {
-            let a = s.apps.get_mut(&app).ok_or_else(|| anyhow!("app '{app}' not found"))?;
-            let target = match req.version {
-                Some(v) => a.release(v).cloned().ok_or_else(|| anyhow!("release v{v} not found"))?,
-                None => a
-                    .releases
-                    .iter()
-                    .filter(|r| r.version < a.current && r.status != ReleaseStatus::Failed)
-                    .max_by_key(|r| r.version)
-                    .cloned()
-                    .ok_or_else(|| anyhow!("no earlier release to roll back to"))?,
+            let target = {
+                let a = s.apps.get(&app).ok_or_else(|| anyhow!("app '{app}' not found"))?;
+                match req.version {
+                    Some(v) => a.release(v).cloned().ok_or_else(|| anyhow!("release v{v} not found"))?,
+                    None => a
+                        .releases
+                        .iter()
+                        .filter(|r| r.version < a.current && r.status != ReleaseStatus::Failed)
+                        .max_by_key(|r| r.version)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("no earlier release to roll back to"))?,
+                }
+            };
+            check_app_conflicts(s, &app, &target.config)?;
+            reconcile_app_volumes(s, &live.view(), &app, &target.config)?;
+            let a = s.apps.get_mut(&app).unwrap();
+            let (min, max) = target.config.scale.bounds();
+            a.count = if target.config.stateful() {
+                a.count.min(1).clamp(min.min(1), max.min(1))
+            } else {
+                a.count.clamp(min, max)
             };
             Ok(new_release(
                 a,
@@ -968,8 +1211,11 @@ async fn secrets(
         .mutate(|s| {
             let a = s.apps.get_mut(&app).ok_or_else(|| anyhow!("app '{app}' not found"))?;
             for (k, v) in &req.set {
-                if k.is_empty() || k.contains('=') {
+                if k.is_empty() || k.contains(['=', '\0', '\r', '\n']) {
                     bail!("invalid secret name '{k}'");
+                }
+                if v.contains('\0') {
+                    bail!("secret '{k}' cannot contain NUL bytes");
                 }
                 a.secrets.insert(k.clone(), v.clone());
             }
@@ -995,6 +1241,7 @@ async fn set_settings(
     State(agent): AgentState,
     Json(req): Json<BTreeMap<String, String>>,
 ) -> ApiResult<Settings> {
+    let dev = agent.dev;
     let settings = agent
         .mutate(|s| {
             let mut v = serde_json::to_value(&s.settings)?;
@@ -1013,17 +1260,48 @@ async fn set_settings(
                     serde_json::Value::Number(n) => match (n.is_f64(), val.parse::<u64>()) {
                         (false, Ok(i)) => serde_json::json!(i),
                         (false, Err(_)) => bail!("{k} must be a whole number"),
-                        (true, _) => serde_json::json!(val
-                            .parse::<f64>()
-                            .map_err(|_| anyhow!("{k} must be a number"))?),
+                        (true, _) => {
+                            let f = val
+                                .parse::<f64>()
+                                .map_err(|_| anyhow!("{k} must be a number"))?;
+                            if !f.is_finite() || f < 0.0 {
+                                bail!("{k} must be a finite non-negative number");
+                            }
+                            serde_json::json!(f)
+                        }
                     },
                     _ => serde_json::Value::String(val.clone()),
                 };
                 obj.insert(k.clone(), new);
             }
-            let new: Settings = serde_json::from_value(v)?;
-            if !new.update_window.is_empty() && !new.update_window.contains('-') {
-                bail!("update_window looks like \"02:00-05:00\" (UTC), or empty for any time");
+            let mut new: Settings = serde_json::from_value(v)?;
+            if !new.update_window.is_empty() {
+                scheduler::validate_window(&new.update_window)?;
+            }
+            if !new.base_domain.trim().is_empty() {
+                new.base_domain = crate::config::validate_domain(&new.base_domain)?;
+            } else {
+                new.base_domain.clear();
+            }
+            if !new.alert_webhook.trim().is_empty() {
+                super::alerts::validate_webhook_url(&new.alert_webhook)?;
+            }
+            if new.volume_retention_days > 36_500.0 {
+                bail!("volume_retention_days must be at most 36500");
+            }
+            if new.min_machines == 0 || new.max_machines == 0 {
+                bail!("min_machines and max_machines must be at least 1");
+            }
+            if new.min_machines > new.max_machines {
+                bail!("min_machines can't be larger than max_machines");
+            }
+            if new.autopilot {
+                if dev {
+                    bail!("the local dev cluster can't buy servers");
+                }
+                if s.provider_tokens.is_empty() {
+                    bail!("the autopilot needs a provider token (hetzner or digitalocean)");
+                }
             }
             if new.cloudflare_ttl != 1 && !(60..=86400).contains(&new.cloudflare_ttl) {
                 bail!("cloudflare_ttl must be 1 (auto) or between 60 and 86400 seconds");
@@ -1078,19 +1356,31 @@ async fn set_autopilot(State(agent): AgentState, Json(req): Json<AutopilotReques
     for p in req.tokens.keys() {
         crate::cli::providers::canonical(p)?;
     }
+    let validated_keys: Vec<String> = req
+        .ssh_keys
+        .iter()
+        .map(|k| super::keys::validate(k))
+        .collect::<anyhow::Result<_>>()?;
+    if let Some(b) = req.budget {
+        if !b.is_finite() || b < 0.0 {
+            return Err(anyhow!("budget must be a finite non-negative number").into());
+        }
+    }
     agent
         .mutate(|s| {
             for (p, t) in &req.tokens {
                 let p = crate::cli::providers::canonical(p)?.to_string();
-                s.provider_tokens.insert(p, t.clone());
+                s.provider_tokens.insert(p, t.trim().to_string());
             }
-            for k in &req.ssh_keys {
-                if !s.ssh_keys.contains(k) {
+            for k in &validated_keys {
+                let id = super::keys::key_id(k);
+                s.revoked_ssh_keys.retain(|r| super::keys::key_id(r) != id);
+                if !s.ssh_keys.iter().any(|x| super::keys::key_id(x) == id) {
                     s.ssh_keys.push(k.clone());
                 }
             }
             if let Some(b) = req.budget {
-                s.settings.monthly_budget = b.max(0.0);
+                s.settings.monthly_budget = b;
             }
             if let Some(m) = req.min_machines {
                 s.settings.min_machines = m.max(1);
@@ -1125,14 +1415,51 @@ async fn set_autopilot(State(agent): AgentState, Json(req): Json<AutopilotReques
 
 async fn provision_machine(State(agent): AgentState, Json(req): Json<ProvisionRequest>) -> ApiResult<Machine> {
     validate_name("machine", &req.name)?;
+    util::validate_ssh_target(&req.ssh)?;
+    let port = req.port.unwrap_or(22);
+    if port == 0 {
+        return Err(anyhow!("invalid SSH port 0").into());
+    }
     let (key, _) = super::autopilot::leader_key(&agent).await?;
-    let ssh = super::autopilot::leader_ssh(&agent, &req.ssh, req.port.unwrap_or(22), &key);
+    let ssh = super::autopilot::leader_ssh(&agent, &req.ssh, port, &key);
     let ip = match &req.public_ip {
-        Some(ip) => ip.clone(),
-        None => ssh.host().to_string(),
+        Some(ip) => {
+            let trimmed = ip.trim();
+            if trimmed.parse::<std::net::IpAddr>().is_err() {
+                return Err(anyhow!("invalid public_ip '{ip}'").into());
+            }
+            trimmed.to_string()
+        }
+        None => {
+            let h = ssh.host().to_string();
+            if h.parse::<std::net::IpAddr>().is_err() {
+                return Err(anyhow!("public_ip is required when SSH host '{h}' is not an IP address").into());
+            }
+            h
+        }
     };
+    if agent
+        .autopilot
+        .busy
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "another server provisioning task is already in progress".into(),
+        ));
+    }
+    struct ClearGuard(Arc<Agent>);
+    impl Drop for ClearGuard {
+        fn drop(&mut self) {
+            self.0.autopilot.status.lock().unwrap().working_on = None;
+            self.0
+                .autopilot
+                .busy
+                .store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+    let _guard = ClearGuard(agent.clone());
     let m = super::autopilot::provision(&agent, &ssh, &req.name, &ip, None, None, None).await?;
-    agent.autopilot.status.lock().unwrap().working_on = None;
     agent.event("info", format!("machine {} joined the cluster (set up by the leader)", m.name));
     Ok(Json(m))
 }
@@ -1255,6 +1582,15 @@ fn normalize_dns_record(mut r: crate::config::DnsRecordConfig) -> crate::config:
         .map(|t| t.trim().to_ascii_uppercase())
         .filter(|t| !t.is_empty());
     r.content = r.content.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+    if r.record_type.is_none() {
+        if let Some(c) = &r.content {
+            if c.parse::<std::net::Ipv4Addr>().is_ok() {
+                r.record_type = Some("A".into());
+            } else if c.parse::<std::net::Ipv6Addr>().is_ok() {
+                r.record_type = Some("AAAA".into());
+            }
+        }
+    }
     r
 }
 
@@ -1391,7 +1727,13 @@ async fn set_ssh_keys(State(agent): AgentState, Json(req): Json<SshKeysRequest>)
     use super::keys::{key_id, validate};
     let (_, cluster_key) = super::autopilot::leader_key(&agent).await?;
     let add: Vec<String> = req.add.iter().map(|k| validate(k)).collect::<anyhow::Result<_>>()?;
-    let remove: Vec<String> = req.remove.iter().filter_map(|k| key_id(k)).collect();
+    let mut remove = Vec::with_capacity(req.remove.len());
+    for k in &req.remove {
+        match key_id(k) {
+            Some(id) => remove.push(id),
+            None => return Err(anyhow!("invalid SSH key to remove: '{k}'").into()),
+        }
+    }
     if remove.iter().any(|r| key_id(&cluster_key).as_ref() == Some(r)) {
         return Err(anyhow!("that is the cluster's own key; it can't be removed").into());
     }
@@ -1425,9 +1767,7 @@ async fn get_rexctl(State(agent): AgentState) -> Json<RexctlStatusView> {
 
 async fn set_rexctl(State(agent): AgentState, Json(mut stack): Json<FluxerStack>) -> ApiResult<RexctlStatusView> {
     validate_name("project", &stack.project)?;
-    if stack.domain.trim().is_empty() || !stack.domain.contains('.') {
-        return Err(anyhow!("invalid Fluxer domain '{}'", stack.domain).into());
-    }
+    stack.domain = crate::config::validate_domain(&stack.domain)?;
     stack.updated_at = now();
     if stack.created_at == 0 {
         stack.created_at = stack.updated_at;
@@ -1505,6 +1845,10 @@ async fn set_rexctl_auto_upgrade(
         })
         .await?;
     if req.check_now {
+        agent
+            .rexctl
+            .force_check
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         agent.rexctl.wake.notify_one();
     }
     Ok(Json(super::rexctl::status_view(&agent)))

@@ -47,7 +47,7 @@ case "$pm" in
     zypper -n -q refresh >/dev/null || true
     install_pkgs ca-certificates curl git rsync wireguard-tools iproute2 openssh-clients ;;
   pacman)
-    pacman -Sy --noconfirm >/dev/null
+    pacman -Syu --noconfirm >/dev/null
     install_pkgs ca-certificates curl git rsync wireguard-tools iproute2 openssh ;;
   *)
     log "unsupported distribution: no apt, dnf, yum, zypper or pacman found"; exit 1 ;;
@@ -62,7 +62,9 @@ if ! command -v docker >/dev/null 2>&1; then
       case "$ID_LIKE" in *ubuntu*) distro=ubuntu; codename="${UBUNTU_CODENAME:-$codename}" ;; esac
       if [ "$distro" != ubuntu ] && [ "$distro" != debian ]; then distro=debian; fi
       install -m 0755 -d /etc/apt/keyrings
-      if curl -fsSL "https://download.docker.com/linux/$distro/gpg" -o /etc/apt/keyrings/docker.asc \
+      if [ -n "$codename" ] \
+         && curl -fsSL "https://download.docker.com/linux/$distro/gpg" -o /etc/apt/keyrings/docker.asc \
+         && chmod a+r /etc/apt/keyrings/docker.asc \
          && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/$distro $codename stable" > /etc/apt/sources.list.d/docker.list \
          && apt-get update -q >/dev/null \
          && install_pkgs docker-ce docker-ce-cli containerd.io docker-buildx-plugin; then
@@ -89,13 +91,37 @@ if ! command -v docker >/dev/null 2>&1; then
   esac
 fi
 
+# Firewall: configure BEFORE starting/restarting Docker so firewalld reload does not wipe Docker's iptables chains.
+if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
+  log "configuring ufw"
+  ufw allow 80/tcp >/dev/null
+  ufw allow 443/tcp >/dev/null
+  ufw allow 51870/udp >/dev/null
+  ufw allow in on latrix0 >/dev/null
+  # Containers only need internal DNS (53) and app VIPs (10.78.0.0/16), not blanket host access.
+  ufw allow in on docker0 to any port 53 proto udp >/dev/null
+  ufw allow in on docker0 to any port 53 proto tcp >/dev/null
+  ufw allow in on docker0 to 10.78.0.0/16 >/dev/null
+fi
+if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  log "configuring firewalld"
+  firewall-cmd -q --permanent --add-service=http --add-service=https
+  firewall-cmd -q --permanent --add-port=51870/udp
+  firewall-cmd -q --permanent --zone=trusted --add-interface=latrix0 || true
+  firewall-cmd -q --permanent --zone=trusted --add-interface=latrix-vip || true
+  firewall-cmd -q --permanent --add-rich-rule='rule family="ipv4" source address="172.16.0.0/12" port port="53" protocol="udp" accept' || true
+  firewall-cmd -q --permanent --add-rich-rule='rule family="ipv4" source address="172.16.0.0/12" port port="53" protocol="tcp" accept' || true
+  firewall-cmd -q --permanent --add-rich-rule='rule family="ipv4" source address="172.16.0.0/12" destination address="10.78.0.0/16" accept' || true
+  firewall-cmd -q --reload
+fi
+
 # Docker daemon config: trust the mesh-internal registries, keep containers
 # running across daemon restarts (package upgrades), cap log sizes.
 mkdir -p /etc/docker
 daemon=/etc/docker/daemon.json
 changed=0
 if [ ! -s "$daemon" ]; then
-  cat > "$daemon" <<'JSON'
+  cat > "$daemon.tmp" <<'JSON'
 {
   "insecure-registries": ["10.77.0.0/16", "127.0.0.0/8"],
   "live-restore": true,
@@ -104,21 +130,27 @@ if [ ! -s "$daemon" ]; then
   "features": { "buildkit": true }
 }
 JSON
+  mv -f "$daemon.tmp" "$daemon"
   changed=1
-elif ! grep -q '10.77.0.0/16' "$daemon" || ! grep -q '127.0.0.0/8' "$daemon"; then
+elif ! grep -Fq '10.77.0.0/16' "$daemon" || ! grep -Fq '127.0.0.0/8' "$daemon"; then
   if command -v python3 >/dev/null 2>&1; then
     cp "$daemon" "$daemon.latrix-backup"
     python3 - "$daemon" <<'PY'
-import json, sys
+import json, os, sys
 p = sys.argv[1]
-d = json.load(open(p))
+with open(p) as f:
+    d = json.load(f)
 regs = d.setdefault("insecure-registries", [])
 for r in ("10.77.0.0/16", "127.0.0.0/8"):
     if r not in regs:
         regs.append(r)
 d.setdefault("live-restore", True)
-d.setdefault("log-opts", {"max-size": "10m", "max-file": "3"})
-json.dump(d, open(p, "w"), indent=2)
+if d.get("log-driver", "json-file") == "json-file":
+    d.setdefault("log-opts", {"max-size": "10m", "max-file": "3"})
+tmp = p + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(d, f, indent=2)
+os.replace(tmp, p)
 PY
     changed=1
     log "updated existing $daemon (backup in $daemon.latrix-backup)"
@@ -136,27 +168,7 @@ fi
 modprobe wireguard 2>/dev/null || true
 modprobe dummy 2>/dev/null || true
 
-# Firewall: web traffic + the WireGuard mesh; trust the mesh and docker bridge.
-if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q "Status: active"; then
-  log "configuring ufw"
-  ufw allow 80/tcp >/dev/null
-  ufw allow 443/tcp >/dev/null
-  ufw allow 51870/udp >/dev/null
-  ufw allow in on latrix0 >/dev/null
-  ufw allow in on docker0 >/dev/null
-fi
-if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-  log "configuring firewalld"
-  firewall-cmd -q --permanent --add-service=http --add-service=https
-  firewall-cmd -q --permanent --add-port=51870/udp
-  firewall-cmd -q --permanent --zone=trusted --add-interface=latrix0 || true
-  firewall-cmd -q --permanent --zone=trusted --add-interface=latrix-vip || true
-  firewall-cmd -q --permanent --zone=trusted --add-interface=docker0 || true
-  firewall-cmd -q --reload
-fi
-
-mkdir -p /var/lib/latrix
-chmod 700 /var/lib/latrix
+install -d -m 0700 /var/lib/latrix /etc/wireguard
 
 cat > /etc/systemd/system/latrix.service <<'UNIT'
 [Unit]
@@ -170,6 +182,12 @@ ExecStart=/usr/local/bin/latrix agent run
 Restart=always
 RestartSec=3
 LimitNOFILE=1048576
+UMask=0077
+PrivateTmp=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+RestrictRealtime=yes
+OOMScoreAdjust=-500
 Environment=RUST_LOG=info
 # Containers are owned by Docker and keep running when the agent restarts.
 

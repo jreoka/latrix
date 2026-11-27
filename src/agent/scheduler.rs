@@ -156,6 +156,11 @@ pub fn reconcile(s: &mut ClusterState, live: &LiveView, mem: &mut SchedMemory) -
             rebalance(s, &mut cx);
         }
     }
+    // Prune expired / deleted-app entries from leader-local memory.
+    cx.mem.up_streak.retain(|k, _| s.apps.contains_key(k));
+    cx.mem.down_streak.retain(|k, _| s.apps.contains_key(k));
+    cx.mem.homes.retain(|k, _| s.apps.contains_key(k));
+    cx.mem.warned.retain(|_, ts| live.now.saturating_sub(*ts) < 600);
     cx.events
 }
 
@@ -168,6 +173,9 @@ fn restart_stuck(s: &mut ClusterState, cx: &mut Ctx) {
     let mut stuck = vec![];
     let mut seen = vec![];
     for i in s.instances.values().filter(|i| !i.stopping) {
+        if !live.is_alive(i.machine) {
+            continue;
+        }
         let Some(r) = live.inst(i) else { continue };
         seen.push(i.id.clone());
         let active = s
@@ -176,14 +184,23 @@ fn restart_stuck(s: &mut ClusterState, cx: &mut Ctx) {
             .and_then(|a| a.release(i.release))
             .map(|r| r.status == ReleaseStatus::Active)
             .unwrap_or(false);
-        if active && !r.healthy && r.unhealthy_since > 0 && now.saturating_sub(r.unhealthy_since) >= 120 {
+        // Prefer worker's monotonic `unhealthy_for` duration when reported, falling
+        // back to `unhealthy_since` for compatibility with older agents/tests.
+        let unhealthy_secs = if r.unhealthy_for > 0 {
+            r.unhealthy_for
+        } else if r.unhealthy_since > 0 {
+            now.saturating_sub(r.unhealthy_since)
+        } else {
+            0
+        };
+        if active && !r.healthy && unhealthy_secs >= 120 {
             stuck.push((i.id.clone(), i.app.clone(), i.machine));
         }
         // crash loop: 5+ restarts within 10 minutes
         let entry = cx.mem.restarts.entry(i.id.clone()).or_insert((r.restarts, now));
         if r.restarts < entry.0 || now.saturating_sub(entry.1) > 600 {
             *entry = (r.restarts, now);
-        } else if r.restarts >= entry.0 + 5 {
+        } else if r.restarts >= entry.0.saturating_add(5) {
             let n = r.restarts - entry.0;
             *entry = (r.restarts, now);
             let app = i.app.clone();
@@ -385,17 +402,18 @@ fn track_release(s: &mut ClusterState, app: &str, cx: &mut Ctx) -> bool {
     }
     let cfg = rel.config.clone();
     let version = rel.version;
-    let target = a.count;
+    let target = if cfg.stateful() { a.count.min(1) } else { a.count };
     let cur: Vec<&Instance> = s
         .instances_of(app)
         .filter(|i| i.release == version && !i.stopping)
         .collect();
     let healthy = cur.iter().filter(|i| live.healthy(i)).count() as u32;
     let timeout = cfg.deploy.health_timeout_secs();
+    let deadline = timeout.saturating_mul(3);
     let failed = cur
         .iter()
         .any(|i| !live.healthy(i) && live.now.saturating_sub(i.created_at) > timeout)
-        || (cur.is_empty() && target > 0 && live.now.saturating_sub(rel.created_at) > timeout * 3);
+        || (healthy < target && target > 0 && live.now.saturating_sub(rel.created_at) > deadline);
     if healthy >= target {
         let a = s.apps.get_mut(app).unwrap();
         for r in a.releases.iter_mut() {
@@ -574,9 +592,12 @@ fn reconcile_stateless(s: &mut ClusterState, app: &str, cx: &mut Ctx) {
                     continue;
                 }
             }
-            match place(s, live, app, &cfg, &taken) {
+            let exclude: &[u32] = if is_direct { &taken } else { &[] };
+            match place(s, live, app, &cfg, exclude) {
                 Some(m) => {
-                    taken.push(m);
+                    if is_direct {
+                        taken.push(m);
+                    }
                     create(s, app, version, m, now);
                 }
                 None => {
@@ -654,9 +675,24 @@ fn reconcile_stateful(s: &mut ClusterState, app: &str, cx: &mut Ctx) {
     let vol_ids: Vec<String> = vols.iter().map(|v| v.id.clone()).collect();
 
     // --- planned move in progress -------------------------------------------
-    if let Some(target) = vols[0].moving_to {
-        let since = vols[0].moving_since;
-        let since_version = vols[0].moving_version;
+    let moving_vol = vols.iter().find(|v| v.moving_to.is_some());
+    if let Some(mv) = moving_vol {
+        let target = mv.moving_to.unwrap();
+        let since = mv.moving_since;
+        let since_version = mv.moving_version;
+        // Abort the move cleanly if the target machine died or was removed.
+        if !s.machines.contains_key(&target) || !schedulable(s, live, target) {
+            for v in &vol_ids {
+                if let Some(vol) = s.volumes.get_mut(v) {
+                    vol.moving_to = None;
+                }
+            }
+            cx.warn(format!(
+                "{app}: aborted volume move to {} (target is no longer available)",
+                machine_name(s, target)
+            ));
+            return;
+        }
         let remaining: Vec<String> = s
             .instances_of(app)
             .filter(|i| i.machine == primary)
@@ -679,7 +715,7 @@ fn reconcile_stateful(s: &mut ClusterState, app: &str, cx: &mut Ctx) {
             for v in &vol_ids {
                 let vol = s.volumes.get_mut(v).unwrap();
                 vol.replicas.retain(|r| *r != target);
-                if !vol.replicas.contains(&primary) {
+                if s.machines.contains_key(&primary) && !vol.replicas.contains(&primary) {
                     vol.replicas.push(primary);
                 }
                 vol.primary = target;
@@ -731,11 +767,12 @@ fn reconcile_stateful(s: &mut ClusterState, app: &str, cx: &mut Ctx) {
         return;
     }
 
-    // --- planned evacuation (drain / maintenance) -----------------------------
+    // --- planned evacuation (drain / maintenance / broken Docker) -------------
     let primary_status = s.machines.get(&primary).map(|m| m.status);
     let cfg = s.apps.get(app).and_then(|a| a.config()).cloned();
     let wrong_region = cfg.as_ref().map(|c| !region_ok(s, c, primary)).unwrap_or(false);
-    let leaving = matches!(primary_status, Some(MachineStatus::Draining) | Some(MachineStatus::Maintenance));
+    let leaving = matches!(primary_status, Some(MachineStatus::Draining) | Some(MachineStatus::Maintenance))
+        || !live.docker_ok(primary);
     if leaving || wrong_region {
         let t = best_replica(s, live, &vols, primary, true)
             .filter(|t| leaving || cfg.as_ref().map(|c| region_ok(s, c, *t)).unwrap_or(true));
@@ -819,23 +856,42 @@ fn best_replica_where(
     planned: bool,
     ok: &dyn Fn(u32) -> bool,
 ) -> Option<u32> {
+    // Candidate must be a replica for EVERY volume of the app so multi-volume
+    // apps never promote a machine missing one of their volumes.
     let replicas = &vols[0].replicas;
     let mut best: Option<(u64, u32)> = None;
     for r in replicas {
         if !schedulable(s, live, *r) || !ok(*r) {
             continue;
         }
-        // Oldest sync across all of the app's volumes for this replica.
+        if !vols.iter().all(|v| v.replicas.contains(r)) {
+            continue;
+        }
+        // Oldest confirmed sync across all of the app's volumes for this replica.
+        // Fall back to replica-reported local volume data on unplanned failover
+        // (when the dead primary's VolumeReport is unavailable).
         let synced = vols
             .iter()
             .map(|v| {
-                live.vol(primary, &v.id)
+                let from_primary = live
+                    .vol(primary, &v.id)
                     .and_then(|x| x.synced.get(r).copied())
-                    .unwrap_or(0)
+                    .unwrap_or(0);
+                if from_primary > 0 || planned {
+                    from_primary
+                } else {
+                    live.reports
+                        .get(r)
+                        .and_then(|nr| nr.replica_volumes.get(&v.id).copied())
+                        .unwrap_or(0)
+                }
             })
             .min()
             .unwrap_or(0);
-        if planned && synced == 0 {
+        // Never promote an unsynced/empty replica (for both planned moves and
+        // unplanned failover, to avoid overwriting the real primary with empty
+        // data via `rsync --delete` once it comes back).
+        if synced == 0 {
             continue;
         }
         if best.map(|(b, _)| synced > b).unwrap_or(true) {
@@ -862,18 +918,24 @@ fn maintain_replicas(s: &mut ClusterState, cx: &mut Ctx) {
         let need_home = !allowed(vol.primary);
         let base_want = vol.copies.saturating_sub(1) as usize;
         let want = if need_home { base_want.max(1) } else { base_want };
+        let mut seen_r = HashSet::new();
         let mut replicas: Vec<u32> = vol
             .replicas
             .iter()
             .copied()
             .filter(|r| *r != vol.primary && s.machines.contains_key(r))
             .filter(|r| live.dead_for(*r) < REPLICA_REPLACE_AFTER)
+            .filter(|r| seen_r.insert(*r))
             .collect();
-        replicas.dedup();
+        // Converge all volumes of the same app onto the same replica machines.
         if let Some(shared) = chosen_for_app.get(&vol.app) {
             for m in shared {
-                if !replicas.contains(m) && *m != vol.primary && replicas.len() < want {
-                    replicas.push(*m);
+                if *m != vol.primary && !replicas.contains(m) {
+                    if replicas.len() < want {
+                        replicas.push(*m);
+                    } else if let Some(pos) = replicas.iter().position(|r| !shared.contains(r)) {
+                        replicas[pos] = *m;
+                    }
                 }
             }
         }
@@ -896,7 +958,7 @@ fn maintain_replicas(s: &mut ClusterState, cx: &mut Ctx) {
                 .max_by(|a, b| {
                     let fa = (allowed(a.id), free_disk(live, a.id));
                     let fb = (allowed(b.id), free_disk(live, b.id));
-                    fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
+                    fa.0.cmp(&fb.0).then_with(|| fa.1.total_cmp(&fb.1))
                 })
                 .map(|m| m.id);
             match cand {
@@ -921,13 +983,35 @@ fn maintain_replicas(s: &mut ClusterState, cx: &mut Ctx) {
 }
 
 fn free_disk(live: &LiveView, m: u32) -> f64 {
-    live.metrics(m)
+    let f = live
+        .metrics(m)
         .map(|x| x.disk_total_gb - x.disk_used_gb)
-        .unwrap_or(0.0)
+        .unwrap_or(0.0);
+    if f.is_finite() { f } else { 0.0 }
 }
 
-/// A machine counts as drained when nothing on it can still be moved elsewhere.
+/// A machine counts as drained when nothing on it can still be moved elsewhere
+/// and no volume moves/removals are still pending on it.
 pub fn drained(s: &ClusterState, live: &LiveView, m: u32) -> bool {
+    let is_remove = s
+        .machines
+        .get(&m)
+        .and_then(|mm| mm.maintenance.as_ref())
+        .map(|t| t.kind == "remove")
+        .unwrap_or(false);
+    // Never declare a machine drained while a volume final-sync move is in flight,
+    // or while a doomed (`remove`) machine still owns ANY volume primary.
+    for v in s.volumes.values().filter(|v| v.primary == m) {
+        if v.moving_to.is_some() || is_remove {
+            return false;
+        }
+        // If a schedulable replica exists (even still doing initial sync), wait for
+        // the volume to finish syncing and move rather than rebooting mid-sync.
+        let has_target = v.replicas.iter().any(|r| schedulable(s, live, *r));
+        if has_target {
+            return false;
+        }
+    }
     for i in s.instances_on(m) {
         if i.stopping {
             return false;
@@ -942,7 +1026,9 @@ pub fn drained(s: &ClusterState, live: &LiveView, m: u32) -> bool {
                 *o != m
                     && schedulable(s, live, *o)
                     && region_ok(s, cfg, *o)
-                    && !(direct(cfg) && s.instances_of(&i.app).any(|x| x.machine == *o && !x.stopping))
+                    && !(direct(cfg)
+                        && (s.instances_of(&i.app).any(|x| x.machine == *o && !x.stopping)
+                            || udp_conflict(s, &i.app, cfg, *o)))
             })
         };
         if movable {
@@ -952,17 +1038,46 @@ pub fn drained(s: &ClusterState, live: &LiveView, m: u32) -> bool {
     true
 }
 
+fn parse_window_time(t: &str, allow_24: bool) -> Option<u64> {
+    let (h_s, m_s) = t.trim().split_once(':')?;
+    if h_s.is_empty() || m_s.len() != 2 || !h_s.chars().all(|c| c.is_ascii_digit()) || !m_s.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let h: u64 = h_s.parse().ok()?;
+    let m: u64 = m_s.parse().ok()?;
+    if m >= 60 {
+        return None;
+    }
+    if h < 24 || (allow_24 && h == 24 && m == 0) {
+        h.checked_mul(60)?.checked_add(m)
+    } else {
+        None
+    }
+}
+
+pub fn validate_window(window: &str) -> anyhow::Result<()> {
+    let w = window.trim();
+    if w.is_empty() {
+        return Ok(());
+    }
+    let Some((a, b)) = w.split_once('-') else {
+        anyhow::bail!("update_window must be \"HH:MM-HH:MM\" (UTC), or empty for any time");
+    };
+    if parse_window_time(a, false).is_none() || parse_window_time(b, true).is_none() {
+        anyhow::bail!("update_window must be \"HH:MM-HH:MM\" (UTC, 00:00-23:59), or empty for any time");
+    }
+    Ok(())
+}
+
 pub fn in_window(window: &str, now: u64) -> bool {
     let w = window.trim();
     if w.is_empty() {
         return true;
     }
-    let parse = |t: &str| -> Option<u64> {
-        let (h, m) = t.trim().split_once(':')?;
-        Some(h.parse::<u64>().ok()? * 60 + m.parse::<u64>().ok()?)
+    let Some((a, b)) = w.split_once('-') else { return false };
+    let (Some(start), Some(end)) = (parse_window_time(a, false), parse_window_time(b, true)) else {
+        return false;
     };
-    let Some((a, b)) = w.split_once('-') else { return true };
-    let (Some(start), Some(end)) = (parse(a), parse(b)) else { return true };
     let minute = (now % 86400) / 60;
     if start <= end {
         minute >= start && minute < end
@@ -981,10 +1096,13 @@ fn orchestrate_maintenance(s: &mut ClusterState, cx: &mut Ctx) {
             MachineStatus::Draining => {
                 if drained(s, live, *id) {
                     let kind = m.maintenance.as_ref().map(|t| t.kind.clone()).unwrap_or_default();
-                    let mm = s.machines.get_mut(id).unwrap();
                     if kind == "updates" {
-                        mm.status = MachineStatus::Maintenance;
                         let stuck = s.instances_on(*id).filter(|i| !i.stopping).count();
+                        let mm = s.machines.get_mut(id).unwrap();
+                        mm.status = MachineStatus::Maintenance;
+                        if let Some(t) = mm.maintenance.as_mut() {
+                            t.started_at = now;
+                        }
                         if stuck > 0 {
                             cx.warn(format!(
                                 "{}: {} instance(s) cannot move anywhere and will be briefly down during updates",
@@ -993,10 +1111,16 @@ fn orchestrate_maintenance(s: &mut ClusterState, cx: &mut Ctx) {
                         }
                         cx.info(format!("{}: drained, installing OS updates", m.name));
                     } else if kind == "remove" {
-                        // The autopilot deletes it next (keeps the task as a marker).
-                        mm.status = MachineStatus::Cordoned;
-                        cx.info(format!("{}: drained, ready to be removed", m.name));
+                        // Never mark a machine ready for cloud deletion if instances or volumes still live on it.
+                        let has_inst = s.instances_on(*id).next().is_some();
+                        let has_vol = s.volumes.values().any(|v| v.primary == *id || v.moving_to == Some(*id));
+                        if !has_inst && !has_vol {
+                            // The autopilot deletes it next (keeps the task as a marker).
+                            s.machines.get_mut(id).unwrap().status = MachineStatus::Cordoned;
+                            cx.info(format!("{}: drained, ready to be removed", m.name));
+                        }
                     } else {
+                        let mm = s.machines.get_mut(id).unwrap();
                         mm.status = MachineStatus::Cordoned;
                         mm.maintenance = None;
                         cx.info(format!("{}: drained (cordoned — run `latrix machine uncordon {}` to reuse)", m.name, m.name));
@@ -1121,14 +1245,24 @@ pub fn can_absorb(s: &ClusterState, live: &LiveView, m: u32) -> bool {
     if others.is_empty() {
         return false;
     }
-    // Apps pinned to a region need another machine there.
+    // Apps pinned to a region need another machine there; stateful apps need a replica target.
     for i in s.instances_on(m).filter(|i| !i.stopping) {
         let Some(cfg) = s.apps.get(&i.app).and_then(|a| a.config()) else { continue };
         if cfg.stateful() {
-            continue; // they wait for / move to their replica
+            let vols: Vec<Volume> = s.volumes_of(&i.app).cloned().collect();
+            let has_replica_target = !vols.is_empty()
+                && (best_replica(s, live, &vols, m, true).is_some()
+                    || vols.iter().all(|v| v.replicas.iter().any(|r| schedulable(s, live, *r))));
+            if !has_replica_target {
+                return false;
+            }
+            continue;
         }
         let fits = others.iter().any(|o| {
-            region_ok(s, cfg, o.id) && !(direct(cfg) && s.instances_of(&i.app).any(|x| x.machine == o.id && !x.stopping))
+            region_ok(s, cfg, o.id)
+                && !(direct(cfg)
+                    && (s.instances_of(&i.app).any(|x| x.machine == o.id && !x.stopping)
+                        || udp_conflict(s, &i.app, cfg, o.id)))
         });
         if !fits {
             return false;
@@ -1172,6 +1306,22 @@ fn drive_surge(s: &mut ClusterState, cx: &mut Ctx, sg: Surge) {
             }
         }
         "maintaining" => {
+            if !s.machines.contains_key(&target) {
+                // Target was removed mid-maintenance: if temp_machine is now the
+                // sole remaining node, promote it instead of draining the whole cluster!
+                if let Some(tid) = sg.temp_machine {
+                    if s.machines.len() <= 1 {
+                        if let Some(tm) = s.machines.get_mut(&tid) {
+                            tm.temporary = false;
+                            tm.status = MachineStatus::Ready;
+                            tm.maintenance = None;
+                        }
+                        s.surge = None;
+                        cx.warn("original machine disappeared during maintenance; promoted temporary server to permanent");
+                        return;
+                    }
+                }
+            }
             let back = s
                 .machines
                 .get(&target)
@@ -1184,12 +1334,21 @@ fn drive_surge(s: &mut ClusterState, cx: &mut Ctx, sg: Surge) {
                 }
                 next.phase = "returning".into();
                 cx.info(format!("{} is updated; moving apps back and removing the temporary server", machine_name(s, target)));
+            } else if now.saturating_sub(sg.requested_at) > 4 * 3600 {
+                // Bounded safety timeout so a permanently dead target doesn't lock surge forever.
+                next.phase = "failed".into();
+                cx.warn("maintenance surge timed out after 4h; clearing surge state");
             }
         }
         "returning" => {
             if sg.temp_machine.map(|t| !s.machines.contains_key(&t)).unwrap_or(true) {
                 s.surge = None;
                 cx.info("temporary server removed; maintenance complete");
+                return;
+            }
+            if now.saturating_sub(sg.requested_at) > 6 * 3600 {
+                s.surge = None;
+                cx.warn("temporary server cleanup timed out after 6h; clearing surge state");
                 return;
             }
         }
@@ -1249,7 +1408,7 @@ fn rebalance(s: &mut ClusterState, cx: &mut Ctx) {
     }
 
     // 1) Spread: an app with two instances on one machine while another
-    //    ready machine runs none of it.
+    //    ready machine runs none of it (and has room to fit it).
     for (name, app) in s.apps.clone() {
         let Some(cfg) = app.config() else { continue };
         if cfg.stateful() || direct(cfg) {
@@ -1266,6 +1425,9 @@ fn rebalance(s: &mut ClusterState, cx: &mut Ctx) {
             let Some(victim) = v.iter().find(|i| live.healthy(i)).map(|i| (*i).clone()) else { continue };
             let exclude: Vec<u32> = per.keys().copied().collect();
             if let Some(t) = place(s, live, &name, cfg, &exclude) {
+                if !fits_on(s, live, t, cfg.scale.memory_mb(), cfg.scale.cpu) {
+                    continue;
+                }
                 let id = create(s, &name, victim.release, t, now);
                 s.instances.get_mut(&id).unwrap().replaces = Some(victim.id.clone());
                 cx.info(format!(
@@ -1278,14 +1440,38 @@ fn rebalance(s: &mut ClusterState, cx: &mut Ctx) {
         }
     }
 
-    // 2) Load: move one instance from the busiest to the least busy machine.
+    // 2) Load: move one instance from the busiest to the least busy machine,
+    //    only if it fits on the target and genuinely reduces the imbalance (no ping-pong).
     let mut loads: Vec<(f64, u32)> = ready.iter().map(|m| (load(s, live, m), m.id)).collect();
-    loads.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+    loads.sort_by(|a, b| a.0.total_cmp(&b.0));
     let (lo, lo_id) = loads[0];
     let (hi, hi_id) = *loads.last().unwrap();
     if hi - lo < 0.25 {
         return;
     }
+    let hi_m = &s.machines[&hi_id];
+    let lo_m = &s.machines[&lo_id];
+    let mem_of = |m: &Machine| {
+        live.metrics(m.id)
+            .map(|x| x.mem_total_mb)
+            .filter(|x| *x > 0)
+            .unwrap_or(m.memory_mb.max(1024)) as f64
+    };
+    let cpu_of = |m: &Machine| {
+        live.metrics(m.id)
+            .map(|x| x.cpus)
+            .filter(|x| *x > 0.0)
+            .unwrap_or(m.cpus.max(1.0))
+    };
+    let hi_mem_tot = mem_of(hi_m);
+    let lo_mem_tot = mem_of(lo_m);
+    let hi_cpu_tot = cpu_of(hi_m);
+    let lo_cpu_tot = cpu_of(lo_m);
+    let hi_res_mb = s.reserved_mb(hi_id) as f64;
+    let lo_res_mb = s.reserved_mb(lo_id) as f64;
+    let hi_res_cpu = s.reserved_cpu(hi_id);
+    let lo_res_cpu = s.reserved_cpu(lo_id);
+
     let candidates: Vec<Instance> = s
         .instances_on(hi_id)
         .filter(|i| {
@@ -1300,22 +1486,27 @@ fn rebalance(s: &mut ClusterState, cx: &mut Ctx) {
             // don't stack two of the same app on the target
             !s.instances_of(&i.app).any(|o| o.machine == lo_id)
         })
+        .filter(|i| {
+            let imb = inst_mb(s, i);
+            let icpu = inst_cpu(s, i);
+            if !fits_on(s, live, lo_id, imb, icpu) {
+                return false;
+            }
+            // Simulate post-move reserved loads and ensure strict improvement (prevents 45s ping-pong).
+            let new_hi = ((hi_res_mb - imb as f64).max(0.0) / hi_mem_tot)
+                .max((hi_res_cpu - icpu).max(0.0) / hi_cpu_tot);
+            let new_lo = ((lo_res_mb + imb as f64) / lo_mem_tot)
+                .max((lo_res_cpu + icpu) / lo_cpu_tot);
+            (new_hi - new_lo).abs() + 0.05 < (hi - lo) && new_lo < hi - 0.05
+        })
         .cloned()
         .collect();
     // Pick the instance whose size best halves the gap.
-    let gap_mb = {
-        let m = &s.machines[&hi_id];
-        let total = live
-            .metrics(hi_id)
-            .map(|x| x.mem_total_mb)
-            .filter(|x| *x > 0)
-            .unwrap_or(m.memory_mb.max(1024)) as f64;
-        (hi - lo) / 2.0 * total
-    };
+    let gap_mb = (hi - lo) / 2.0 * hi_mem_tot;
     let pick = candidates.into_iter().min_by(|a, b| {
         let sa = inst_mb(s, a) as f64;
         let sb = inst_mb(s, b) as f64;
-        (sa - gap_mb).abs().partial_cmp(&(sb - gap_mb).abs()).unwrap_or(std::cmp::Ordering::Equal)
+        (sa - gap_mb).abs().total_cmp(&(sb - gap_mb).abs())
     });
     if let Some(victim) = pick {
         let id = create(s, &victim.app, victim.release, lo_id, now);
@@ -1331,6 +1522,21 @@ fn rebalance(s: &mut ClusterState, cx: &mut Ctx) {
     }
 }
 
+fn fits_on(s: &ClusterState, live: &LiveView, m: u32, need_mb: u64, need_cpu: f64) -> bool {
+    let Some(mm) = s.machines.get(&m) else { return false };
+    let met = live.metrics(m);
+    let mem_total = met
+        .map(|x| x.mem_total_mb)
+        .filter(|x| *x > 0)
+        .unwrap_or(mm.memory_mb.max(1024)) as f64;
+    let cpus = met
+        .map(|x| x.cpus)
+        .filter(|x| *x > 0.0)
+        .unwrap_or(mm.cpus.max(1.0));
+    (s.reserved_mb(m) as f64 + need_mb as f64) <= mem_total * 0.9
+        && (s.reserved_cpu(m) + need_cpu) <= cpus * 1.1
+}
+
 fn inst_mb(s: &ClusterState, i: &Instance) -> u64 {
     s.apps
         .get(&i.app)
@@ -1339,41 +1545,75 @@ fn inst_mb(s: &ClusterState, i: &Instance) -> u64 {
         .unwrap_or(0)
 }
 
+fn inst_cpu(s: &ClusterState, i: &Instance) -> f64 {
+    s.apps
+        .get(&i.app)
+        .and_then(|a| a.release(i.release))
+        .map(|r| r.config.scale.cpu)
+        .filter(|c| c.is_finite() && *c >= 0.0)
+        .unwrap_or(0.0)
+}
+
 fn autoscale(s: &mut ClusterState, cx: &mut Ctx) {
     let live = cx.live;
     let names: Vec<String> = s.apps.keys().cloned().collect();
     for name in names {
         let app = &s.apps[&name];
-        let Some(cfg) = app.config() else { continue };
-        if !cfg.scale.autoscale() {
+        let Some(rel) = app.current_release() else { continue };
+        // Never autoscale mid-deploy or on stateful apps.
+        if rel.status != ReleaseStatus::Active {
             continue;
         }
-        let (min, max) = cfg.scale.bounds();
-        let cpu_limit = if cfg.scale.cpu > 0.0 { cfg.scale.cpu } else { 1.0 };
+        let cfg = &rel.config;
+        if cfg.stateful() || !cfg.scale.autoscale() {
+            continue;
+        }
+        let (raw_min, raw_max) = cfg.scale.bounds();
+        // Never autoscale down to 0 (no scale-from-zero activator).
+        let min = raw_min.max(1);
+        let max = if direct(cfg) {
+            let eligible = s
+                .machines
+                .keys()
+                .filter(|m| schedulable(s, live, **m) && region_ok(s, cfg, **m))
+                .count() as u32;
+            raw_max.min(eligible.max(min))
+        } else {
+            raw_max
+        };
+        let cpu_limit = if cfg.scale.cpu.is_finite() && cfg.scale.cpu > 0.0 {
+            cfg.scale.cpu
+        } else {
+            1.0
+        };
         let mem_limit = cfg.scale.memory_mb().max(1) as f64;
         let reports: Vec<&InstanceReport> = s
             .instances_of(&name)
-            .filter(|i| !i.stopping && i.release == app.current)
+            .filter(|i| !i.stopping && i.release == app.current && live.is_alive(i.machine))
             .filter_map(|i| live.inst(i))
-            .filter(|r| r.healthy)
+            .filter(|r| r.healthy && r.cpu_pct.is_finite() && r.mem_mb.is_finite())
             .collect();
-        if reports.is_empty() {
+        // Wait until all desired instances are healthy & reporting before scaling again.
+        if reports.is_empty() || reports.len() != app.count as usize {
             continue;
         }
         let n = reports.len() as f64;
         let cpu = reports.iter().map(|r| r.cpu_pct / 100.0 / cpu_limit).sum::<f64>() / n;
         let mem = reports.iter().map(|r| r.mem_mb / mem_limit).sum::<f64>() / n;
         let util = cpu.max(mem * 0.85);
+        if !util.is_finite() {
+            continue;
+        }
         let up = cx.mem.up_streak.entry(name.clone()).or_default();
         if util > 0.75 {
-            *up += 1;
+            *up = up.saturating_add(1);
         } else {
             *up = 0;
         }
         let up_n = *up;
         let down = cx.mem.down_streak.entry(name.clone()).or_default();
         if util < 0.25 {
-            *down += 1;
+            *down = down.saturating_add(1);
         } else {
             *down = 0;
         }
@@ -1407,18 +1647,22 @@ pub fn compute_routes(s: &ClusterState, live: &LiveView) -> Routes {
         let mut hosts: Vec<String> = cfg
             .http
             .iter()
-            .flat_map(|h| h.domains.iter().cloned())
+            .flat_map(|h| h.domains.iter().map(|d| crate::config::normalize_dns_name(d)))
             .collect();
-        if !s.settings.base_domain.is_empty() {
-            hosts.push(format!("{}.{}", name, s.settings.base_domain));
+        if cfg.http.is_some() && !s.settings.base_domain.trim().is_empty() {
+            let bd = crate::config::normalize_dns_name(&s.settings.base_domain);
+            let h = format!("{name}.{bd}");
+            if !hosts.contains(&h) {
+                hosts.push(h);
+            }
         }
         let backends: Vec<Backend> = s
             .instances_of(name)
             .filter(|i| !i.stopping)
             .filter_map(|i| {
                 let r = live.inst(i)?;
-                // Stale "healthy" reports from a machine that stopped answering don't count.
-                if !r.healthy || !live.is_alive(i.machine) {
+                // Stale "healthy" reports from a dead or broken-Docker machine don't count.
+                if !r.healthy || !live.is_alive(i.machine) || !live.docker_ok(i.machine) {
                     return None;
                 }
                 let m = s.machines.get(&i.machine)?;
@@ -1445,11 +1689,13 @@ pub fn compute_routes(s: &ClusterState, live: &LiveView) -> Routes {
         if let Some(g) = &cfg.group {
             routes
                 .dns
-                .insert(format!("{}.{}.internal", cfg.service_name(), g), app.vip.clone());
+                .entry(format!("{}.{}.internal", cfg.service_name(), g))
+                .or_insert_with(|| app.vip.clone());
             for alias in &cfg.aliases {
                 routes
                     .dns
-                    .insert(format!("{alias}.{g}.internal"), app.vip.clone());
+                    .entry(format!("{alias}.{g}.internal"))
+                    .or_insert_with(|| app.vip.clone());
             }
         }
         routes.apps.insert(
@@ -1615,6 +1861,9 @@ mod tests {
                         idle_synced_version: if running { 0 } else { self.s.version },
                         ..Default::default()
                     });
+                }
+                for v in self.s.volumes.values().filter(|v| v.replicas.contains(m)) {
+                    r.replica_volumes.insert(v.id.clone(), self.now);
                 }
                 self.reports.insert(*m, r);
             }

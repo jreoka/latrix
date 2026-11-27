@@ -2,7 +2,7 @@
 //! instances the scheduler assigned to it, health-checks them, and keeps the
 //! image / build caches tidy.
 
-use super::{cmd, Agent};
+use super::{cmd, cmd_redacted, cmd_timeout, Agent};
 use crate::config::AppConfig;
 use crate::state::*;
 use crate::util::{self, REGISTRY_PORT};
@@ -17,25 +17,57 @@ use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{debug, info, warn};
 
-#[derive(Default)]
 pub struct Runtime {
     reports: Mutex<HashMap<String, InstanceReport>>,
     /// instance -> phase ("pulling", "starting", "stopping")
     busy: Mutex<HashMap<String, String>>,
     health: Mutex<HashMap<String, Health>>,
-    /// instance -> (last failed attempt, error)
+    /// instance -> (last failed attempt, error, consecutive failures)
     failures: Mutex<HashMap<String, (Instant, String, u32)>>,
     /// container name -> (cpu %, mem MB)
     stats: Mutex<HashMap<String, (f64, f64)>>,
     build_cache_gb: Mutex<f64>,
     pub builds_running: std::sync::atomic::AtomicUsize,
+    /// Shared RW lock coordinating pushes/builds (read) against registry GC (write).
+    pub registry_gc_lock: tokio::sync::RwLock<()>,
+    /// Dedicated HTTP client for container health checks (no redirect following).
+    health_http: reqwest::Client,
     /// When a container was last moved to a new address (rebinds are spaced
     /// out so routing tables everywhere catch up in between).
     last_rebind: Mutex<Option<Instant>>,
     /// Consecutive failed reconcile passes (Docker not answering).
     pub docker_failures: std::sync::atomic::AtomicU32,
-    /// app -> name of its running container on this machine (for volume sync)
+    /// app -> name of its active (running/stopping) container on this machine (for volume sync)
     pub running_apps: Mutex<HashMap<String, String>>,
+    /// Recently allocated host ports (avoids TOCTOU collisions across concurrent starts).
+    recent_ports: Mutex<HashMap<u16, Instant>>,
+}
+
+impl Default for Runtime {
+    fn default() -> Self {
+        let health_http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(3))
+            .no_proxy()
+            .build()
+            .expect("health http client");
+        Self {
+            reports: Default::default(),
+            busy: Default::default(),
+            health: Default::default(),
+            failures: Default::default(),
+            stats: Default::default(),
+            build_cache_gb: Default::default(),
+            builds_running: Default::default(),
+            registry_gc_lock: tokio::sync::RwLock::new(()),
+            health_http,
+            last_rebind: Default::default(),
+            docker_failures: Default::default(),
+            running_apps: Default::default(),
+            recent_ports: Default::default(),
+        }
+    }
 }
 
 #[derive(Default, Clone)]
@@ -44,6 +76,7 @@ struct Health {
     fails: u32,
     healthy_since: u64,
     unhealthy_since: u64,
+    unhealthy_at: Option<Instant>,
 }
 
 impl Runtime {
@@ -56,9 +89,18 @@ impl Runtime {
     pub fn build_cache_gb(&self) -> f64 {
         *self.build_cache_gb.lock().unwrap()
     }
-    /// Running container name for an app on this machine, if any.
+    /// Active container name for an app on this machine, if any.
     pub fn running_container(&self, app: &str) -> Option<String> {
         self.running_apps.lock().unwrap().get(app).cloned()
+    }
+    /// True if any instance of `app` is currently starting/stopping or has a container on this machine.
+    pub fn app_has_active_work(&self, app: &str, s: &ClusterState, me: u32) -> bool {
+        if self.running_apps.lock().unwrap().contains_key(app) {
+            return true;
+        }
+        let busy = self.busy.lock().unwrap();
+        s.instances_of(app)
+            .any(|i| i.machine == me && busy.contains_key(&i.id))
     }
     fn set_busy(&self, id: &str, phase: &str) {
         self.busy.lock().unwrap().insert(id.into(), phase.into());
@@ -68,6 +110,20 @@ impl Runtime {
     }
     fn is_busy(&self, id: &str) -> bool {
         self.busy.lock().unwrap().contains_key(id)
+    }
+    fn alloc_host_port(&self) -> Result<u16> {
+        let mut recent = self.recent_ports.lock().unwrap();
+        recent.retain(|_, t| t.elapsed() < Duration::from_secs(30));
+        for _ in 0..32 {
+            let port = std::net::TcpListener::bind(("0.0.0.0", 0))?.local_addr()?.port();
+            if let std::collections::hash_map::Entry::Vacant(e) = recent.entry(port) {
+                e.insert(Instant::now());
+                return Ok(port);
+            }
+        }
+        let port = std::net::TcpListener::bind(("0.0.0.0", 0))?.local_addr()?.port();
+        recent.insert(port, Instant::now());
+        Ok(port)
     }
 }
 
@@ -91,72 +147,86 @@ pub struct Ctr {
 }
 
 pub async fn list_containers() -> Result<Vec<Ctr>> {
-    let ids = cmd("docker", &["ps", "-aq", "--filter", "label=latrix.instance"]).await?;
-    let ids: Vec<&str> = ids.split_whitespace().collect();
-    if ids.is_empty() {
-        return Ok(vec![]);
-    }
-    let mut args = vec!["inspect"];
-    args.extend(ids.iter());
-    let out = match cmd("docker", &args).await {
-        Ok(o) => o,
-        // A container may vanish between ps and inspect; try again next tick.
-        Err(e) => {
-            debug!("docker inspect: {e}");
+    // Retry once if a container vanishes between `docker ps` and `docker inspect`.
+    for attempt in 0..2 {
+        let ids = cmd_timeout(
+            "docker",
+            &["ps", "-aq", "--filter", "label=latrix.instance"],
+            Duration::from_secs(15),
+        )
+        .await?;
+        let ids: Vec<&str> = ids.split_whitespace().collect();
+        if ids.is_empty() {
             return Ok(vec![]);
         }
-    };
-    let v: serde_json::Value = serde_json::from_str(&out)?;
-    let mut res = vec![];
-    for c in v.as_array().cloned().unwrap_or_default() {
-        let labels = &c["Config"]["Labels"];
-        let mut ports = BTreeMap::new();
-        let mut host_ips: Vec<String> = vec![];
-        if let Some(map) = c["NetworkSettings"]["Ports"].as_object() {
-            for (k, binds) in map {
-                let Some(cp) = k.strip_suffix("/tcp").and_then(|p| p.parse::<u16>().ok()) else { continue };
-                let first = binds.as_array().and_then(|a| a.first());
-                if let Some(hp) = first.and_then(|b| b["HostPort"].as_str()).and_then(|p| p.parse::<u16>().ok()) {
-                    ports.insert(cp, hp);
-                }
-                for b in binds.as_array().cloned().unwrap_or_default() {
-                    if let Some(ip) = b["HostIp"].as_str() {
-                        if !host_ips.iter().any(|x| x == ip) {
-                            host_ips.push(ip.to_string());
+        let mut args = vec!["inspect"];
+        args.extend(ids.iter());
+        match cmd_timeout("docker", &args, Duration::from_secs(15)).await {
+            Ok(out) => {
+                let v: serde_json::Value = serde_json::from_str(&out)?;
+                let mut res = vec![];
+                for c in v.as_array().cloned().unwrap_or_default() {
+                    let labels = &c["Config"]["Labels"];
+                    let mut ports = BTreeMap::new();
+                    let mut host_ips: Vec<String> = vec![];
+                    if let Some(map) = c["NetworkSettings"]["Ports"].as_object() {
+                        for (k, binds) in map {
+                            let Some(cp) = k.strip_suffix("/tcp").and_then(|p| p.parse::<u16>().ok()) else { continue };
+                            let first = binds.as_array().and_then(|a| a.first());
+                            if let Some(hp) = first.and_then(|b| b["HostPort"].as_str()).and_then(|p| p.parse::<u16>().ok()) {
+                                ports.insert(cp, hp);
+                            }
+                            for b in binds.as_array().cloned().unwrap_or_default() {
+                                if let Some(ip) = b["HostIp"].as_str() {
+                                    if !host_ips.iter().any(|x| x == ip) {
+                                        host_ips.push(ip.to_string());
+                                    }
+                                }
+                            }
                         }
                     }
+                    let mut ip = c["NetworkSettings"]["IPAddress"].as_str().unwrap_or("").to_string();
+                    if ip.is_empty() {
+                        if let Some(nets) = c["NetworkSettings"]["Networks"].as_object() {
+                            if let Some(n) = nets.values().find_map(|n| n["IPAddress"].as_str().filter(|s| !s.is_empty())) {
+                                ip = n.to_string();
+                            }
+                        }
+                    }
+                    res.push(Ctr {
+                        id: c["Id"].as_str().unwrap_or("").to_string(),
+                        name: c["Name"].as_str().unwrap_or("").trim_start_matches('/').to_string(),
+                        instance: labels["latrix.instance"].as_str().unwrap_or("").to_string(),
+                        app: labels["latrix.app"].as_str().unwrap_or("").to_string(),
+                        status: c["State"]["Status"].as_str().unwrap_or("").to_string(),
+                        restarts: c["RestartCount"].as_u64().unwrap_or(0) as u32,
+                        ports,
+                        host_ips,
+                        ip,
+                        error: c["State"]["Error"].as_str().unwrap_or("").to_string(),
+                    });
                 }
+                return Ok(res);
+            }
+            Err(e) if attempt == 0 => {
+                debug!("docker inspect transient error (retrying): {e}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            Err(e) => {
+                // Never return Ok(vec![]) on inspect failure — that would make
+                // reconcile_once think every container vanished and force-recreate all of them.
+                return Err(e.context("docker inspect failed"));
             }
         }
-        let mut ip = c["NetworkSettings"]["IPAddress"].as_str().unwrap_or("").to_string();
-        if ip.is_empty() {
-            if let Some(nets) = c["NetworkSettings"]["Networks"].as_object() {
-                if let Some(n) = nets.values().find_map(|n| n["IPAddress"].as_str().filter(|s| !s.is_empty())) {
-                    ip = n.to_string();
-                }
-            }
-        }
-        res.push(Ctr {
-            id: c["Id"].as_str().unwrap_or("").to_string(),
-            name: c["Name"].as_str().unwrap_or("").trim_start_matches('/').to_string(),
-            instance: labels["latrix.instance"].as_str().unwrap_or("").to_string(),
-            app: labels["latrix.app"].as_str().unwrap_or("").to_string(),
-            status: c["State"]["Status"].as_str().unwrap_or("").to_string(),
-            restarts: c["RestartCount"].as_u64().unwrap_or(0) as u32,
-            ports,
-            host_ips,
-            ip,
-            error: c["State"]["Error"].as_str().unwrap_or("").to_string(),
-        });
     }
-    Ok(res)
+    unreachable!()
 }
 
 pub async fn reconcile_loop(agent: Arc<Agent>) {
     let mut rx = agent.changed.subscribe();
     let mut tick = tokio::time::interval(Duration::from_secs(3));
     if agent.dev {
-        let _ = cmd("docker", &["network", "create", "latrix"]).await;
+        let _ = cmd_timeout("docker", &["network", "create", "latrix"], Duration::from_secs(15)).await;
     }
     loop {
         tokio::select! {
@@ -167,6 +237,12 @@ pub async fn reconcile_loop(agent: Arc<Agent>) {
             Ok(()) => agent.rt.docker_failures.store(0, std::sync::atomic::Ordering::SeqCst),
             Err(e) => {
                 let n = agent.rt.docker_failures.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+                if n >= 3 {
+                    // Mark cached reports unhealthy so traffic stops routing here while Docker is wedged.
+                    for r in agent.rt.reports.lock().unwrap().values_mut() {
+                        r.healthy = false;
+                    }
+                }
                 if n == 1 || n.is_multiple_of(20) {
                     warn!("runtime reconcile: {e:#}");
                 }
@@ -201,8 +277,9 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
             tokio::spawn(async move {
                 info!("stopping {}", c.name);
                 let t = timeout.to_string();
-                let _ = cmd("docker", &["stop", "-t", &t, &c.id]).await;
-                let _ = cmd("docker", &["rm", "-f", &c.id]).await;
+                let stop_limit = Duration::from_secs(timeout.saturating_add(30));
+                let _ = cmd_timeout("docker", &["stop", "-t", &t, &c.id], stop_limit).await;
+                let _ = cmd_timeout("docker", &["rm", "-f", &c.id], Duration::from_secs(30)).await;
                 agent.rt.health.lock().unwrap().remove(&c.instance);
                 agent.rt.clear_busy(&c.instance);
                 agent.vols.kick();
@@ -213,19 +290,21 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
     // Start instances that should run here.
     let mine: Vec<Instance> = s.instances_on(me).filter(|i| !i.stopping).cloned().collect();
     let wanted = wanted_ips(agent);
-    // Move containers to a new address one at a time, and only while
-    // everything else here is healthy (so an app with 2+ instances never
-    // has all of them down at once).
-    let all_healthy = {
-        let health = agent.rt.health.lock().unwrap();
-        mine.iter().all(|i| health.get(&i.id).map(|h| h.healthy).unwrap_or(false))
-    } && agent.rt.busy.lock().unwrap().is_empty()
+    // Move containers to a new address one at a time, gated per-app so one
+    // broken app doesn't block healthy apps from rebinding to the mesh IP.
+    let rebind_ready = agent.rt.busy.lock().unwrap().is_empty()
         && agent.rt.last_rebind.lock().unwrap().map(|t| t.elapsed() > Duration::from_secs(15)).unwrap_or(true);
-    let mut rebinds = if all_healthy { 0 } else { 1 };
+    let mut rebinds = if rebind_ready { 0 } else { 1 };
     for inst in &mine {
         if agent.rt.is_busy(&inst.id) {
             continue;
         }
+        let app_healthy = {
+            let health = agent.rt.health.lock().unwrap();
+            mine.iter()
+                .filter(|x| x.app == inst.app)
+                .all(|x| health.get(&x.id).map(|h| h.healthy).unwrap_or(false))
+        };
         match by_inst.get(&inst.id) {
             None => {
                 // Back off after failures: 5s, 10s, 20s ... up to 2 minutes.
@@ -246,7 +325,7 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
                         Err(e) => {
                             warn!("could not start {} ({}): {e:#}", inst.id, inst.app);
                             let mut f = agent.rt.failures.lock().unwrap();
-                            let n = f.get(&inst.id).map(|x| x.2 + 1).unwrap_or(1);
+                            let n = f.get(&inst.id).map(|x| x.2.saturating_add(1)).unwrap_or(1);
                             f.insert(inst.id.clone(), (Instant::now(), format!("{e:#}"), n));
                         }
                     }
@@ -257,21 +336,29 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
                 if c.status == "running"
                     && !c.ports.is_empty()
                     && !wanted.iter().all(|ip| c.host_ips.contains(ip))
-                    && rebinds == 0 =>
+                    && rebinds == 0
+                    && app_healthy =>
             {
                 // Published on an old address (the mesh went down or came back):
                 // move it to the current one, one container per pass.
                 rebinds += 1;
                 *agent.rt.last_rebind.lock().unwrap() = Some(Instant::now());
+                let stop_t = s
+                    .apps
+                    .get(&inst.app)
+                    .and_then(|a| a.release(inst.release))
+                    .map(|r| r.config.deploy.stop_timeout_secs())
+                    .unwrap_or(10);
                 info!("{} is published on {} instead of {}; recreating it", c.name, c.host_ips.join(","), wanted.join(","));
-                agent.rt.set_busy(&c.instance, "starting");
+                agent.rt.set_busy(&c.instance, "stopping");
                 let agent = agent.clone();
                 let c = c.clone();
                 tokio::spawn(async move {
                     // Graceful stop first: in-flight requests finish, new ones
                     // go to the other instances.
-                    let _ = cmd("docker", &["stop", "-t", "10", &c.id]).await;
-                    let _ = cmd("docker", &["rm", "-f", &c.id]).await;
+                    let t = stop_t.to_string();
+                    let _ = cmd_timeout("docker", &["stop", "-t", &t, &c.id], Duration::from_secs(stop_t.saturating_add(30))).await;
+                    let _ = cmd_timeout("docker", &["rm", "-f", &c.id], Duration::from_secs(30)).await;
                     agent.rt.clear_busy(&c.instance);
                 });
             }
@@ -287,11 +374,12 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
                 // Running but its published ports are gone (e.g. the address it
                 // was bound to disappeared): recreate it on the current address.
                 warn!("{} lost its port bindings; recreating it", c.name);
-                agent.rt.set_busy(&c.instance, "starting");
+                agent.rt.set_busy(&c.instance, "stopping");
                 let agent = agent.clone();
                 let c = c.clone();
                 tokio::spawn(async move {
-                    let _ = cmd("docker", &["rm", "-f", &c.id]).await;
+                    let _ = cmd_timeout("docker", &["stop", "-t", "10", &c.id], Duration::from_secs(40)).await;
+                    let _ = cmd_timeout("docker", &["rm", "-f", &c.id], Duration::from_secs(30)).await;
                     agent.rt.clear_busy(&c.instance);
                 });
             }
@@ -301,8 +389,8 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
                 let c = c.clone();
                 agent.rt.set_busy(&c.instance, "starting");
                 tokio::spawn(async move {
-                    if cmd("docker", &["start", &c.id]).await.is_err() {
-                        let _ = cmd("docker", &["rm", "-f", &c.id]).await;
+                    if cmd_timeout("docker", &["start", &c.id], Duration::from_secs(30)).await.is_err() {
+                        let _ = cmd_timeout("docker", &["rm", "-f", &c.id], Duration::from_secs(30)).await;
                     }
                     agent.rt.clear_busy(&c.instance);
                 });
@@ -311,10 +399,14 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
         }
     }
 
-    // Health checks.
+    // Health checks (skip instances currently busy stopping/starting).
     let stats = agent.rt.stats.lock().unwrap().clone();
+    let busy_now = agent.rt.busy.lock().unwrap().clone();
     let mut checks = vec![];
     for inst in &mine {
+        if busy_now.contains_key(&inst.id) {
+            continue;
+        }
         let Some(c) = by_inst.get(&inst.id) else { continue };
         if c.status != "running" {
             continue;
@@ -325,8 +417,9 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
         let c = c.clone();
         let bind = agent.bind_ip();
         let id = inst.id.clone();
+        let http = agent.rt.health_http.clone();
         checks.push(async move {
-            let ok = check_health(&cfg, &c, &bind).await;
+            let ok = check_health(&http, &cfg, &c, &bind).await;
             (id, ok)
         });
     }
@@ -349,18 +442,27 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
                     h.healthy = true;
                     h.fails = 0;
                     h.unhealthy_since = 0;
+                    h.unhealthy_at = None;
                 }
                 Some(false) => {
-                    h.fails += 1;
+                    h.fails = h.fails.saturating_add(1);
                     // Need 3 consecutive failures to mark a healthy instance unhealthy.
                     if h.fails >= 3 || !h.healthy {
                         if h.healthy {
                             h.unhealthy_since = util::now();
+                            h.unhealthy_at = Some(Instant::now());
                         }
                         h.healthy = false;
                     }
                 }
-                None => h.healthy = false,
+                None => {
+                    // Track transition to unhealthy on crash/exit so restart_stuck can still replace it.
+                    if h.healthy && !busy.contains_key(&inst.id) {
+                        h.unhealthy_since = util::now();
+                        h.unhealthy_at = Some(Instant::now());
+                    }
+                    h.healthy = false;
+                }
             }
             let status = match (busy.get(&inst.id), c) {
                 (Some(p), _) => p.clone(),
@@ -373,7 +475,7 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
                 }
             };
             if let Some(c) = c {
-                if c.status == "running" {
+                if matches!(c.status.as_str(), "running" | "restarting") {
                     running_apps.insert(inst.app.clone(), c.name.clone());
                 }
             }
@@ -382,12 +484,17 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
                 .get(&inst.id)
                 .map(|f| f.1.clone())
                 .or_else(|| c.map(|c| c.error.clone()).filter(|e| !e.is_empty()));
+            let is_busy = busy.contains_key(&inst.id);
+            let unhealthy_for = h
+                .unhealthy_at
+                .map(|t| t.elapsed().as_secs())
+                .unwrap_or(0);
             reports.insert(
                 inst.id.clone(),
                 InstanceReport {
                     id: inst.id.clone(),
                     status,
-                    healthy: h.healthy && c.map(|c| c.status == "running").unwrap_or(false),
+                    healthy: !is_busy && h.healthy && c.map(|c| c.status == "running").unwrap_or(false),
                     ports: c.map(|c| c.ports.clone()).unwrap_or_default(),
                     restarts: c.map(|c| c.restarts).unwrap_or(0),
                     cpu_pct: cpu,
@@ -395,12 +502,18 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
                     error,
                     healthy_since: h.healthy_since,
                     unhealthy_since: h.unhealthy_since,
+                    unhealthy_for,
                 },
             );
         }
         // Containers being stopped / not (or no longer) assigned here are still
-        // reported so the leader knows when they are really gone.
+        // reported so the leader knows when they are really gone — AND kept in
+        // `running_apps` while still running/restarting so `volumes::sync_once`
+        // NEVER runs a final "idle" sync while a DB container is still flushing!
         for c in &ctrs {
+            if matches!(c.status.as_str(), "running" | "restarting") && !c.app.is_empty() {
+                running_apps.entry(c.app.clone()).or_insert_with(|| c.name.clone());
+            }
             if reports.contains_key(&c.instance) {
                 continue;
             }
@@ -414,6 +527,16 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
                     ..Default::default()
                 },
             );
+        }
+        // Also report in-flight busy starts (e.g. pulling) even if the instance was
+        // just marked stopping, so cleanup_stopping doesn't race with start_instance.
+        for (id, phase) in &busy {
+            reports.entry(id.clone()).or_insert_with(|| InstanceReport {
+                id: id.clone(),
+                status: phase.clone(),
+                healthy: false,
+                ..Default::default()
+            });
         }
         let mine_ids: HashSet<&String> = mine.iter().map(|i| &i.id).collect();
         health.retain(|k, _| mine_ids.contains(k));
@@ -431,10 +554,14 @@ async fn tcp_ok(addr: &str) -> bool {
     )
 }
 
-async fn check_health(cfg: &AppConfig, c: &Ctr, bind: &str) -> bool {
-    // Prefer the container IP: connecting through the docker port proxy always
-    // "succeeds", even when nothing listens inside the container.
+async fn check_health(http: &reqwest::Client, cfg: &AppConfig, c: &Ctr, bind: &str) -> bool {
+    // Prefer the container IP on Linux (connecting through the docker port proxy
+    // always "succeeds" even when nothing listens), while also verifying the
+    // host port binding exists so lost port bindings aren't hidden.
     let target = |port: u16| -> Option<String> {
+        if !c.ports.contains_key(&port) {
+            return None;
+        }
         if !c.ip.is_empty() && cfg!(target_os = "linux") {
             Some(format!("{}:{}", c.ip, port))
         } else {
@@ -444,9 +571,14 @@ async fn check_health(cfg: &AppConfig, c: &Ctr, bind: &str) -> bool {
     if let Some(h) = &cfg.http {
         let Some(addr) = target(h.port) else { return false };
         if let Some(path) = &h.health {
+            if !path.starts_with('/')
+                || path.starts_with("//")
+                || path.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+            {
+                return false;
+            }
             let url = format!("http://{addr}{path}");
-            let client = reqwest::Client::new();
-            return match client.get(&url).timeout(Duration::from_secs(3)).send().await {
+            return match http.get(&url).send().await {
                 Ok(r) => r.status().as_u16() < 400,
                 Err(_) => false,
             };
@@ -474,7 +606,9 @@ fn split_registry(image: &str) -> Option<(&str, &str)> {
 }
 
 async fn image_exists(image: &str) -> bool {
-    cmd("docker", &["image", "inspect", "--format", "{{.Id}}", image]).await.is_ok()
+    cmd_timeout("docker", &["image", "inspect", "--format", "{{.Id}}", "--", image], Duration::from_secs(15))
+        .await
+        .is_ok()
 }
 
 fn summarize_pull_error(err: &str) -> String {
@@ -491,25 +625,43 @@ fn summarize_pull_error(err: &str) -> String {
 /// Make sure the release's image is present, pulling it from whichever
 /// machine's registry has it.
 pub async fn ensure_image(agent: &Arc<Agent>, rel: &Release) -> Result<()> {
+    util::validate_image_ref(&rel.image)?;
     if image_exists(&rel.image).await {
         return Ok(());
     }
     if rel.sources.is_empty() {
-        cmd("docker", &["pull", &rel.image])
+        cmd_timeout("docker", &["pull", &rel.image], Duration::from_secs(300))
             .await
             .with_context(|| format!("pulling {}", rel.image))?;
         return Ok(());
     }
     let Some((_, repo)) = split_registry(&rel.image) else {
-        cmd("docker", &["pull", &rel.image]).await?;
+        cmd_timeout("docker", &["pull", &rel.image], Duration::from_secs(300)).await?;
         return Ok(());
     };
     let s = agent.snapshot();
-    let mut ips: Vec<String> = rel.sources.iter().filter_map(|m| agent.ip_of(*m)).collect();
     let alive = agent.alive_set();
+    // Try alive source machines first, then other alive machines, then offline sources last.
+    let mut ips: Vec<String> = vec![];
+    for m in &rel.sources {
+        if alive.contains(m) {
+            if let Some(ip) = agent.ip_of(*m) {
+                if !ips.contains(&ip) {
+                    ips.push(ip);
+                }
+            }
+        }
+    }
     for m in s.machines.values() {
         if alive.contains(&m.id) && !ips.contains(&m.overlay_ip) {
             ips.push(m.overlay_ip.clone());
+        }
+    }
+    for m in &rel.sources {
+        if let Some(ip) = agent.ip_of(*m) {
+            if !ips.contains(&ip) {
+                ips.push(ip);
+            }
         }
     }
     if agent.dev {
@@ -519,17 +671,20 @@ pub async fn ensure_image(agent: &Arc<Agent>, rel: &Release) -> Result<()> {
     for ip in ips {
         let pull_host = if ip == agent.me.overlay_ip { "127.0.0.1" } else { ip.as_str() };
         let r = format!("{pull_host}:{REGISTRY_PORT}/{repo}");
-        match cmd("docker", &["pull", "-q", &r]).await {
+        match cmd_timeout("docker", &["pull", "-q", &r], Duration::from_secs(180)).await {
             Ok(_) => {
                 if r != rel.image {
-                    cmd("docker", &["tag", &r, &rel.image]).await?;
+                    cmd_timeout("docker", &["tag", &r, &rel.image], Duration::from_secs(15)).await?;
                 }
-                // Mirror into our own registry so this machine can serve it too.
+                // Mirror into our own registry under the shared GC read lock so
+                // registry GC never deletes in-flight layers during the push.
                 if pull_host != "127.0.0.1" {
                     let own = format!("127.0.0.1:{REGISTRY_PORT}/{repo}");
+                    let agent_push = agent.clone();
                     tokio::spawn(async move {
-                        if cmd("docker", &["tag", &r, &own]).await.is_ok() {
-                            let _ = cmd("docker", &["push", "-q", &own]).await;
+                        let _gc_read = agent_push.rt.registry_gc_lock.read().await;
+                        if cmd_timeout("docker", &["tag", &r, &own], Duration::from_secs(15)).await.is_ok() {
+                            let _ = cmd_timeout("docker", &["push", "-q", &own], Duration::from_secs(180)).await;
                         }
                     });
                 }
@@ -546,7 +701,13 @@ pub async fn ensure_image(agent: &Arc<Agent>, rel: &Release) -> Result<()> {
 }
 
 async fn exposed_ports(image: &str) -> Vec<u16> {
-    let Ok(out) = cmd("docker", &["image", "inspect", "--format", "{{json .Config.ExposedPorts}}", image]).await else {
+    let Ok(out) = cmd_timeout(
+        "docker",
+        &["image", "inspect", "--format", "{{json .Config.ExposedPorts}}", "--", image],
+        Duration::from_secs(15),
+    )
+    .await
+    else {
         return vec![];
     };
     let v: serde_json::Value = serde_json::from_str(out.trim()).unwrap_or_default();
@@ -563,12 +724,34 @@ async fn exposed_ports(image: &str) -> Vec<u16> {
 /// files at that path and the same owner/permissions, so images that run as
 /// a non-root user (postgres, many others) can write to it. Best effort.
 async fn seed_volume(image: &str, dir: &std::path::Path, path: &str) {
-    let script = r#"if [ -d "$P" ]; then cp -a "$P"/. /__latrix_vol/ 2>/dev/null; chown "$(stat -c %u:%g "$P")" /__latrix_vol 2>/dev/null; chmod "$(stat -c %a "$P")" /__latrix_vol 2>/dev/null; fi; true"#;
+    if path == "/" || path == "/__latrix_vol" || path.contains(':') || path.is_empty() {
+        return;
+    }
+    // Copy regular files/dirs/symlinks while avoiding special device files and stripping setuid/setgid.
+    let script = r#"if [ -d "$P" ]; then cp -rP --preserve=mode,ownership,timestamps "$P"/. /__latrix_vol/ 2>/dev/null || cp -a "$P"/. /__latrix_vol/ 2>/dev/null; chmod -R a-s /__latrix_vol 2>/dev/null; chown "$(stat -c %u:%g "$P")" /__latrix_vol 2>/dev/null; chmod "$(stat -c %a "$P")" /__latrix_vol 2>/dev/null; fi; true"#;
     let mount = format!("{}:/__latrix_vol", dir.display());
     let env = format!("P={path}");
-    if let Err(e) = cmd(
+    if let Err(e) = cmd_timeout(
         "docker",
-        &["run", "--rm", "--user", "0", "--entrypoint", "sh", "-e", &env, "-v", &mount, image, "-c", script],
+        &[
+            "run",
+            "--rm",
+            "--network=none",
+            "--memory=256m",
+            "--pids-limit=64",
+            "--user",
+            "0",
+            "--entrypoint",
+            "sh",
+            "-e",
+            &env,
+            "-v",
+            &mount,
+            image,
+            "-c",
+            script,
+        ],
+        Duration::from_secs(60),
     )
     .await
     {
@@ -587,8 +770,12 @@ fn wanted_ips(agent: &Agent) -> Vec<String> {
     ips
 }
 
-fn free_port() -> Result<u16> {
-    Ok(std::net::TcpListener::bind(("0.0.0.0", 0))?.local_addr()?.port())
+/// RAII cleanup for temporary `0600` docker `--env-file`.
+struct EnvFileGuard(std::path::PathBuf);
+impl Drop for EnvFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
 }
 
 async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
@@ -596,7 +783,21 @@ async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
     let app = s.apps.get(&inst.app).context("app no longer exists")?;
     let rel = app.release(inst.release).context("release no longer exists")?.clone();
     let cfg = &rel.config;
+    util::validate_image_ref(&rel.image)?;
     ensure_image(agent, &rel).await?;
+
+    // Re-check cluster state after potentially long image pull so a cancelled or
+    // moved stateful instance never launches a split-brain second writer!
+    let still_active = |snap: &ClusterState| {
+        snap.instances
+            .get(&inst.id)
+            .map(|i| !i.stopping && i.machine == agent.me.machine_id)
+            .unwrap_or(false)
+    };
+    if !still_active(&agent.snapshot()) {
+        debug!("instance {} cancelled while pulling; aborting start", inst.id);
+        return Ok(());
+    }
     agent.rt.set_busy(&inst.id, "starting");
 
     let name = container_name(&inst.app, &inst.id);
@@ -621,7 +822,7 @@ async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
         args.push("--memory".into());
         args.push(format!("{mem}m"));
     }
-    if cfg.scale.cpu > 0.0 {
+    if cfg.scale.cpu.is_finite() && cfg.scale.cpu > 0.0 {
         args.push("--cpus".into());
         args.push(format!("{}", cfg.scale.cpu));
     }
@@ -652,7 +853,37 @@ async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
         "LATRIX_MACHINE".into(),
         s.machines.get(&inst.machine).map(|m| m.name.clone()).unwrap_or_default(),
     );
+    // Pass single-line env vars/secrets via a temporary 0600 `--env-file` so
+    // secrets never appear in `/proc/<pid>/cmdline`. (Docker `--env-file` splits
+    // lines on `\n`, so multiline values must still use `-e` — with `cmd_redacted`
+    // ensuring argv is never logged or returned in errors.)
+    let mut env_file_lines = String::new();
+    let mut multiline_env: Vec<(String, String)> = vec![];
     for (k, v) in env {
+        if k.contains(['=', '\0', '\r', '\n']) || v.contains('\0') {
+            continue;
+        }
+        if v.contains(['\n', '\r']) {
+            multiline_env.push((k, v));
+        } else {
+            env_file_lines.push_str(&k);
+            env_file_lines.push('=');
+            env_file_lines.push_str(&v);
+            env_file_lines.push('\n');
+        }
+    }
+    let _env_guard = if !env_file_lines.is_empty() {
+        let env_path = agent
+            .data
+            .join(format!(".env-{}-{}", inst.id, util::random_id(6)));
+        util::write_atomic_private(&env_path, env_file_lines.as_bytes())?;
+        args.push("--env-file".into());
+        args.push(env_path.display().to_string());
+        Some(EnvFileGuard(env_path))
+    } else {
+        None
+    };
+    for (k, v) in multiline_env {
         args.push("-e".into());
         args.push(format!("{k}={v}"));
     }
@@ -666,7 +897,7 @@ async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
     // mesh does) and on the mesh IP (other machines), when the mesh is up.
     let ips = wanted_ips(agent);
     for p in ports {
-        let hp = free_port()?;
+        let hp = agent.rt.alloc_host_port()?;
         for ip in &ips {
             args.push("-p".into());
             args.push(format!("{ip}:{hp}:{p}"));
@@ -679,6 +910,9 @@ async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
         args.push(format!("0.0.0.0:{public}:{p}/udp"));
     }
     for v in &cfg.volumes {
+        if v.path.contains(':') || v.path == "/" || v.path == "/__latrix_vol" {
+            bail!("invalid volume mount path '{}'", v.path);
+        }
         let dir = agent.data.join("volumes").join(Volume::dir_name(&inst.app, &v.name));
         let fresh = std::fs::read_dir(&dir).map(|mut d| d.next().is_none()).unwrap_or(true);
         std::fs::create_dir_all(&dir)?;
@@ -715,10 +949,14 @@ async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
     if let Some(c) = &cfg.command {
         args.extend(c.to_args());
     }
+    if !still_active(&agent.snapshot()) {
+        debug!("instance {} cancelled before docker run; aborting start", inst.id);
+        return Ok(());
+    }
     let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
     // A leftover container with the same name would make `run` fail.
-    let _ = cmd("docker", &["rm", "-f", &name]).await;
-    cmd("docker", &refs).await?;
+    let _ = cmd_timeout("docker", &["rm", "-f", &name], Duration::from_secs(30)).await;
+    cmd_redacted("docker", &refs, Duration::from_secs(60)).await?;
     info!("started {name} ({})", rel.image);
     Ok(())
 }
@@ -728,9 +966,10 @@ pub async fn stats_loop(agent: Arc<Agent>) {
     let mut tick = tokio::time::interval(Duration::from_secs(15));
     loop {
         tick.tick().await;
-        let Ok(out) = cmd(
+        let Ok(out) = cmd_timeout(
             "docker",
             &["stats", "--no-stream", "--format", "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}"],
+            Duration::from_secs(15),
         )
         .await
         else {
@@ -742,7 +981,13 @@ pub async fn stats_loop(agent: Arc<Agent>) {
             if parts.len() < 3 || !parts[0].starts_with("latrix-") {
                 continue;
             }
-            let cpu = parts[1].trim_end_matches('%').trim().parse::<f64>().unwrap_or(0.0);
+            let cpu = parts[1]
+                .trim_end_matches('%')
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or(0.0);
             let used = parts[2].split('/').next().unwrap_or("").trim();
             map.insert(parts[0].to_string(), (cpu, parse_docker_size_mb(used)));
         }
@@ -753,15 +998,21 @@ pub async fn stats_loop(agent: Arc<Agent>) {
 pub fn parse_docker_size_mb(s: &str) -> f64 {
     let s = s.trim();
     let idx = s.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(s.len());
-    let n: f64 = s[..idx].trim().parse().unwrap_or(0.0);
-    match s[idx..].trim().to_ascii_lowercase().as_str() {
+    let n: f64 = s[..idx]
+        .trim()
+        .parse::<f64>()
+        .ok()
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(0.0);
+    let mb = match s[idx..].trim().to_ascii_lowercase().as_str() {
         "b" => n / 1048576.0,
         "kb" | "kib" => n / 1024.0,
         "mb" | "mib" => n,
         "gb" | "gib" => n * 1024.0,
         "tb" | "tib" => n * 1048576.0,
         _ => n,
-    }
+    };
+    if mb.is_finite() && mb >= 0.0 { mb } else { 0.0 }
 }
 
 /// Docker must trust the mesh registries (10.77.0.0/16) and this machine's
@@ -796,8 +1047,12 @@ pub async fn ensure_docker_config(agent: &Agent) {
     if obj.get("live-restore").is_none() {
         obj.insert("live-restore".into(), serde_json::json!(true));
     }
-    let _ = std::fs::copy(path, path.with_extension("json.latrix-backup"));
-    if let Err(e) = std::fs::write(path, serde_json::to_vec_pretty(&v).unwrap_or_default()) {
+    let backup = path.with_extension("json.latrix-backup");
+    if !backup.exists() {
+        let _ = std::fs::copy(path, &backup);
+    }
+    let bytes = serde_json::to_vec_pretty(&v).unwrap_or_default();
+    if let Err(e) = util::write_atomic(path, &bytes) {
         warn!("cannot update {}: {e}", path.display());
         return;
     }
@@ -842,6 +1097,7 @@ pub async fn registry_loop(agent: Arc<Agent>) {
         ensure_docker_config(&agent).await;
     }
     let mut tick = tokio::time::interval(Duration::from_secs(30));
+    let mut probe_fails: u32 = 0;
     loop {
         tick.tick().await;
         // Always on 127.0.0.1 (builds push there; works even if the mesh is
@@ -854,9 +1110,10 @@ pub async fn registry_loop(agent: Arc<Agent>) {
         // Check the *live* bindings and mounted config: when one address is
         // missing after a Docker restart, Docker silently drops all of a
         // container's ports; older containers also lack our no-cache config.
-        let live = cmd(
+        let live = cmd_timeout(
             "docker",
             &["inspect", "-f", "{{.State.Running}} {{json .NetworkSettings.Ports}} {{json .Mounts}}", "latrix-registry"],
+            Duration::from_secs(15),
         )
         .await
         .unwrap_or_default();
@@ -868,16 +1125,27 @@ pub async fn registry_loop(agent: Arc<Agent>) {
             .collect();
         let stale_mesh = !ips.iter().any(|ip| ip != "127.0.0.1") && live.contains("\"HostIp\":\"10.77.");
         let has_cfg = live.contains("/etc/docker/registry/config.yml");
-        let answers = reqwest::Client::new()
+        let answers = agent
+            .http
             .get(format!("http://127.0.0.1:{REGISTRY_PORT}/v2/"))
             .timeout(Duration::from_secs(3))
             .send()
             .await
-            .is_ok();
-        if up && bound.len() == ips.len() && !stale_mesh && has_cfg && answers {
-            continue;
+            .map(|r| r.status().is_success())
+            .unwrap_or(false);
+        if up && bound.len() == ips.len() && !stale_mesh && has_cfg {
+            if answers {
+                probe_fails = 0;
+                continue;
+            }
+            // Don't kill a busy registry on a single transient probe timeout.
+            probe_fails += 1;
+            if probe_fails < 3 {
+                continue;
+            }
         }
-        let _ = cmd("docker", &["rm", "-f", "latrix-registry"]).await;
+        probe_fails = 0;
+        let _ = cmd_timeout("docker", &["rm", "-f", "latrix-registry"], Duration::from_secs(30)).await;
         let dir = agent.data.join("registry");
         let _ = std::fs::create_dir_all(&dir);
         let cfg_path = agent.data.join("registry-config.yml");
@@ -915,7 +1183,9 @@ pub async fn registry_loop(agent: Arc<Agent>) {
 /// and keep the BuildKit cache within a disk-aware budget.
 pub async fn gc_loop(agent: Arc<Agent>) {
     tokio::time::sleep(Duration::from_secs(120)).await;
-    let mut last_full = Instant::now() - Duration::from_secs(7200);
+    // Use Option<Instant> instead of `Instant::now() - Duration::from_secs(7200)`,
+    // which panics on any freshly booted server with uptime < 2 hours!
+    let mut last_full: Option<Instant> = None;
     let mut last_emergency: Option<Instant> = None;
     let mut last_disk_warn: Option<Instant> = None;
     let mut known: HashSet<String> = agent.snapshot().apps.keys().cloned().collect();
@@ -924,8 +1194,8 @@ pub async fn gc_loop(agent: Arc<Agent>) {
         let apps: HashSet<String> = agent.snapshot().apps.keys().cloned().collect();
         let removed = known.iter().any(|a| !apps.contains(a));
         known = apps;
-        if removed || last_full.elapsed() > Duration::from_secs(3600) {
-            last_full = Instant::now();
+        if removed || last_full.map(|t| t.elapsed() > Duration::from_secs(3600)).unwrap_or(true) {
+            last_full = Some(Instant::now());
             if let Err(e) = gc_once(&agent).await {
                 warn!("cache cleanup: {e:#}");
             }
@@ -1034,7 +1304,16 @@ async fn gc_once(agent: &Arc<Agent>) -> Result<()> {
             }
         }
     }
-    let out = cmd("docker", &["images", "--format", "{{.Repository}}:{{.Tag}}"]).await?;
+    // Tags built within the last 15 minutes are protected even if the CLI
+    // hasn't committed `/deploy` to ClusterState yet (tag format `<unix>-<rand>`).
+    let now_ts = util::now();
+    let is_recent_tag = |tag: &str| -> bool {
+        tag.split_once('-')
+            .and_then(|(ts, _)| ts.parse::<u64>().ok())
+            .map(|ts| now_ts.saturating_sub(ts) < 900)
+            .unwrap_or(false)
+    };
+    let out = cmd_timeout("docker", &["images", "--format", "{{.Repository}}:{{.Tag}}"], Duration::from_secs(30)).await?;
     let marker = format!(":{REGISTRY_PORT}/");
     for img in out.lines() {
         if !img.contains(&marker) {
@@ -1042,21 +1321,31 @@ async fn gc_once(agent: &Arc<Agent>) -> Result<()> {
         }
         let Some((_, repo)) = split_registry(img) else { continue };
         let Some((name, tag)) = repo.rsplit_once(':') else { continue };
-        let wanted = keep.contains(img) || keep_tags.get(name).map(|t| t.contains(tag)).unwrap_or(false);
+        let wanted = keep.contains(img)
+            || keep_tags.get(name).map(|t| t.contains(tag)).unwrap_or(false)
+            || is_recent_tag(tag);
         if !wanted {
             debug!("removing old image {img}");
-            let _ = cmd("docker", &["rmi", img]).await;
+            let _ = cmd_timeout("docker", &["rmi", img], Duration::from_secs(30)).await;
         }
     }
-    let _ = cmd("docker", &["image", "prune", "-f"]).await;
+    let _ = cmd_timeout("docker", &["image", "prune", "-f"], Duration::from_secs(120)).await;
     prune_build_cache(agent).await;
 
     // Registry: delete old manifests, then garbage-collect blobs (only when idle).
+    // Acquire the write lock (try_write so we don't block builds/pushes) to prevent
+    // deleting untagged blobs while a build or background mirror push is in flight.
     if agent.rt.builds_running.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        let Ok(_gc_write) = agent.rt.registry_gc_lock.try_write() else {
+            return Ok(());
+        };
+        if agent.rt.builds_running.load(std::sync::atomic::Ordering::SeqCst) != 0 {
+            return Ok(());
+        }
         let base = format!("http://127.0.0.1:{REGISTRY_PORT}");
         let client = &agent.http;
         let catalog: serde_json::Value = client
-            .get(format!("{base}/v2/_catalog"))
+            .get(format!("{base}/v2/_catalog?n=1000"))
             .timeout(Duration::from_secs(5))
             .send()
             .await?
@@ -1065,13 +1354,17 @@ async fn gc_once(agent: &Arc<Agent>) -> Result<()> {
         let mut deleted = 0;
         for repo in catalog["repositories"].as_array().cloned().unwrap_or_default() {
             let Some(repo) = repo.as_str() else { continue };
-            let tags_json: serde_json::Value = client
+            let Ok(resp) = client
                 .get(format!("{base}/v2/{repo}/tags/list"))
                 .timeout(Duration::from_secs(5))
                 .send()
-                .await?
-                .json()
-                .await?;
+                .await
+            else {
+                continue;
+            };
+            let Ok(tags_json) = resp.json::<serde_json::Value>().await else {
+                continue;
+            };
             let tags: Vec<String> = tags_json["tags"]
                 .as_array()
                 .cloned()
@@ -1081,12 +1374,14 @@ async fn gc_once(agent: &Arc<Agent>) -> Result<()> {
                 .collect();
             let kept = keep_tags.get(repo);
 
-            // Resolve kept tags first: registry DELETE operates on manifest
-            // digests, so deleting an old tag that shares a digest with a kept
-            // release (e.g. cached rebuilds) would delete the kept release too.
+            // Resolve kept (and recently built) tags first: registry DELETE operates
+            // on manifest digests, so deleting an old tag that shares a digest with
+            // a kept release would delete the kept release too.
             let mut keep_digests: HashSet<String> = HashSet::new();
             let mut keep_ok = true;
-            for tag in tags.iter().filter(|t| kept.map(|k| k.contains(t.as_str())).unwrap_or(false)) {
+            for tag in tags.iter().filter(|t| {
+                kept.map(|k| k.contains(t.as_str())).unwrap_or(false) || is_recent_tag(t)
+            }) {
                 match manifest_digest(client, &base, repo, tag).await {
                     Ok(Some(d)) => {
                         keep_digests.insert(d);
@@ -1102,7 +1397,9 @@ async fn gc_once(agent: &Arc<Agent>) -> Result<()> {
             }
 
             let mut deleted_digests: HashSet<String> = HashSet::new();
-            for tag in tags.iter().filter(|t| !kept.map(|k| k.contains(t.as_str())).unwrap_or(false)) {
+            for tag in tags.iter().filter(|t| {
+                !kept.map(|k| k.contains(t.as_str())).unwrap_or(false) && !is_recent_tag(t)
+            }) {
                 let Ok(Some(d)) = manifest_digest(client, &base, repo, tag).await else { continue };
                 if keep_digests.contains(&d) || !deleted_digests.insert(d.clone()) {
                     continue;
@@ -1119,10 +1416,11 @@ async fn gc_once(agent: &Arc<Agent>) -> Result<()> {
                 }
             }
         }
-        if deleted > 0 {
-            if let Err(e) = cmd(
+        if deleted > 0 && agent.rt.builds_running.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            if let Err(e) = cmd_timeout(
                 "docker",
                 &["exec", "latrix-registry", "registry", "garbage-collect", "--delete-untagged", "/etc/docker/registry/config.yml"],
+                Duration::from_secs(300),
             )
             .await
             {
@@ -1146,8 +1444,11 @@ pub struct LogsQuery {
 
 /// Stream a container's logs (stdout + stderr, timestamped).
 pub async fn handle_logs(State(_agent): State<Arc<Agent>>, Query(q): Query<LogsQuery>) -> Response {
+    if !util::safe_id(&q.instance) {
+        return (axum::http::StatusCode::BAD_REQUEST, "invalid instance id\n").into_response();
+    }
     let filter = format!("label=latrix.instance={}", q.instance);
-    let id = match cmd("docker", &["ps", "-aq", "--filter", &filter]).await {
+    let id = match cmd_timeout("docker", &["ps", "-aq", "--filter", &filter], Duration::from_secs(15)).await {
         Ok(o) if !o.trim().is_empty() => o.split_whitespace().next().unwrap().to_string(),
         _ => {
             return (axum::http::StatusCode::NOT_FOUND, format!("no container for instance {}\n", q.instance))
@@ -1170,22 +1471,34 @@ pub async fn handle_logs(State(_agent): State<Arc<Agent>>, Query(q): Query<LogsQ
         Ok(c) => c,
         Err(e) => return (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
     };
-    let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
+    let (tx, rx) = tokio::sync::mpsc::channel::<bytes::Bytes>(256);
     let out = child.stdout.take().unwrap();
     let err = child.stderr.take().unwrap();
     let tx2 = tx.clone();
     tokio::spawn(async move {
-        let mut lines = BufReader::new(out).lines();
-        while let Ok(Some(l)) = lines.next_line().await {
-            if tx.send(l + "\n").await.is_err() {
+        let mut reader = BufReader::new(out);
+        let mut buf = Vec::new();
+        while let Ok(n) = reader.read_until(b'\n', &mut buf).await {
+            if n == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            buf.clear();
+            if tx.send(bytes::Bytes::from(text)).await.is_err() {
                 break;
             }
         }
     });
     tokio::spawn(async move {
-        let mut lines = BufReader::new(err).lines();
-        while let Ok(Some(l)) = lines.next_line().await {
-            if tx2.send(l + "\n").await.is_err() {
+        let mut reader = BufReader::new(err);
+        let mut buf = Vec::new();
+        while let Ok(n) = reader.read_until(b'\n', &mut buf).await {
+            if n == 0 {
+                break;
+            }
+            let text = String::from_utf8_lossy(&buf).into_owned();
+            buf.clear();
+            if tx2.send(bytes::Bytes::from(text)).await.is_err() {
                 break;
             }
         }
@@ -1193,7 +1506,7 @@ pub async fn handle_logs(State(_agent): State<Arc<Agent>>, Query(q): Query<LogsQ
     let stream = futures::stream::unfold((rx, child), |(mut rx, child)| async move {
         rx.recv()
             .await
-            .map(|l| (Ok::<_, std::io::Error>(bytes::Bytes::from(l)), (rx, child)))
+            .map(|l| (Ok::<_, std::io::Error>(l), (rx, child)))
     });
     Body::from_stream(stream).into_response()
 }

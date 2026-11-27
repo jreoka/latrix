@@ -25,10 +25,12 @@ fn sanitize(name: &str) -> String {
             out.push(c);
         }
     }
-    if out.is_empty() {
+    let truncated: String = out.chars().take(40).collect();
+    let clean = truncated.trim_end_matches('-');
+    if clean.is_empty() {
         "app".into()
     } else {
-        out.chars().take(40).collect()
+        clean.to_string()
     }
 }
 
@@ -204,19 +206,33 @@ pub fn launch(name: Option<String>, image: Option<String>, port: Option<u16>, fo
         }
     }
     let text = config::template(&name, detected_port.or(if image.is_some() { None } else { Some(8080) }), image.as_deref());
-    std::fs::write(path, &text)?;
     let cfg: AppConfig = toml::from_str(&text)?;
     cfg.validate()?;
+    std::fs::write(path, &text)?;
     println!("Wrote latrix.toml for app '{name}'. Edit it if you like, then run `latrix deploy`.");
     Ok(())
+}
+
+fn create_private_temp(path: &Path) -> Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path).with_context(|| format!("creating {}", path.display()))
 }
 
 /// Gzipped tarball of the build context. Honors .dockerignore, or .gitignore
 /// when there is no .dockerignore. `.git` is never uploaded.
 pub fn pack_context(dir: &Path) -> Result<(PathBuf, u64, usize)> {
     let has_dockerignore = dir.join(".dockerignore").exists();
+    let canon_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
     let out = std::env::temp_dir().join(format!("latrix-ctx-{}.tar.gz", crate::util::random_id(8)));
-    let file = std::fs::File::create(&out)?;
+    let guard = TempFile(out.clone());
+    let file = create_private_temp(&out)?;
+    let out_canon = std::fs::canonicalize(&out).unwrap_or_else(|_| out.clone());
     let gz = flate2::write::GzEncoder::new(file, flate2::Compression::fast());
     let mut tar = tar::Builder::new(gz);
     tar.follow_symlinks(false);
@@ -232,24 +248,62 @@ pub fn pack_context(dir: &Path) -> Result<(PathBuf, u64, usize)> {
         .add_custom_ignore_filename(".dockerignore")
         .filter_entry(|e| e.file_name() != ".git");
     let mut files = 0;
+    let mut warned_dotenv = false;
     for entry in walker.build() {
         let entry = entry?;
         let path = entry.path();
+        if path == out || path == out_canon {
+            continue;
+        }
         let rel = path.strip_prefix(dir).unwrap_or(path);
         if rel.as_os_str().is_empty() {
             continue;
         }
         let ft = entry.file_type();
-        if ft.map(|t| t.is_file() || t.is_symlink()).unwrap_or(false) {
+        if ft.map(|t| t.is_symlink()).unwrap_or(false) {
+            // Reject symlinks that escape the build context directory.
+            if let Ok(target) = std::fs::read_link(path) {
+                let resolved = if target.is_absolute() {
+                    target
+                } else {
+                    path.parent().unwrap_or(dir).join(target)
+                };
+                if let Ok(canon_target) = std::fs::canonicalize(&resolved) {
+                    if !canon_target.starts_with(&canon_dir) {
+                        bail!(
+                            "symlink '{}' in build context points outside the build directory ({})",
+                            rel.display(),
+                            canon_target.display()
+                        );
+                    }
+                }
+            }
             tar.append_path_with_name(path, rel)
                 .with_context(|| format!("adding {}", path.display()))?;
             files += 1;
+        } else if ft.map(|t| t.is_file()).unwrap_or(false) {
+            if !warned_dotenv {
+                if let Some(fname) = path.file_name().and_then(|s| s.to_str()) {
+                    if (fname == ".env" || fname.starts_with(".env."))
+                        && !matches!(fname, ".env.example" | ".env.sample" | ".env.template")
+                    {
+                        println!("    ! warning: including '{fname}' in build context (add it to .dockerignore and use `latrix secrets set` for secrets)");
+                        warned_dotenv = true;
+                    }
+                }
+            }
+            tar.append_path_with_name(path, rel)
+                .with_context(|| format!("adding {}", path.display()))?;
+            files += 1;
+        } else if ft.map(|t| t.is_dir()).unwrap_or(false) {
+            let _ = tar.append_dir(rel, path);
         }
     }
     let gz = tar.into_inner()?;
     let mut f = gz.finish()?;
     f.flush()?;
     let size = std::fs::metadata(&out)?.len();
+    std::mem::forget(guard);
     Ok((out, size, files))
 }
 
@@ -261,12 +315,12 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
     let req = BuildRequest {
         app: app.app.clone(),
         tag: plan.tag.clone(),
-        dockerfile: app.build.dockerfile.clone(),
+        dockerfile: app.build.dockerfile.as_ref().map(|s| s.replace('\\', "/")),
         target: app.build.target.clone(),
         args: app.build.args.clone(),
         git: app.build.git.clone(),
         branch: app.build.branch.clone(),
-        context: app.build.context.clone(),
+        context: app.build.context.as_ref().map(|s| s.replace('\\', "/")),
         cache_from: plan.cache_from.clone(),
         tty_cols: tty.map(|(w, _)| w),
         tty_rows: tty.map(|(_, h)| h),
@@ -282,7 +336,8 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
         if !ctx.is_dir() {
             bail!("build context {} is not a directory", ctx.display());
         }
-        let (archive, size, files) = pack_context(&ctx)?;
+        let ctx_clone = ctx.clone();
+        let (archive, size, files) = tokio::task::spawn_blocking(move || pack_context(&ctx_clone)).await??;
         println!(
             "{} Uploading build context ({files} files, {:.1} MB) to {}",
             arrow(),
@@ -293,7 +348,12 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
         _cleanup = Some(TempFile(archive));
         rb = rb.body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(f)));
     } else {
-        println!("{} Building {} from git on {}", arrow(), app.build.git.as_deref().unwrap(), plan.machine_name);
+        println!(
+            "{} Building {} from git on {}",
+            arrow(),
+            crate::util::redact_url_creds(app.build.git.as_deref().unwrap()),
+            plan.machine_name
+        );
     }
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
@@ -384,13 +444,22 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
     if !raw_carry.is_empty() {
         buf.push_str(&String::from_utf8_lossy(&raw_carry));
     }
-    if raw && !buf.is_empty() {
-        if let Some(i) = buf.find(BUILD_RESULT_PREFIX) {
-            write_raw_frame(&mut out, &buf.as_bytes()[..i])?;
-            let rest = &buf[i + BUILD_RESULT_PREFIX.len()..];
-            result = serde_json::from_str(rest.trim()).ok();
+    if !buf.is_empty() {
+        if raw {
+            if let Some(i) = buf.find(BUILD_RESULT_PREFIX) {
+                write_raw_frame(&mut out, &buf.as_bytes()[..i])?;
+                let rest = &buf[i + BUILD_RESULT_PREFIX.len()..];
+                result = serde_json::from_str(rest.trim()).ok();
+            } else {
+                write_raw_frame(&mut out, buf.as_bytes())?;
+            }
         } else {
-            write_raw_frame(&mut out, buf.as_bytes())?;
+            let line = buf.trim_end();
+            if let Some(json) = line.strip_prefix(BUILD_RESULT_PREFIX) {
+                result = serde_json::from_str(json).ok();
+            } else if !line.is_empty() {
+                println!("    {line}");
+            }
         }
     }
     drop(_tty_reset);
@@ -448,6 +517,7 @@ pub async fn watch(client: &Client, app: &str, version: u64, health_timeout: u64
     let prefix = format!("{app}: ");
     let ctrl_c = tokio::signal::ctrl_c();
     tokio::pin!(ctrl_c);
+    let mut consecutive_poll_errors = 0u32;
     loop {
         tokio::select! {
             _ = tokio::time::sleep(Duration::from_secs(2)) => {}
@@ -469,7 +539,19 @@ pub async fn watch(client: &Client, app: &str, version: u64, health_timeout: u64
             client.get::<AppView>(&format!("/v1/apps/{app}")).await
         };
         let v = tokio::select! {
-            r = poll => r?,
+            r = poll => match r {
+                Ok(v) => {
+                    consecutive_poll_errors = 0;
+                    v
+                }
+                Err(e) => {
+                    consecutive_poll_errors += 1;
+                    if consecutive_poll_errors >= 5 || start.elapsed() > limit {
+                        return Err(e);
+                    }
+                    continue;
+                }
+            },
             _ = &mut ctrl_c => {
                 println!(
                     "\nStopped watching — release v{version} is still rolling out on the cluster.\n  Check progress: latrix ps {app}\n  Undo rollout:   latrix rollback {app}"
@@ -532,8 +614,9 @@ pub async fn watch(client: &Client, app: &str, version: u64, health_timeout: u64
             _ => {}
         }
         if start.elapsed() > limit {
-            println!("still rolling out in the background — check `latrix ps {app}`");
-            return Ok(());
+            bail!(
+                "timed out waiting for {app} v{version} to become healthy (still rolling out in the background — check `latrix ps {app}`)"
+            );
         }
     }
 }

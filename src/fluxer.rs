@@ -12,9 +12,15 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
+
+const MAX_BACKUP_ENTRIES: usize = 100_000;
+const MAX_BACKUP_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
+const MAX_COMPOSE_BUNDLE_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+const MAX_COMPOSE_TEXT_BYTES: u64 = 2 * 1024 * 1024; // 2 MiB
 
 pub const DEFAULT_RELEASE_URL: &str = "https://fluxer.dev/rexctl/release.json";
 pub const BACKUP_FORMAT_VERSION: u32 = 2;
@@ -194,6 +200,12 @@ pub struct ExtractedBackup {
     pub is_native: bool,
 }
 
+impl Drop for ExtractedBackup {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 impl ExtractedBackup {
     pub fn cleanup(&self) {
         let _ = std::fs::remove_dir_all(&self.work_dir);
@@ -266,7 +278,7 @@ impl ExtractedBackup {
             if k.starts_with("COMPOSE_") || k == "FLUXER_SETTINGS_LOADED" || v.is_empty() {
                 continue;
             }
-            if is_secret_var(k) {
+            if is_secret_entry(k, v) {
                 secrets.insert(k.clone(), v.clone());
             } else {
                 settings.insert(k.clone(), v.clone());
@@ -275,7 +287,11 @@ impl ExtractedBackup {
         if let Some(st) = &self.state {
             for (k, v) in &st.settings {
                 if !v.is_empty() {
-                    settings.insert(k.clone(), v.clone());
+                    if is_secret_entry(k, v) && k != "storage.secret_key" && k != "storage.access_key" {
+                        secrets.insert(k.clone(), v.clone());
+                    } else {
+                        settings.insert(k.clone(), v.clone());
+                    }
                 }
             }
             for (k, v) in &st.secrets {
@@ -285,12 +301,17 @@ impl ExtractedBackup {
             }
         }
 
+        let backup_domain = self.domain();
         let domain = domain_override
             .map(|d| d.trim().to_ascii_lowercase())
             .filter(|d| !d.is_empty())
-            .unwrap_or_else(|| self.domain());
+            .unwrap_or_else(|| backup_domain.clone());
         if domain.is_empty() {
             bail!("backup has no domain configured — pass --domain <your-domain>");
+        }
+        crate::config::validate_domain(&domain)?;
+        if !backup_domain.is_empty() && domain != backup_domain {
+            clear_stale_domain_settings(&mut settings, &backup_domain);
         }
         settings.insert("domain".into(), domain.clone());
 
@@ -308,7 +329,7 @@ impl ExtractedBackup {
             .get("storage.endpoint")
             .or_else(|| settings.get("FLUXER_S3_ENDPOINT"))
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty() && !s.contains("seaweedfs"));
+            .filter(|s| !s.is_empty() && !is_bundled_seaweedfs_endpoint(s));
         let external_object_store = storage_backend != "filesystem" && storage_endpoint.is_some();
 
         let bundled_voice = settings
@@ -329,6 +350,12 @@ impl ExtractedBackup {
             .map(|v| v.trim().eq_ignore_ascii_case("single"))
             .unwrap_or(false);
 
+        let caddyfile_custom = self
+            .caddyfile
+            .as_deref()
+            .map(|c| !c.trim().is_empty() && c != DEFAULT_CADDYFILE)
+            .unwrap_or(false);
+
         let now = util::now();
         Ok(FluxerStack {
             project,
@@ -347,6 +374,7 @@ impl ExtractedBackup {
                 .caddyfile
                 .clone()
                 .unwrap_or_else(|| DEFAULT_CADDYFILE.to_string()),
+            caddyfile_custom,
             caddy_dropins: self.caddy_dropins.clone(),
             services: vec![],
             external_object_store,
@@ -362,6 +390,64 @@ impl ExtractedBackup {
     }
 }
 
+/// Remove derived URL/origin settings that still point to `old_domain` so changing
+/// the stack domain regenerates fresh endpoints cleanly.
+pub fn clear_stale_domain_settings(settings: &mut BTreeMap<String, String>, old_domain: &str) {
+    let old = old_domain.trim().to_ascii_lowercase();
+    if old.is_empty() {
+        return;
+    }
+    const DERIVED_KEYS: &[&str] = &[
+        "FLUXER_PUBLIC_ORIGIN",
+        "FLUXER_APP_ENDPOINT",
+        "FLUXER_MEDIA_ENDPOINT",
+        "FLUXER_MEDIA_PROXY_PUBLIC_ENDPOINT",
+        "FLUXER_MEDIA_PROXY_UPLOAD_RELAY_ENDPOINT",
+        "FLUXER_ADMIN_ENDPOINT",
+        "FLUXER_MARKETING_ENDPOINT",
+        "FLUXER_LIVEKIT_URL",
+        "FLUXER_PASSKEY_RP_ID",
+        "FLUXER_PASSKEY_ADDITIONAL_ALLOWED_ORIGINS",
+        "FLUXER_GATEWAY_MEDIA_PROXY_ENDPOINT",
+        "FLUXER_GATEWAY_STATIC_CDN_ENDPOINT",
+        "FLUXER_MEDIA_PROXY_CORS_ALLOWED_ORIGINS",
+        "FLUXER_STATIC_CDN_ENDPOINT",
+    ];
+    for key in DERIVED_KEYS {
+        if let Some(val) = settings.get(*key) {
+            if val.to_ascii_lowercase().contains(&old) {
+                settings.remove(*key);
+            }
+        }
+    }
+}
+
+/// True when an S3 endpoint URL targets the bundled `seaweedfs` service rather than an external S3/R2 host.
+pub fn is_bundled_seaweedfs_endpoint(endpoint: &str) -> bool {
+    let is_bundled_host = |h: &str| {
+        let h = h.trim_end_matches('.').to_ascii_lowercase();
+        h == "seaweedfs"
+            || h == "seaweedfs.internal"
+            || (h.starts_with("seaweedfs.") && h.ends_with(".internal"))
+            || h.ends_with("-seaweedfs.internal")
+    };
+    let s = endpoint.trim();
+    if let Ok(u) = reqwest::Url::parse(s) {
+        if let Some(host) = u.host_str() {
+            return is_bundled_host(host);
+        }
+    }
+    let host_port = s
+        .strip_prefix("http://")
+        .or_else(|| s.strip_prefix("https://"))
+        .unwrap_or(s)
+        .split('/')
+        .next()
+        .unwrap_or("");
+    let host = host_port.split(':').next().unwrap_or("");
+    is_bundled_host(host)
+}
+
 pub fn sanitize_name(s: &str) -> String {
     let s: String = s
         .to_ascii_lowercase()
@@ -375,10 +461,12 @@ pub fn sanitize_name(s: &str) -> String {
             out.push(c);
         }
     }
-    if out.is_empty() {
+    let truncated: String = out.chars().take(32).collect();
+    let clean = truncated.trim_end_matches('-');
+    if clean.is_empty() {
         "fluxer".into()
     } else {
-        out.chars().take(32).collect()
+        clean.to_string()
     }
 }
 
@@ -387,12 +475,22 @@ pub fn sanitize_name(s: &str) -> String {
 // ---------------------------------------------------------------------------
 
 fn safe_rel_path(raw: &str) -> Result<PathBuf> {
-    let trimmed = raw.trim_start_matches("./");
+    if raw.contains('\0') {
+        bail!("unsafe NUL byte in backup archive path");
+    }
+    let normalized = raw.replace('\\', "/");
+    let trimmed = normalized.trim_start_matches("./");
     let p = Path::new(trimmed);
     let mut out = PathBuf::new();
     for c in p.components() {
         match c {
-            Component::Normal(part) => out.push(part),
+            Component::Normal(part) => {
+                let s = part.to_string_lossy();
+                if s.contains('\0') {
+                    bail!("unsafe path in backup archive: {raw}");
+                }
+                out.push(part);
+            }
             Component::CurDir => {}
             Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
                 bail!("unsafe path in backup archive: {raw}");
@@ -402,12 +500,83 @@ fn safe_rel_path(raw: &str) -> Result<PathBuf> {
     Ok(out)
 }
 
+fn canonical_arc_path(rel: &Path) -> String {
+    rel.components()
+        .filter_map(|c| match c {
+            Component::Normal(p) => Some(p.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn is_safe_release_segment(s: &str) -> bool {
+    let s = s.trim();
+    !s.is_empty()
+        && s.len() <= 64
+        && s != "."
+        && s != ".."
+        && !s.contains("..")
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+}
+
+fn check_no_symlink_ancestors(root: &Path, rel: &Path) -> Result<()> {
+    let mut cur = root.to_path_buf();
+    for comp in rel.components() {
+        cur.push(comp);
+        if let Ok(meta) = std::fs::symlink_metadata(&cur) {
+            if meta.file_type().is_symlink() {
+                bail!("backup archive attempts to traverse symlink at {}", cur.display());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate a symlink target inside `volumes/<vol>/...` so it cannot escape its volume root.
+fn validate_volume_symlink(rel: &Path, target: &Path) -> Result<()> {
+    let comps: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(p) => Some(p.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    if comps.len() < 3 || comps[0] != "volumes" {
+        bail!("symlinks are not allowed outside volumes/ in backup archives ({})", rel.display());
+    }
+    if target.is_absolute() {
+        bail!("absolute symlink target rejected in backup archive: {}", target.display());
+    }
+    let mut depth: i64 = (comps.len() as i64) - 3; // depth of parent dir relative to volumes/<vol>
+    for c in target.components() {
+        match c {
+            Component::CurDir => {}
+            Component::Normal(_) => depth += 1,
+            Component::ParentDir => {
+                depth -= 1;
+                if depth < 0 {
+                    bail!(
+                        "symlink '{}' in backup archive escapes volume boundary via '{}'",
+                        rel.display(),
+                        target.display()
+                    );
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                bail!("unsafe symlink target in backup archive: {}", target.display());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn open_archive_reader(path: &Path) -> Result<Box<dyn Read>> {
     let mut f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let mut magic = [0u8; 4];
     let n = f.read(&mut magic)?;
-    drop(f);
-    let f = std::fs::File::open(path)?;
+    f.seek(SeekFrom::Start(0))?;
     if n >= 4 && magic == [0x28, 0xB5, 0x2F, 0xFD] {
         let dec = zstd::stream::read::Decoder::new(f).context("invalid zstd backup archive")?;
         Ok(Box::new(dec))
@@ -442,7 +611,7 @@ fn sha256_file(path: &Path) -> Result<(u64, String)> {
 
 pub fn extract_and_verify_backup(path: &Path, verify: bool) -> Result<ExtractedBackup> {
     let work_dir = std::env::temp_dir().join(format!("latrix-rexctl-{}", util::random_id(8)));
-    std::fs::create_dir_all(&work_dir)?;
+    util::create_private_dir_all(&work_dir)?;
 
     let res = extract_inner(path, &work_dir, verify);
     if res.is_err() {
@@ -457,30 +626,53 @@ fn extract_inner(path: &Path, work_dir: &Path, verify: bool) -> Result<Extracted
 
     let mut hashes: BTreeMap<String, (u64, String)> = BTreeMap::new();
     let mut sums_text: Option<String> = None;
+    let mut entry_count = 0usize;
+    let mut total_bytes = 0u64;
 
     for entry in ar.entries().context("reading backup tar archive")? {
+        entry_count += 1;
+        if entry_count > MAX_BACKUP_ENTRIES {
+            bail!("backup archive exceeds maximum entry limit ({MAX_BACKUP_ENTRIES})");
+        }
         let mut entry = entry?;
         let raw_path = entry.path()?.to_string_lossy().replace('\\', "/");
-        let norm = raw_path.trim_start_matches("./").to_string();
-        if norm.is_empty() {
-            continue;
-        }
-        let rel = safe_rel_path(&norm)?;
-        let dest = work_dir.join(&rel);
+        let rel = safe_rel_path(&raw_path)?;
+        let canon = canonical_arc_path(&rel);
         let etype = entry.header().entry_type();
+        if canon.is_empty() {
+            if etype.is_dir() {
+                continue;
+            }
+            bail!("empty entry path in backup archive: '{raw_path}'");
+        }
+        check_no_symlink_ancestors(work_dir, &rel)?;
+        let dest = work_dir.join(&rel);
         if etype.is_dir() {
             std::fs::create_dir_all(&dest)?;
             continue;
         }
-        if !etype.is_file() {
-            // Skip symlinks/hardlinks safely unless inside volumes (handled if needed).
-            if etype.is_symlink() || etype.is_hard_link() {
-                if let Some(parent) = dest.parent() {
-                    let _ = std::fs::create_dir_all(parent);
+        if etype.is_symlink() {
+            let link = entry
+                .link_name()?
+                .ok_or_else(|| anyhow::anyhow!("symlink '{canon}' missing target"))?;
+            validate_volume_symlink(&rel, &link)?;
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            #[cfg(unix)]
+            {
+                if dest.exists() || std::fs::symlink_metadata(&dest).is_ok() {
+                    let _ = std::fs::remove_file(&dest);
                 }
-                let _ = entry.unpack(&dest);
+                std::os::unix::fs::symlink(&link, &dest)?;
             }
             continue;
+        }
+        if !etype.is_file() {
+            bail!("unsupported archive entry type {:?} at '{canon}'", etype);
+        }
+        if hashes.contains_key(&canon) {
+            bail!("duplicate entry '{canon}' in backup archive");
         }
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
@@ -488,22 +680,26 @@ fn extract_inner(path: &Path, work_dir: &Path, verify: bool) -> Result<Extracted
         let mut out = std::fs::File::create(&dest)?;
         let mut hasher = Sha256::new();
         let mut buf = [0u8; 64 * 1024];
-        let mut total = 0u64;
+        let mut file_bytes = 0u64;
         loop {
             let n = entry.read(&mut buf)?;
             if n == 0 {
                 break;
             }
+            total_bytes = total_bytes.saturating_add(n as u64);
+            if total_bytes > MAX_BACKUP_BYTES {
+                bail!("backup archive exceeds maximum extracted size ({MAX_BACKUP_BYTES} bytes)");
+            }
             out.write_all(&buf[..n])?;
             hasher.update(&buf[..n]);
-            total += n as u64;
+            file_bytes += n as u64;
         }
         out.flush()?;
         let digest = format!("{:x}", hasher.finalize());
-        if norm == "SHA256SUMS" {
-            sums_text = std::fs::read_to_string(&dest).ok();
+        if canon == "SHA256SUMS" {
+            sums_text = Some(std::fs::read_to_string(&dest).context("reading SHA256SUMS")?);
         }
-        hashes.insert(norm, (total, digest));
+        hashes.insert(canon, (file_bytes, digest));
     }
 
     let manifest_path = work_dir.join("manifest.json");
@@ -525,48 +721,70 @@ fn extract_inner(path: &Path, work_dir: &Path, verify: bool) -> Result<Extracted
 
     let mut verified_entries = 0usize;
     if verify {
+        let mut covered: BTreeSet<String> = BTreeSet::new();
         for e in &manifest.entries {
-            let p = e.path.trim_start_matches("./");
-            let Some((sz, got)) = hashes.get(p) else {
+            let rel = safe_rel_path(&e.path)?;
+            let p = canonical_arc_path(&rel);
+            if p.is_empty() {
+                bail!("backup damaged: empty path in manifest.json");
+            }
+            if e.sha256.len() != 64 || !e.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+                bail!("backup damaged: invalid sha256 checksum for '{p}' in manifest.json");
+            }
+            let Some((sz, got)) = hashes.get(&p) else {
                 bail!("backup damaged: manifest entry '{p}' is missing from archive");
             };
-            if !e.sha256.is_empty() && got != &e.sha256 {
+            if !got.eq_ignore_ascii_case(&e.sha256) {
                 bail!(
                     "backup damaged: checksum mismatch for '{p}' (expected {}, got {got})",
                     e.sha256
                 );
             }
-            if e.size > 0 && *sz != e.size {
+            if *sz != e.size {
                 bail!(
                     "backup damaged: size mismatch for '{p}' (expected {} bytes, got {sz})",
                     e.size
                 );
             }
-            verified_entries += 1;
+            if covered.insert(p) {
+                verified_entries += 1;
+            }
         }
         if let Some(sums) = &sums_text {
-            for line in sums.lines() {
-                let line = line.trim();
+            for (lineno, raw_line) in sums.lines().enumerate() {
+                let line = raw_line.trim();
                 if line.is_empty() {
                     continue;
                 }
-                let mut parts = line.splitn(2, char::is_whitespace);
-                let Some(expected) = parts.next() else { continue };
-                let Some(file) = parts.next().map(|s| s.trim().trim_start_matches('*').trim_start_matches("./")) else {
-                    continue;
+                let Some((expected, rest)) = line.split_once(char::is_whitespace) else {
+                    bail!("backup damaged: malformed SHA256SUMS line {}", lineno + 1);
                 };
-                if file.is_empty() || expected.len() != 64 {
-                    continue;
+                let raw_file = rest.trim().trim_start_matches('*');
+                if expected.len() != 64 || !expected.bytes().all(|b| b.is_ascii_hexdigit()) || raw_file.is_empty() {
+                    bail!("backup damaged: malformed SHA256SUMS line {}", lineno + 1);
                 }
-                let Some((_, got)) = hashes.get(file) else {
+                let rel = safe_rel_path(raw_file)?;
+                let file = canonical_arc_path(&rel);
+                let Some((_, got)) = hashes.get(&file) else {
                     bail!("backup damaged: SHA256SUMS entry '{file}' is missing");
                 };
                 if !got.eq_ignore_ascii_case(expected) {
                     bail!("backup damaged: SHA256SUMS mismatch for '{file}'");
                 }
-                if verified_entries == 0 {
+                if covered.insert(file) {
                     verified_entries += 1;
                 }
+            }
+        }
+        if verified_entries == 0 {
+            bail!("backup damaged: archive contains no verifiable checksum entries (pass --skip-verify to bypass)");
+        }
+        for file in hashes.keys() {
+            if file == "manifest.json" || file == "SHA256SUMS" {
+                continue;
+            }
+            if !covered.contains(file) {
+                bail!("backup damaged: unverified file '{file}' present in archive");
             }
         }
     }
@@ -588,12 +806,17 @@ fn extract_inner(path: &Path, work_dir: &Path, verify: bool) -> Result<Extracted
         BTreeMap::new()
     };
 
+    // Validate manifest.release before joining it into any filesystem path.
+    let safe_release = is_safe_release_segment(&manifest.release).then(|| manifest.release.trim());
+
     // Locate Caddyfile
-    let caddy_candidates = [
+    let mut caddy_candidates = vec![
         work_dir.join("files").join("Caddyfile"),
         work_dir.join("files").join(".rexctl").join("generated").join("Caddyfile"),
-        work_dir.join("files").join("releases").join(&manifest.release).join("Caddyfile"),
     ];
+    if let Some(rel_seg) = safe_release {
+        caddy_candidates.push(work_dir.join("files").join("releases").join(rel_seg).join("Caddyfile"));
+    }
     let caddyfile = caddy_candidates
         .iter()
         .find(|p| p.is_file())
@@ -608,11 +831,12 @@ fn extract_inner(path: &Path, work_dir: &Path, verify: bool) -> Result<Extracted
 
     // Parse pinned images from any compose files included in the backup
     let mut compose_images = BTreeMap::new();
-    let compose_roots = [
-        work_dir.join("files").join("releases").join(&manifest.release),
-        work_dir.join("files").join(".rexctl").join("generated"),
-        work_dir.join("files"),
-    ];
+    let mut compose_roots = vec![];
+    if let Some(rel_seg) = safe_release {
+        compose_roots.push(work_dir.join("files").join("releases").join(rel_seg));
+    }
+    compose_roots.push(work_dir.join("files").join(".rexctl").join("generated"));
+    compose_roots.push(work_dir.join("files"));
     for root in &compose_roots {
         let base = root.join("docker-compose.yml");
         if base.is_file() {
@@ -636,13 +860,14 @@ fn extract_inner(path: &Path, work_dir: &Path, verify: bool) -> Result<Extracted
     let dump_path = work_dir.join("postgres").join("fluxer.dump");
     let (postgres_dump, postgres_dump_size) = if dump_path.is_file() {
         let meta = std::fs::metadata(&dump_path)?;
-        if meta.len() >= 5 {
-            let mut f = std::fs::File::open(&dump_path)?;
-            let mut head = [0u8; 5];
-            f.read_exact(&mut head)?;
-            if &head != b"PGDMP" {
-                bail!("postgres/fluxer.dump does not have a valid PGDMP header");
-            }
+        if meta.len() < 5 {
+            bail!("postgres/fluxer.dump is truncated ({} bytes; expected PGDMP header)", meta.len());
+        }
+        let mut f = std::fs::File::open(&dump_path)?;
+        let mut head = [0u8; 5];
+        f.read_exact(&mut head)?;
+        if &head != b"PGDMP" {
+            bail!("postgres/fluxer.dump does not have a valid PGDMP header");
         }
         (Some(dump_path), meta.len())
     } else {
@@ -686,10 +911,11 @@ fn extract_inner(path: &Path, work_dir: &Path, verify: bool) -> Result<Extracted
 fn collect_caddy_dropins(base: &Path, dir: &Path, out: &mut BTreeMap<String, String>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
     for ent in rd.flatten() {
+        let Ok(ft) = ent.file_type() else { continue };
         let p = ent.path();
-        if p.is_dir() {
+        if ft.is_dir() {
             collect_caddy_dropins(base, &p, out);
-        } else if p.extension().and_then(|e| e.to_str()) == Some("caddy") {
+        } else if ft.is_file() && p.extension().and_then(|e| e.to_str()) == Some("caddy") {
             if let (Ok(rel), Ok(content)) = (p.strip_prefix(base), std::fs::read_to_string(&p)) {
                 out.insert(rel.to_string_lossy().replace('\\', "/"), content);
             }
@@ -706,17 +932,28 @@ pub fn write_rexctl_backup(
     scope: &str,
     reason: &str,
 ) -> Result<u64> {
-    if let Some(parent) = out_path.parent() {
+    if let Some(parent) = out_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Build all virtual files in a temporary staging directory so we can
+    // Build all virtual files in a private temporary staging directory so we can
     // compute exact sizes and SHA256 checksums for manifest.json + SHA256SUMS.
     let stage = std::env::temp_dir().join(format!("latrix-rexctl-pack-{}", util::random_id(8)));
-    std::fs::create_dir_all(&stage)?;
+    util::create_private_dir_all(&stage)?;
     let res = write_backup_inner(&stage, out_path, stack, pg_dump, volume_dirs, scope, reason);
     let _ = std::fs::remove_dir_all(&stage);
     res
+}
+
+fn create_private_file(path: &Path) -> Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path).with_context(|| format!("creating {}", path.display()))
 }
 
 fn write_backup_inner(
@@ -769,12 +1006,16 @@ fn write_backup_inner(
     }
     for (rel, body) in &stack.caddy_dropins {
         let safe = safe_rel_path(rel)?;
+        let canon_rel = canonical_arc_path(&safe);
+        if canon_rel.is_empty() {
+            continue;
+        }
         let f = stage.join("caddy.d").join(&safe);
         if let Some(p) = f.parent() {
             std::fs::create_dir_all(p)?;
         }
         std::fs::write(&f, body.as_bytes())?;
-        let arc = format!("files/caddy.d/{}", rel.trim_start_matches('/'));
+        let arc = format!("files/caddy.d/{canon_rel}");
         manifest_entries.push(RexctlEntry {
             path: arc.clone(),
             size: body.len() as u64,
@@ -822,39 +1063,51 @@ fn write_backup_inner(
         sums.push_str(&format!("{}  {}\n", e.sha256, e.path));
     }
 
-    let out_file = std::fs::File::create(out_path)
-        .with_context(|| format!("creating {}", out_path.display()))?;
-    crate::agent::set_private(out_path);
-    let enc = zstd::stream::write::Encoder::new(out_file, 3)?;
-    let mut tar = tar::Builder::new(enc);
-    let now = util::now();
+    let tmp_out = out_path.with_extension(format!("tmp-{}", util::random_id(8)));
+    let write_res = (|| -> Result<()> {
+        let out_file = create_private_file(&tmp_out)?;
+        let enc = zstd::stream::write::Encoder::new(out_file, 3)?;
+        let mut tar = tar::Builder::new(enc);
+        let now = util::now();
 
-    let mut add_bytes = |name: &str, data: &[u8], mode: u32| -> Result<()> {
-        let mut h = tar::Header::new_gnu();
-        h.set_size(data.len() as u64);
-        h.set_mode(mode);
-        h.set_mtime(now);
-        h.set_cksum();
-        tar.append_data(&mut h, name, data)?;
+        let mut add_bytes = |name: &str, data: &[u8], mode: u32| -> Result<()> {
+            let mut h = tar::Header::new_gnu();
+            h.set_size(data.len() as u64);
+            h.set_mode(mode);
+            h.set_mtime(now);
+            h.set_cksum();
+            tar.append_data(&mut h, name, data)?;
+            Ok(())
+        };
+        add_bytes("manifest.json", &manifest_bytes, 0o600)?;
+        add_bytes("SHA256SUMS", sums.as_bytes(), 0o600)?;
+
+        for (arc_name, src, mode) in &entries_to_pack {
+            let mut f = std::fs::File::open(src)?;
+            let meta = f.metadata()?;
+            let mut h = tar::Header::new_gnu();
+            h.set_size(meta.len());
+            h.set_mode(*mode);
+            h.set_mtime(now);
+            h.set_cksum();
+            tar.append_data(&mut h, arc_name, &mut f)?;
+        }
+
+        let enc = tar.into_inner()?;
+        let mut file = enc.finish()?;
+        file.flush()?;
+        file.sync_all()?;
         Ok(())
-    };
-    add_bytes("manifest.json", &manifest_bytes, 0o600)?;
-    add_bytes("SHA256SUMS", sums.as_bytes(), 0o600)?;
-
-    for (arc_name, src, mode) in &entries_to_pack {
-        let mut f = std::fs::File::open(src)?;
-        let meta = f.metadata()?;
-        let mut h = tar::Header::new_gnu();
-        h.set_size(meta.len());
-        h.set_mode(*mode);
-        h.set_mtime(now);
-        h.set_cksum();
-        tar.append_data(&mut h, arc_name, &mut f)?;
+    })();
+    if let Err(e) = write_res {
+        let _ = std::fs::remove_file(&tmp_out);
+        return Err(e);
     }
-
-    let enc = tar.into_inner()?;
-    let mut file = enc.finish()?;
-    file.flush()?;
+    if let Err(e) = std::fs::rename(&tmp_out, out_path) {
+        let _ = std::fs::remove_file(&tmp_out);
+        return Err(e).with_context(|| format!("moving backup archive into {}", out_path.display()));
+    }
+    crate::agent::set_private(out_path);
     Ok(std::fs::metadata(out_path)?.len())
 }
 
@@ -966,16 +1219,29 @@ pub fn is_newer_fluxer(candidate: &str, current: &str) -> bool {
 }
 
 pub fn check_upgrade_path(from: &str, to: &FluxerRelease) -> Result<()> {
-    if !to.min_from.is_empty()
-        && parse_fluxer_version(from).is_some()
-        && compare_fluxer_versions(from, &to.min_from) == std::cmp::Ordering::Less
-    {
+    let min = to.min_from.trim();
+    if min.is_empty() || from.trim().is_empty() {
+        return Ok(());
+    }
+    if parse_fluxer_version(min).is_none() {
         bail!(
-            "Fluxer {from} cannot upgrade directly to {} (minimum source release is {}). Upgrade to {} first: `latrix rexctl upgrade {}`",
+            "Fluxer release {} specifies an unparseable minimum source release '{}' — refusing upgrade",
             to.version,
-            to.min_from,
-            to.min_from,
-            to.min_from
+            min
+        );
+    }
+    if parse_fluxer_version(from).is_none() {
+        bail!(
+            "cannot verify upgrade path from unparseable release '{}' to {} (requires >= {})",
+            from,
+            to.version,
+            min
+        );
+    }
+    if compare_fluxer_versions(from, min) == std::cmp::Ordering::Less {
+        bail!(
+            "Fluxer {from} cannot upgrade directly to {} (minimum source release is {min}). Upgrade to {min} first: `latrix rexctl upgrade {min}`",
+            to.version,
         );
     }
     Ok(())
@@ -989,20 +1255,80 @@ pub fn postgres_major(image_ref: &str) -> Option<u32> {
     digits.parse::<u32>().ok().filter(|&n| n > 0)
 }
 
-pub async fn resolve_release(client: &reqwest::Client, version: Option<&str>) -> Result<FluxerRelease> {
-    let base = std::env::var("REXCTL_RELEASE_URL").unwrap_or_else(|_| DEFAULT_RELEASE_URL.into());
-    let url = match version.filter(|v| !v.trim().is_empty()) {
-        Some(v) => {
-            if base.contains('?') {
-                format!("{base}&version={}", v.trim())
-            } else {
-                format!("{base}?version={}", v.trim())
+fn validate_release_url(raw: &str) -> Result<reqwest::Url> {
+    let u = reqwest::Url::parse(raw.trim()).with_context(|| format!("invalid Fluxer URL '{raw}'"))?;
+    if !u.username().is_empty() || u.password().is_some() {
+        bail!("Fluxer URL must not contain embedded credentials");
+    }
+    let host = u.host_str().ok_or_else(|| anyhow::anyhow!("Fluxer URL missing host"))?;
+    let is_local_test = host.eq_ignore_ascii_case("localhost") || host == "127.0.0.1" || host == "::1";
+    match u.scheme() {
+        "https" => {}
+        "http" if is_local_test => {}
+        other => bail!("Fluxer URL must use https:// (got {other}://)"),
+    }
+    if !is_local_test {
+        let lower = host.trim_end_matches('.').to_ascii_lowercase();
+        if lower.ends_with(".internal") || lower.ends_with(".localhost") {
+            bail!("Fluxer URL host '{host}' is not allowed");
+        }
+        if let Ok(ip) = host.trim_matches(['[', ']']).parse::<IpAddr>() {
+            if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
+                bail!("Fluxer URL IP '{ip}' is not allowed");
+            }
+            match ip {
+                IpAddr::V4(v4) => {
+                    let [a, b, _, _] = v4.octets();
+                    if (a == 169 && b == 254) || (a == 10 && (b == 77 || b == 78)) {
+                        bail!("Fluxer URL IP '{ip}' is not allowed");
+                    }
+                }
+                IpAddr::V6(v6) => {
+                    if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                        bail!("Fluxer URL IP '{ip}' is not allowed");
+                    }
+                }
             }
         }
-        None => base,
-    };
-    let resp = client
-        .get(&url)
+    }
+    Ok(u)
+}
+
+fn release_http_client() -> Result<reqwest::Client> {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("too many redirects");
+        }
+        let target = attempt.url().as_str();
+        if let Err(e) = validate_release_url(target) {
+            return attempt.error(e.to_string());
+        }
+        // Prevent HTTPS -> HTTP downgrade on redirects.
+        if let Some(prev) = attempt.previous().last() {
+            if prev.scheme() == "https" && attempt.url().scheme() != "https" {
+                return attempt.error("refusing HTTPS-to-HTTP redirect");
+            }
+        }
+        attempt.follow()
+    });
+    Ok(reqwest::Client::builder()
+        .redirect(policy)
+        .timeout(Duration::from_secs(90))
+        .build()?)
+}
+
+pub async fn resolve_release(_client: &reqwest::Client, version: Option<&str>) -> Result<FluxerRelease> {
+    let base = std::env::var("REXCTL_RELEASE_URL").unwrap_or_else(|_| DEFAULT_RELEASE_URL.into());
+    let mut url = validate_release_url(&base)?;
+    if let Some(v) = version.map(str::trim).filter(|v| !v.is_empty()) {
+        if !is_safe_release_segment(v) {
+            bail!("invalid Fluxer release version '{v}'");
+        }
+        url.query_pairs_mut().append_pair("version", v);
+    }
+    let http = release_http_client()?;
+    let resp = http
+        .get(url.clone())
         .header("Accept", "application/json")
         .header("User-Agent", format!("latrix/{}", util::VERSION))
         .timeout(Duration::from_secs(30))
@@ -1015,45 +1341,79 @@ pub async fn resolve_release(client: &reqwest::Client, version: Option<&str>) ->
     if !resp.status().is_success() {
         bail!("Fluxer release resolver returned {}", resp.status());
     }
-    let rel: FluxerRelease = resp.json().await.context("invalid Fluxer release.json")?;
+    let body = resp.bytes().await.context("reading Fluxer release.json")?;
+    if body.len() > 1024 * 1024 {
+        bail!("Fluxer release.json response is unexpectedly large");
+    }
+    let rel: FluxerRelease = serde_json::from_slice(&body).context("invalid Fluxer release.json")?;
     if parse_fluxer_version(&rel.version).is_none() {
         bail!("unexpected Fluxer release version '{}'", rel.version);
+    }
+    if !rel.compose_url.trim().is_empty() {
+        validate_release_url(&rel.compose_url)?;
     }
     Ok(rel)
 }
 
-pub async fn fetch_compose_bundle(client: &reqwest::Client, compose_url: &str) -> Result<ComposeBundle> {
+pub async fn fetch_compose_bundle(_client: &reqwest::Client, compose_url: &str) -> Result<ComposeBundle> {
     if compose_url.trim().is_empty() {
         return Ok(ComposeBundle::default());
     }
-    let bytes = client
-        .get(compose_url)
+    let url = validate_release_url(compose_url)?;
+    let http = release_http_client()?;
+    let mut resp = http
+        .get(url)
         .header("User-Agent", format!("latrix/{}", util::VERSION))
         .timeout(Duration::from_secs(90))
         .send()
         .await
         .with_context(|| format!("downloading Fluxer compose bundle {compose_url}"))?
         .error_for_status()
-        .with_context(|| format!("downloading Fluxer compose bundle {compose_url}"))?
-        .bytes()
-        .await?;
+        .with_context(|| format!("downloading Fluxer compose bundle {compose_url}"))?;
+    if let Some(len) = resp.content_length() {
+        if len > MAX_COMPOSE_BUNDLE_BYTES as u64 {
+            bail!("Fluxer compose bundle exceeds {MAX_COMPOSE_BUNDLE_BYTES} bytes");
+        }
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = resp.chunk().await? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_COMPOSE_BUNDLE_BYTES {
+            bail!("Fluxer compose bundle exceeds {MAX_COMPOSE_BUNDLE_BYTES} bytes");
+        }
+        bytes.extend_from_slice(&chunk);
+    }
 
-    let dec = flate2::read::GzDecoder::new(bytes.as_ref());
+    let dec = flate2::read::GzDecoder::new(bytes.as_slice());
     let mut ar = tar::Archive::new(dec);
     let mut bundle = ComposeBundle::default();
+    let mut entries_seen = 0usize;
     for entry in ar.entries()? {
-        let mut entry = entry?;
-        let name = entry.path()?.to_string_lossy().replace('\\', "/");
-        let norm = name.trim_start_matches("./");
+        entries_seen += 1;
+        if entries_seen > 1000 {
+            bail!("Fluxer compose bundle contains too many archive entries");
+        }
+        let entry = entry?;
+        if !entry.header().entry_type().is_file() {
+            continue;
+        }
+        let raw_name = entry.path()?.to_string_lossy().replace('\\', "/");
+        let Ok(rel) = safe_rel_path(&raw_name) else { continue };
+        let norm = canonical_arc_path(&rel);
         if norm == "docker-compose.yml" || norm == "rust-server.compose.yml" {
             let mut txt = String::new();
-            entry.read_to_string(&mut txt)?;
+            entry.take(MAX_COMPOSE_TEXT_BYTES + 1).read_to_string(&mut txt)?;
+            if txt.len() as u64 > MAX_COMPOSE_TEXT_BYTES {
+                bail!("compose file '{norm}' exceeds maximum size");
+            }
             for (k, v) in parse_compose_images(&txt) {
                 bundle.images.insert(k, v);
             }
         } else if norm == "Caddyfile" {
             let mut txt = String::new();
-            entry.read_to_string(&mut txt)?;
+            entry.take(MAX_COMPOSE_TEXT_BYTES + 1).read_to_string(&mut txt)?;
+            if txt.len() as u64 > MAX_COMPOSE_TEXT_BYTES {
+                bail!("Caddyfile in compose bundle exceeds maximum size");
+            }
             if !txt.trim().is_empty() {
                 bundle.caddyfile = Some(txt);
             }
@@ -1076,7 +1436,9 @@ pub fn parse_compose_images(yaml_text: &str) -> BTreeMap<String, String> {
         let Some(svc) = k.as_str() else { continue };
         let Some(raw) = v["image"].as_str() else { continue };
         if let Some(resolved) = unwrap_compose_image(raw) {
-            out.insert(svc.to_string(), resolved);
+            if util::validate_image_ref(&resolved).is_ok() {
+                out.insert(svc.to_string(), resolved);
+            }
         }
     }
     out
@@ -1113,15 +1475,49 @@ pub fn parse_dotenv(text: &str) -> BTreeMap<String, String> {
         if let Some((k, v)) = line.split_once('=') {
             let k = k.trim();
             let v = v.trim();
-            let unquoted = if (v.starts_with('"') && v.ends_with('"') && v.len() >= 2)
-                || (v.starts_with('\'') && v.ends_with('\'') && v.len() >= 2)
-            {
-                &v[1..v.len() - 1]
+            let val = if let Some(inner) = v.strip_prefix('"') {
+                // Parse double-quoted value with standard escapes until closing quote.
+                let mut buf = String::new();
+                let mut chars = inner.chars();
+                while let Some(c) = chars.next() {
+                    if c == '\\' {
+                        match chars.next() {
+                            Some('n') => buf.push('\n'),
+                            Some('r') => buf.push('\r'),
+                            Some('t') => buf.push('\t'),
+                            Some('"') => buf.push('"'),
+                            Some('\\') => buf.push('\\'),
+                            Some(other) => {
+                                buf.push('\\');
+                                buf.push(other);
+                            }
+                            None => buf.push('\\'),
+                        }
+                    } else if c == '"' {
+                        break;
+                    } else {
+                        buf.push(c);
+                    }
+                }
+                buf
+            } else if let Some(inner) = v.strip_prefix('\'') {
+                // Single-quoted literal until next single quote.
+                inner.split_once('\'').map(|(a, _)| a).unwrap_or(inner).to_string()
             } else {
-                v
+                // Strip unquoted inline `#` comment only when preceded by whitespace.
+                let mut end = v.len();
+                let mut prev_ws = false;
+                for (idx, c) in v.char_indices() {
+                    if c == '#' && prev_ws {
+                        end = idx;
+                        break;
+                    }
+                    prev_ws = c.is_whitespace();
+                }
+                v[..end].trim().to_string()
             };
             if !k.is_empty() {
-                out.insert(k.to_string(), unquoted.to_string());
+                out.insert(k.to_string(), val);
             }
         }
     }
@@ -1132,6 +1528,13 @@ pub fn parse_dotenv(text: &str) -> BTreeMap<String, String> {
 // Settings -> Effective Env & Service Stack Planner
 // ---------------------------------------------------------------------------
 
+fn has_url_creds(val: &str) -> bool {
+    let Some(pos) = val.find("://") else { return false };
+    let after = &val[pos + 3..];
+    let authority = after.split(['/', '?', '#']).next().unwrap_or("");
+    authority.contains('@')
+}
+
 pub fn is_secret_var(k: &str) -> bool {
     let u = k.to_ascii_uppercase();
     u.contains("SECRET")
@@ -1141,11 +1544,17 @@ pub fn is_secret_var(k: &str) -> bool {
         || u.contains("API_KEY")
         || u == "MEILI_MASTER_KEY"
         || u == "LIVEKIT_KEYS"
+        || u == "LIVEKIT_CONFIG"
+        || u == "FLUXER_LIVEKIT_TURN_SERVERS"
         || u == "FLUXER_ERLANG_COOKIE"
         || u == "FLUXER_S3_ACCESS_KEY_ID"
         || u == "FLUXER_S3_ACCESS_KEY"
         || u == "FLUXER_POSTGRES_URL"
-        || u == "FLUXER_KV_URL" && u.contains('@')
+        || u == "STORAGE.SECRET_KEY"
+}
+
+pub fn is_secret_entry(k: &str, v: &str) -> bool {
+    is_secret_var(k) || has_url_creds(v)
 }
 
 /// Named setting -> primary env var mapping (matching `fluxer_rexctl/internal/settings/keys.go`).
@@ -1345,6 +1754,9 @@ fn maybe_rewrite_registry(img: &str, registry: Option<&String>) -> String {
     let Some(reg) = registry.map(|s| s.trim().trim_end_matches('/')).filter(|s| !s.is_empty()) else {
         return img.to_string();
     };
+    if img.starts_with(&format!("{reg}/")) {
+        return img.to_string();
+    }
     let Some((name, digest)) = img.split_once('@') else {
         return img.to_string();
     };
@@ -1381,7 +1793,7 @@ fn split_env_and_secrets(all: BTreeMap<String, String>) -> (BTreeMap<String, Str
         if v.is_empty() {
             continue;
         }
-        if is_secret_var(&k) {
+        if is_secret_entry(&k, &v) {
             secrets.insert(k, v);
         } else {
             env.insert(k, v);
@@ -1563,23 +1975,69 @@ pub fn caddy_bootstrap_command(caddyfile: &str, dropins: &BTreeMap<String, Strin
         "mkdir -p /etc/caddy/conf.d/sites && printf '%s' '{cf_b64}' | base64 -d > /etc/caddy/Caddyfile"
     );
     for (rel, body) in dropins {
-        let clean = rel.trim_start_matches('/').replace('\'', "");
-        if clean.contains("..") || clean.is_empty() {
+        let Ok(safe) = safe_rel_path(rel) else { continue };
+        let clean = canonical_arc_path(&safe);
+        if clean.is_empty() || clean.chars().any(|c| c.is_control()) {
             continue;
         }
         let target = format!("/etc/caddy/conf.d/{clean}");
+        let target_q = util::shell_quote(&target);
         if let Some((parent, _)) = target.rsplit_once('/') {
-            script.push_str(&format!(" && mkdir -p '{parent}'"));
+            let parent_q = util::shell_quote(parent);
+            script.push_str(&format!(" && mkdir -p {parent_q}"));
         }
         let encoded = b64.encode(body.as_bytes());
-        script.push_str(&format!(" && printf '%s' '{encoded}' | base64 -d > '{target}'"));
+        script.push_str(&format!(" && printf '%s' '{encoded}' | base64 -d > {target_q}"));
     }
     script.push_str(" && exec caddy run --config /etc/caddy/Caddyfile --adapter caddyfile");
     Command::Shell(script)
 }
 
+fn validate_s3_bucket(name: &str) -> Result<&str> {
+    let b = name.trim();
+    if b.len() < 3
+        || b.len() > 63
+        || !b.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'-' | b'.'))
+        || !b.as_bytes()[0].is_ascii_alphanumeric()
+        || !b.as_bytes()[b.len() - 1].is_ascii_alphanumeric()
+        || b.contains("..")
+    {
+        bail!("invalid S3 bucket name '{name}'");
+    }
+    Ok(b)
+}
+
+fn validate_seaweed_ttl(ttl: &str) -> Result<&str> {
+    let t = ttl.trim();
+    if t == "off" {
+        return Ok(t);
+    }
+    let Some(unit) = t.chars().last() else {
+        bail!("invalid SeaweedFS TTL '{ttl}'");
+    };
+    let num = &t[..t.len() - unit.len_utf8()];
+    if !matches!(unit, 'm' | 'h' | 'd' | 'w' | 'M' | 'y')
+        || num.is_empty()
+        || !num.bytes().all(|b| b.is_ascii_digit())
+    {
+        bail!("invalid SeaweedFS TTL '{ttl}' (expected 'off' or <number>[m|h|d|w|M|y])");
+    }
+    Ok(t)
+}
+
+fn validate_nats_size(val: &str, name: &str) -> Result<String> {
+    let v = val.trim();
+    if v.is_empty()
+        || !v.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.')
+        || !v.as_bytes()[0].is_ascii_digit()
+    {
+        bail!("invalid {name} '{val}'");
+    }
+    Ok(v.to_string())
+}
+
 /// One-shot SeaweedFS init script (executed inside the running `seaweedfs` container).
-pub fn seaweedfs_init_script(eff: &BTreeMap<String, String>) -> String {
+pub fn seaweedfs_init_script(eff: &BTreeMap<String, String>) -> Result<String> {
     let ak = eff
         .get("FLUXER_S3_ACCESS_KEY")
         .or_else(|| eff.get("FLUXER_S3_ACCESS_KEY_ID"))
@@ -1590,38 +2048,54 @@ pub fn seaweedfs_init_script(eff: &BTreeMap<String, String>) -> String {
         .or_else(|| eff.get("FLUXER_S3_SECRET_ACCESS_KEY"))
         .cloned()
         .unwrap_or_default();
+    if ak.chars().any(|c| c.is_control() || c.is_whitespace())
+        || sk.chars().any(|c| c.is_control() || c.is_whitespace())
+    {
+        bail!("SeaweedFS S3 credentials must not contain whitespace or control characters");
+    }
     let b_cdn = get_or(eff, "FLUXER_S3_BUCKET_CDN", "fluxer");
     let b_up = get_or(eff, "FLUXER_S3_BUCKET_UPLOADS", "fluxer-uploads");
     let b_rep = get_or(eff, "FLUXER_S3_BUCKET_REPORTS", "fluxer-reports");
     let b_har = get_or(eff, "FLUXER_S3_BUCKET_HARVESTS", "fluxer-harvests");
-    let ttl = get_or(eff, "FLUXER_SEAWEEDFS_UPLOADS_TTL", "1d");
-    format!(
+    let b_cdn = validate_s3_bucket(&b_cdn)?;
+    let b_up = validate_s3_bucket(&b_up)?;
+    let b_rep = validate_s3_bucket(&b_rep)?;
+    let b_har = validate_s3_bucket(&b_har)?;
+    let ttl_raw = get_or(eff, "FLUXER_SEAWEEDFS_UPLOADS_TTL", "1d");
+    let ttl = validate_seaweed_ttl(&ttl_raw)?;
+
+    let cfg_line = format!(
+        "s3.configure -user=fluxer -access_key={} -secret_key={} -actions=Admin,Read,Write,List,Tagging -apply",
+        ak, sk
+    );
+    let cfg_line_q = util::shell_quote(&cfg_line);
+    Ok(format!(
         r#"set -e
-buckets="{b_cdn} {b_up} {b_rep} {b_har}"
+buckets='{b_cdn} {b_up} {b_rep} {b_har}'
 for attempt in $(seq 1 30); do
-  listed=$(echo "s3.bucket.list" | timeout 10 weed shell -master=127.0.0.1:9333 2>&1 || true)
+  listed=$(printf '%s\n' 's3.bucket.list' | timeout 10 weed shell -master=127.0.0.1:9333 2>&1 || true)
   missing=""
   for b in $buckets; do
-    echo "$listed" | grep -q "^[[:space:]]*$b[[:space:]]" || missing="${{missing:+$missing }}$b"
+    printf '%s\n' "$listed" | awk -v b="$b" '$1 == b {{ found=1 }} END {{ exit !found }}' || missing="${{missing:+$missing }}$b"
   done
   if [ -z "$missing" ]; then
-    echo "s3.configure -user=fluxer -access_key={ak} -secret_key={sk} -actions=Admin,Read,Write,List,Tagging -apply" | timeout 10 weed shell -master=127.0.0.1:9333 >/dev/null
-    if [ "{ttl}" = "off" ]; then
-      echo "fs.configure -locationPrefix=/buckets/{b_up}/ -delete -apply" | timeout 10 weed shell -master=127.0.0.1:9333 >/dev/null
+    printf '%s\n' {cfg_line_q} | timeout 10 weed shell -master=127.0.0.1:9333 >/dev/null
+    if [ '{ttl}' = 'off' ]; then
+      printf '%s\n' 'fs.configure -locationPrefix=/buckets/{b_up}/ -delete -apply' | timeout 10 weed shell -master=127.0.0.1:9333 >/dev/null
     else
-      echo "fs.configure -locationPrefix=/buckets/{b_up}/ -ttl={ttl} -apply" | timeout 10 weed shell -master=127.0.0.1:9333 >/dev/null
+      printf '%s\n' 'fs.configure -locationPrefix=/buckets/{b_up}/ -ttl={ttl} -apply' | timeout 10 weed shell -master=127.0.0.1:9333 >/dev/null
     fi
     echo "buckets ready"
     exit 0
   fi
   for b in $missing; do
-    echo "s3.bucket.create -name $b" | timeout 10 weed shell -master=127.0.0.1:9333 >/dev/null 2>&1 || true
+    printf 's3.bucket.create -name %s\n' "$b" | timeout 10 weed shell -master=127.0.0.1:9333 >/dev/null 2>&1 || true
   done
   sleep 2
 done
 echo "seaweedfs init timed out" >&2
 exit 1"#
-    )
+    ))
 }
 
 /// Plan every latrix app needed to run this `FluxerStack`.
@@ -1759,8 +2233,14 @@ pub fn plan_stack(
             size: Some("10GB".into()),
         });
         cfg.env.insert("GOMEMLIMIT".into(), get_or(&eff, "FLUXER_NATS_GOMEMLIMIT", "200MiB"));
-        cfg.env.insert("FLUXER_NATS_MAX_MEMORY_STORE".into(), get_or(&eff, "FLUXER_NATS_MAX_MEMORY_STORE", "64MB"));
-        cfg.env.insert("FLUXER_NATS_MAX_FILE_STORE".into(), get_or(&eff, "FLUXER_NATS_MAX_FILE_STORE", "10GB"));
+        cfg.env.insert(
+            "FLUXER_NATS_MAX_MEMORY_STORE".into(),
+            validate_nats_size(&get_or(&eff, "FLUXER_NATS_MAX_MEMORY_STORE", "64MB"), "FLUXER_NATS_MAX_MEMORY_STORE")?,
+        );
+        cfg.env.insert(
+            "FLUXER_NATS_MAX_FILE_STORE".into(),
+            validate_nats_size(&get_or(&eff, "FLUXER_NATS_MAX_FILE_STORE", "10GB"), "FLUXER_NATS_MAX_FILE_STORE")?,
+        );
         cfg.command = Some(Command::Shell(
             r#"printf 'http_port: 8222\njetstream {\n  store_dir: /data\n  max_memory_store: %s\n  max_file_store: %s\n}\n' "$FLUXER_NATS_MAX_MEMORY_STORE" "$FLUXER_NATS_MAX_FILE_STORE" > /tmp/nats.conf && exec nats-server -c /tmp/nats.conf"#.into(),
         ));
@@ -1860,13 +2340,25 @@ pub fn plan_stack(
 
     // 6. livekit (bundled voice)
     if stack.bundled_voice {
-        let tcp_port: u16 = get_or(&eff, "FLUXER_LIVEKIT_TCP_PORT", "7881").parse().unwrap_or(7881);
-        let udp_port: u16 = get_or(&eff, "FLUXER_LIVEKIT_UDP_PORT", "7882").parse().unwrap_or(7882);
-        let use_ext = get_or(&eff, "FLUXER_LIVEKIT_USE_EXTERNAL_IP", "true");
+        let tcp_port: u16 = get_or(&eff, "FLUXER_LIVEKIT_TCP_PORT", "7881")
+            .parse()
+            .context("invalid FLUXER_LIVEKIT_TCP_PORT")?;
+        let udp_port: u16 = get_or(&eff, "FLUXER_LIVEKIT_UDP_PORT", "7882")
+            .parse()
+            .context("invalid FLUXER_LIVEKIT_UDP_PORT")?;
+        if tcp_port == 0 || udp_port == 0 || tcp_port == 7880 {
+            bail!("invalid LiveKit voice ports (tcp={tcp_port}, udp={udp_port})");
+        }
+        let use_ext = !matches!(
+            get_or(&eff, "FLUXER_LIVEKIT_USE_EXTERNAL_IP", "true").trim().to_ascii_lowercase().as_str(),
+            "false" | "0" | "no" | "off"
+        );
         let node_ip = eff.get("FLUXER_LIVEKIT_NODE_IP").cloned().unwrap_or_default();
         let stun1 = get_or(&eff, "FLUXER_LIVEKIT_STUN_PRIMARY", "stun.l.google.com:19302");
         let stun2 = get_or(&eff, "FLUXER_LIVEKIT_STUN_SECONDARY", "stun1.l.google.com:19302");
-        let turn = get_or(&eff, "FLUXER_LIVEKIT_TURN_SERVERS", "[]");
+        let turn_raw = get_or(&eff, "FLUXER_LIVEKIT_TURN_SERVERS", "[]");
+        let turn_val: serde_yaml::Value = serde_yaml::from_str(&turn_raw)
+            .unwrap_or_else(|_| serde_yaml::Value::Sequence(vec![]));
         let lk_key = eff.get("LIVEKIT_API_KEY").or_else(|| eff.get("FLUXER_LIVEKIT_API_KEY")).cloned().unwrap_or_default();
         let lk_sec = eff.get("LIVEKIT_API_SECRET").or_else(|| eff.get("FLUXER_LIVEKIT_API_SECRET")).cloned().unwrap_or_default();
         let lk_log = get_or(&eff, "FLUXER_LIVEKIT_LOG_LEVEL", "info");
@@ -1876,12 +2368,47 @@ pub fn plan_stack(
         cfg.ports.push(PortConfig { port: tcp_port, public: true, public_port: None, protocol: "tcp".into() });
         cfg.ports.push(PortConfig { port: udp_port, public: true, public_port: None, protocol: "udp".into() });
 
-        let lk_config = format!(
-            "port: 7880\nlog_level: {lk_log}\nrtc:\n  tcp_port: {tcp_port}\n  udp_port: {udp_port}\n  use_external_ip: {use_ext}\n  node_ip: \"{node_ip}\"\n  stun_servers:\n    - {stun1}\n    - {stun2}\n  turn_servers: {turn}\nwebhook:\n  api_key: {lk_key}\n  urls:\n    - http://api:8080/webhooks/livekit\n"
+        let mut rtc_map = serde_yaml::Mapping::new();
+        rtc_map.insert("tcp_port".into(), serde_yaml::Value::Number(tcp_port.into()));
+        rtc_map.insert("udp_port".into(), serde_yaml::Value::Number(udp_port.into()));
+        rtc_map.insert("use_external_ip".into(), serde_yaml::Value::Bool(use_ext));
+        rtc_map.insert("node_ip".into(), serde_yaml::Value::String(node_ip));
+        rtc_map.insert(
+            "stun_servers".into(),
+            serde_yaml::Value::Sequence(vec![
+                serde_yaml::Value::String(stun1),
+                serde_yaml::Value::String(stun2),
+            ]),
         );
+        rtc_map.insert("turn_servers".into(), turn_val);
+
+        let mut webhook_map = serde_yaml::Mapping::new();
+        webhook_map.insert("api_key".into(), serde_yaml::Value::String(lk_key.clone()));
+        webhook_map.insert(
+            "urls".into(),
+            serde_yaml::Value::Sequence(vec![serde_yaml::Value::String(
+                "http://api:8080/webhooks/livekit".into(),
+            )]),
+        );
+
+        let mut lk_map = serde_yaml::Mapping::new();
+        lk_map.insert("port".into(), serde_yaml::Value::Number(7880u16.into()));
+        lk_map.insert("log_level".into(), serde_yaml::Value::String(lk_log));
+        lk_map.insert("rtc".into(), serde_yaml::Value::Mapping(rtc_map));
+        lk_map.insert("webhook".into(), serde_yaml::Value::Mapping(webhook_map));
+        let lk_config = serde_yaml::to_string(&serde_yaml::Value::Mapping(lk_map))
+            .context("serializing LIVEKIT_CONFIG")?;
+
         let mut raw_env = BTreeMap::new();
         raw_env.insert("GOMEMLIMIT".into(), get_or(&eff, "FLUXER_LIVEKIT_GOMEMLIMIT", "435MiB"));
-        raw_env.insert("LIVEKIT_KEYS".into(), format!("{lk_key}: {lk_sec}"));
+        let lk_keys = if !lk_key.is_empty() && !lk_sec.is_empty() {
+            format!("{lk_key}: {lk_sec}")
+        } else {
+            eff.get("LIVEKIT_KEYS").cloned().unwrap_or_default()
+        };
+        if !lk_keys.is_empty() {
+            raw_env.insert("LIVEKIT_KEYS".into(), lk_keys);
+        }
         raw_env.insert("LIVEKIT_CONFIG".into(), lk_config);
         let (env, secrets) = split_env_and_secrets(raw_env);
         cfg.env = env;
@@ -1919,10 +2446,14 @@ pub fn plan_stack(
         cfg.ports.push(PortConfig { port: 8080, public: false, public_port: None, protocol: "tcp".into() });
         cfg.ports.push(PortConfig { port: 18083, public: false, public_port: None, protocol: "tcp".into() });
         cfg.ports.push(PortConfig { port: 8090, public: false, public_port: None, protocol: "tcp".into() });
+        let origin = get_or(&eff, "FLUXER_PUBLIC_ORIGIN", &format!("https://{}", stack.domain));
         let (env, secrets) = rust_common(&[
             ("FLUXER_RUST_PROCESS", "single".into()),
             ("FLUXER_SERVER_SERVICES", "snowflakes,users,messages,gifs,unfurl,push,app-proxy,admin".into()),
             ("FLUXER_APP_PROXY_PORT", "8080".into()),
+            ("FLUXER_ADMIN_PORT", "18083".into()),
+            ("FLUXER_ADMIN_BASE_PATH", get_or(&eff, "FLUXER_ADMIN_BASE_PATH", "/admin")),
+            ("FLUXER_STATIC_CDN_ENDPOINT", get_or(&eff, "FLUXER_STATIC_CDN_ENDPOINT", &origin)),
             ("DISCOVERY_UPSTREAM_URL", "http://edge:8088/.well-known/fluxer".into()),
             ("DISCOVERY_REFRESH_INTERVAL_MS", get_or(&eff, "DISCOVERY_REFRESH_INTERVAL_MS", "5000")),
             ("FLUXER_MEDIA_PROXY_ENDPOINT", "http://media-proxy:8080".into()),
@@ -2003,7 +2534,7 @@ pub fn plan_stack(
     // worker
     {
         let mut cfg = base_cfg("worker", &mem_limit(&eff, "FLUXER_WORKER_MEMORY_LIMIT", "1536MB"), 0.5);
-        let replicas: u32 = get_or(&eff, "FLUXER_WORKER_REPLICAS", "1").parse().unwrap_or(1).max(1);
+        let replicas: u32 = get_or(&eff, "FLUXER_WORKER_REPLICAS", "1").parse().unwrap_or(1).clamp(1, 64);
         cfg.scale.count = Some(replicas);
         cfg.command = Some(Command::Exec(vec!["node".into(), "dist/WorkerEntrypoint.js".into()]));
         let mut m = common.clone();
@@ -2188,9 +2719,18 @@ pub fn plan_stack(
         cfg.command = Some(caddy_bootstrap_command(caddyfile, &stack.caddy_dropins));
         cfg.env.insert("FLUXER_EDGE_SITE_ADDRESS".into(), ":8080".into());
         cfg.env.insert("FLUXER_EDGE_TLS_DIRECTIVE".into(), String::new());
-        cfg.env.insert("FLUXER_EDGE_TRUSTED_PROXIES".into(), "private_ranges".into());
+        cfg.env.insert(
+            "FLUXER_EDGE_TRUSTED_PROXIES".into(),
+            get_or(&eff, "FLUXER_EDGE_TRUSTED_PROXIES", "private_ranges"),
+        );
         cfg.env.insert("FLUXER_EDGE_ENCODE".into(), get_or(&eff, "FLUXER_EDGE_ENCODE", "zstd gzip"));
-        cfg.env.insert("FLUXER_EDGE_PROTOCOLS".into(), "h1 h2".into());
+        cfg.env.insert(
+            "FLUXER_EDGE_PROTOCOLS".into(),
+            get_or(&eff, "FLUXER_EDGE_PROTOCOLS", "h1 h2"),
+        );
+        if let Some(opts) = eff.get("FLUXER_EDGE_GLOBAL_OPTIONS").filter(|s| !s.is_empty()) {
+            cfg.env.insert("FLUXER_EDGE_GLOBAL_OPTIONS".into(), opts.clone());
+        }
         cfg.env.insert("FLUXER_ADMIN_BASE_PATH".into(), get_or(&eff, "FLUXER_ADMIN_BASE_PATH", "/admin"));
         if stack.rust_single {
             cfg.env.insert("FLUXER_ADMIN_UPSTREAM".into(), "admin:18083".into());
@@ -2270,12 +2810,15 @@ pub fn storage_summary(stack: &FluxerStack) -> String {
 
 /// Names of secrets that should be masked in CLI output.
 pub fn mask_value(key: &str, val: &str) -> String {
-    let secret_named = matches!(key, "storage.secret_key" | "storage.access_key") || is_secret_var(key);
+    let secret_named = matches!(key, "storage.secret_key" | "storage.access_key") || is_secret_entry(key, val);
     if secret_named {
-        if val.len() <= 6 {
+        let chars: Vec<char> = val.chars().collect();
+        if chars.len() <= 8 {
             "***".into()
         } else {
-            format!("{}…{}", &val[..3], &val[val.len() - 3..])
+            let head: String = chars[..3].iter().collect();
+            let tail: String = chars[chars.len() - 3..].iter().collect();
+            format!("{head}…{tail}")
         }
     } else {
         val.to_string()
@@ -2329,6 +2872,7 @@ mod tests {
             settings,
             secrets,
             caddyfile: DEFAULT_CADDYFILE.into(),
+            caddyfile_custom: false,
             caddy_dropins: BTreeMap::new(),
             services: vec![],
             external_object_store: true,
@@ -2489,5 +3033,54 @@ services:
         let specs = plan_stack(&st, &BTreeMap::new()).unwrap();
         assert!(specs.iter().any(|s| s.service == "seaweedfs"));
         assert!(!specs.iter().any(|s| s.service == "valkey"));
+    }
+
+    #[test]
+    fn fluxer_hardening_edge_cases() {
+        // UTF-8 safe masking
+        assert_eq!(mask_value("storage.secret_key", "пароль_секретный_123"), "пар…123");
+        assert_eq!(mask_value("storage.secret_key", "коротк"), "***");
+
+        // Bundled SeaweedFS endpoint detection is host-exact
+        assert!(is_bundled_seaweedfs_endpoint("http://seaweedfs:8333"));
+        assert!(is_bundled_seaweedfs_endpoint("http://seaweedfs.internal:8333/bucket"));
+        assert!(!is_bundled_seaweedfs_endpoint("https://seaweedfs.example.com"));
+
+        // SeaweedFS init script rejects shell metacharacters in bucket names or whitespace in credentials
+        let mut eff = BTreeMap::new();
+        eff.insert("FLUXER_S3_BUCKET_CDN".into(), "bad;rm -rf /".into());
+        assert!(seaweedfs_init_script(&eff).is_err());
+        let mut bad_cred = BTreeMap::new();
+        bad_cred.insert("FLUXER_S3_ACCESS_KEY".into(), "ak with space".into());
+        assert!(seaweedfs_init_script(&bad_cred).is_err());
+
+        // Upgrade path fails closed on unparseable versions
+        let rel = FluxerRelease {
+            version: "2026.1201.10000".into(),
+            min_from: "2026.1120.0".into(),
+            schema_changed: true,
+            compose_url: String::new(),
+        };
+        assert!(check_upgrade_path("not-a-version", &rel).is_err());
+
+        // Extra unverified file inside backup archive is rejected when verify=true
+        let dir = std::env::temp_dir().join(format!("latrix-fx-extra-{}", util::random_id(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good_st = sample_r2_stack();
+        let archive = dir.join("good.tar.zst");
+        write_rexctl_backup(&archive, &good_st, None, &BTreeMap::new(), "full", "test").unwrap();
+        let ext = extract_and_verify_backup(&archive, true).unwrap();
+        std::fs::write(ext.work_dir.join("files").join("injected.txt"), "evil").unwrap();
+        let bad = dir.join("extra.tar.zst");
+        {
+            let f = std::fs::File::create(&bad).unwrap();
+            let enc = zstd::stream::write::Encoder::new(f, 1).unwrap();
+            let mut tar = tar::Builder::new(enc);
+            tar.append_dir_all(".", &ext.work_dir).unwrap();
+            tar.into_inner().unwrap().finish().unwrap();
+        }
+        assert!(extract_and_verify_backup(&bad, true).is_err());
+        ext.cleanup();
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

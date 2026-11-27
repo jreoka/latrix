@@ -28,6 +28,8 @@ pub struct ClusterState {
     pub acme_challenges: BTreeMap<String, String>,
     #[serde(default)]
     pub acme_account: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acme_staging_account: Option<String>,
     #[serde(default)]
     pub settings: Settings,
     /// Volume directories to delete everywhere (destroyed with --purge-volumes).
@@ -89,6 +91,8 @@ pub struct FluxerStack {
     pub secrets: BTreeMap<String, String>,
     #[serde(default)]
     pub caddyfile: String,
+    #[serde(default)]
+    pub caddyfile_custom: bool,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub caddy_dropins: BTreeMap<String, String>,
     #[serde(default)]
@@ -343,6 +347,9 @@ pub struct Cert {
     /// When no app used this domain any more (0 = in use). Deleted 7 days later.
     #[serde(default)]
     pub unused_since: u64,
+    /// True if issued against Let's Encrypt staging rather than production.
+    #[serde(default)]
+    pub staging: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -525,6 +532,9 @@ pub struct InstanceReport {
     /// When a previously healthy instance started failing its checks (0 = healthy / never was).
     #[serde(default)]
     pub unhealthy_since: u64,
+    /// Seconds the previously healthy instance has been failing (clock-skew free).
+    #[serde(default)]
+    pub unhealthy_for: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -578,6 +588,9 @@ pub struct NodeReport {
     /// False when this machine's Docker daemon is not answering.
     #[serde(default = "yes")]
     pub docker_ok: bool,
+    /// Volume IDs present on this machine (as replica) with their local mtime/size marker (>0 = has data).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub replica_volumes: BTreeMap<String, u64>,
 }
 
 // ---------------------------------------------------------------------------

@@ -90,7 +90,7 @@ async fn wait_pg_ready(c: &Client, machine: u32, pg_app: &str) -> Result<()> {
             c,
             machine,
             pg_app,
-            r#"pg_isready -U "$POSTGRES_USER" -d "$POSTGRES_DB""#,
+            r#"pg_isready -h 127.0.0.1 -U "${POSTGRES_USER:-fluxer}" -d "${POSTGRES_DB:-fluxer}""#,
             None,
             None,
         )
@@ -103,6 +103,27 @@ async fn wait_pg_ready(c: &Client, machine: u32, pg_app: &str) -> Result<()> {
             bail!("{pg_app} did not pass pg_isready within 2 minutes");
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+async fn wait_app_stopped(c: &Client, name: &str) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        let v: AppView = c.get(&format!("/v1/apps/{name}")).await?;
+        if v.instances.is_empty() {
+            return Ok(());
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            bail!("timed out waiting for existing instances of {name} to stop before volume upload");
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+struct RemoveFileGuard(PathBuf);
+impl Drop for RemoveFileGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -151,9 +172,11 @@ async fn deploy_service(
 
         // 3. Upload backed-up volume data onto the primary machine
         if let (Some(src_dir), Some((_, vol_name))) = (volume_src_dir, &spec.backup_volume) {
+            wait_app_stopped(c, name).await?;
             let v: AppView = c.get(&format!("/v1/apps/{name}")).await?;
             if let Some(vol) = v.volumes.iter().find(|x| &x.volume.name == vol_name) {
                 let tgz = work_dir.join(format!("upload-{name}-{vol_name}.tar.gz"));
+                let _rm = RemoveFileGuard(tgz.clone());
                 let sz = fluxer::pack_dir_targz(src_dir, &tgz)?;
                 println!(
                     "    uploading volume {vol_name} ({}) → {}",
@@ -169,7 +192,6 @@ async fn deploy_service(
                     &tgz,
                 )
                 .await?;
-                let _ = std::fs::remove_file(&tgz);
             }
         }
     }
@@ -328,6 +350,9 @@ async fn deploy_backup_inner(
         );
         match fluxer::resolve_release(&http, target).await {
             Ok(rel) => {
+                if opts.release.is_some() {
+                    fluxer::check_upgrade_path(&ext.release(), &rel)?;
+                }
                 if stack.release.is_empty() || opts.release.is_some() {
                     stack.release = rel.version.clone();
                 }
@@ -341,10 +366,16 @@ async fn deploy_backup_inner(
                             if ext.caddyfile.is_none() {
                                 if let Some(cf) = b.caddyfile {
                                     stack.caddyfile = cf;
+                                    stack.caddyfile_custom = false;
                                 }
                             }
                         }
-                        Err(e) => println!("    ! could not download compose bundle (falling back to defaults): {e:#}"),
+                        Err(e) => {
+                            if opts.release.is_some() {
+                                return Err(e).context("downloading compose bundle for requested --release");
+                            }
+                            println!("    ! could not download compose bundle (falling back to defaults): {e:#}");
+                        }
                     }
                 }
             }
@@ -369,10 +400,23 @@ async fn deploy_backup_inner(
         if stack.release.is_empty() { "(default)" } else { &stack.release }
     );
     println!("  storage:      {}", fluxer::storage_summary(&stack));
-    println!(
-        "  voice:        {}",
-        if stack.bundled_voice { "bundled LiveKit (TCP 7881, UDP 7882)" } else { "external" }
-    );
+    let voice_desc = if let Some(lk) = specs.iter().find(|s| s.service == "livekit") {
+        let ports: Vec<String> = lk
+            .config
+            .ports
+            .iter()
+            .filter(|p| p.public)
+            .map(|p| format!("{} {}", p.protocol.to_ascii_uppercase(), p.public_port.unwrap_or(p.port)))
+            .collect();
+        if ports.is_empty() {
+            "bundled LiveKit".into()
+        } else {
+            format!("bundled LiveKit ({})", ports.join(", "))
+        }
+    } else {
+        "external".into()
+    };
+    println!("  voice:        {voice_desc}");
     println!(
         "  kv / rust:    {} / {}",
         if stack.kv_postgres { "postgres" } else { "valkey" },
@@ -423,6 +467,19 @@ async fn deploy_backup_inner(
         }
         println!("{} Replacing existing Fluxer stack '{}'...", deploy::arrow(), existing.project);
         destroy_apps(&c, &existing, true).await?;
+        // Wait briefly for stopped containers and purged volumes to drain before recreating.
+        let wait_start = Instant::now();
+        while wait_start.elapsed() < Duration::from_secs(60) {
+            let Ok(st) = c.get::<StatusView>("/v1/status").await else { break };
+            let still_running = st.apps.iter().any(|a| {
+                a.config.as_ref().and_then(|c| c.group.as_deref()) == Some(existing.project.as_str())
+                    && !a.instances.is_empty()
+            });
+            if !still_running {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
     }
 
     let desc = format!(
@@ -465,7 +522,7 @@ async fn deploy_backup_inner(
                         &c,
                         m,
                         &spec.config.app,
-                        r#"exec pg_restore -U "$POSTGRES_USER" -d "$POSTGRES_DB" --exit-on-error --single-transaction"#,
+                        r#"PGPASSWORD="${POSTGRES_PASSWORD:-}" exec pg_restore -h 127.0.0.1 -U "${POSTGRES_USER:-fluxer}" -d "${POSTGRES_DB:-fluxer}" --no-owner --no-privileges --exit-on-error --single-transaction"#,
                         Some(dump),
                         None,
                     )
@@ -480,7 +537,7 @@ async fn deploy_backup_inner(
                 let m = find_running_machine(&c, &spec.config.app).await?;
                 println!("    initializing SeaweedFS buckets and S3 credentials...");
                 let eff = fluxer::effective_env(&stack);
-                let script = fluxer::seaweedfs_init_script(&eff);
+                let script = fluxer::seaweedfs_init_script(&eff)?;
                 exec_in_app(&c, m, &spec.config.app, &script, None, None)
                     .await
                     .context("seaweedfs-init failed")?;
@@ -723,41 +780,39 @@ async fn backup_stack_inner(
 ) -> Result<()> {
     println!("{} Backing up Fluxer '{}' ({})", deploy::arrow(), stack.project, stack.domain);
 
-    // 1. Dump Postgres via pg_dump --format=custom
+    // 1. Dump Postgres via pg_dump --format=custom (required when postgres is part of the stack).
     let pg_app = format!("{}-postgres", stack.project);
     let dump_file = work.join("fluxer.dump");
-    let pg_dump = if let Ok(m) = find_running_machine(c, &pg_app).await {
-        println!("    dumping PostgreSQL database from {pg_app}...");
-        exec_in_app(
-            c,
-            m,
-            &pg_app,
-            r#"PGPASSWORD="${POSTGRES_PASSWORD:-}" exec pg_dump -U "${POSTGRES_USER:-fluxer}" -d "${POSTGRES_DB:-fluxer}" --format=custom"#,
-            None,
-            Some(&dump_file),
-        )
+    let m = find_running_machine(c, &pg_app)
         .await
-        .context("pg_dump failed")?;
-        let sz = std::fs::metadata(&dump_file)?.len();
-        if sz == 0 {
-            bail!(
-                "pg_dump produced an empty file (if the cluster agent is older than this CLI, upgrade the cluster agents with `latrix update`)"
-            );
-        }
-        let mut magic = [0u8; 5];
-        use std::io::Read;
-        let n = std::fs::File::open(&dump_file)?.read(&mut magic)?;
-        if n < 5 || &magic != b"PGDMP" {
-            bail!(
-                "pg_dump output ({sz} bytes) is not a valid PostgreSQL custom-format dump (missing PGDMP header)"
-            );
-        }
-        println!("    database dump: {}", mb(sz));
-        Some(dump_file)
-    } else {
-        println!("    ! {pg_app} is not running; skipping database dump");
-        None
-    };
+        .with_context(|| format!("{pg_app} is not running or unreachable; refusing to create a backup without the PostgreSQL database"))?;
+    println!("    dumping PostgreSQL database from {pg_app}...");
+    exec_in_app(
+        c,
+        m,
+        &pg_app,
+        r#"PGPASSWORD="${POSTGRES_PASSWORD:-}" exec pg_dump -h 127.0.0.1 -U "${POSTGRES_USER:-fluxer}" -d "${POSTGRES_DB:-fluxer}" --format=custom"#,
+        None,
+        Some(&dump_file),
+    )
+    .await
+    .context("pg_dump failed")?;
+    let sz = std::fs::metadata(&dump_file)?.len();
+    if sz == 0 {
+        bail!(
+            "pg_dump produced an empty file (if the cluster agent is older than this CLI, upgrade the cluster agents with `latrix update`)"
+        );
+    }
+    let mut magic = [0u8; 5];
+    use std::io::Read;
+    let n = std::fs::File::open(&dump_file)?.read(&mut magic)?;
+    if n < 5 || &magic != b"PGDMP" {
+        bail!(
+            "pg_dump output ({sz} bytes) is not a valid PostgreSQL custom-format dump (missing PGDMP header)"
+        );
+    }
+    println!("    database dump: {}", mb(sz));
+    let pg_dump = Some(dump_file);
 
     // 2. Download stateful non-Postgres volumes
     let mut vol_dirs: BTreeMap<String, PathBuf> = BTreeMap::new();
@@ -771,9 +826,14 @@ async fn backup_stack_inner(
         if *svc == "seaweedfs" && (no_uploads || stack.external_object_store) {
             continue;
         }
-        let app_name = format!("{}-{svc}", stack.project);
-        let Ok(v) = c.get::<AppView>(&format!("/v1/apps/{app_name}")).await else {
+        if *svc == "valkey" && stack.kv_postgres {
             continue;
+        }
+        let app_name = format!("{}-{svc}", stack.project);
+        let v: AppView = match c.get::<AppView>(&format!("/v1/apps/{app_name}")).await {
+            Ok(v) => v,
+            Err(e) if e.to_string().contains("404") => continue,
+            Err(e) => return Err(e).with_context(|| format!("inspecting {app_name} for backup")),
         };
         let Some(vol) = v.volumes.iter().find(|x| x.volume.name == *vol_name) else {
             continue;
@@ -795,7 +855,9 @@ async fn backup_stack_inner(
     }
 
     let dir = out_dir.unwrap_or_else(backup::default_dir);
-    let safe_dom = stack.domain.replace(['/', '\\', ':', '*'], "_");
+    let safe_dom = stack
+        .domain
+        .replace(['/', '\\', ':', '*', '?', '"', '<', '>', '|'], "_");
     let out = dir.join(format!(
         "fluxer-{safe_dom}-{}.tar.zst",
         backup::stamp(util::now())
@@ -836,7 +898,7 @@ pub async fn logs(
             };
             vec![app]
         }
-        None => ["edge", "api", "gateway", "worker", "media-proxy", "livekit"]
+        None => ["edge", "api", "gateway", "worker", "rust", "media-proxy", "livekit"]
             .iter()
             .filter_map(|s| v.services.iter().find(|x| x.service == *s).map(|x| x.app.clone()))
             .collect(),
@@ -851,7 +913,7 @@ pub async fn logs(
         let Ok(av) = c.get::<AppView>(&format!("/v1/apps/{app}")).await else {
             continue;
         };
-        for inst in &av.instances {
+        for inst in av.instances.iter().filter(|i| !i.instance.stopping) {
             let path = format!(
                 "/v1/m/{}/logs?instance={}&tail={tail}&follow={follow}",
                 inst.instance.machine, inst.instance.id
@@ -864,21 +926,35 @@ pub async fn logs(
             }
             let short = app.strip_prefix(&format!("{}-", v.project)).unwrap_or(app);
             let prefix = format!("\x1b[{}m{short}@{}\x1b[0m", colors[n % colors.len()], inst.machine_name);
-            streams.push(resp.bytes_stream().map(move |b| (prefix.clone(), b)).boxed());
+            let key = inst.instance.id.clone();
+            streams.push(resp.bytes_stream().map(move |b| (key.clone(), prefix.clone(), b)).boxed());
         }
     }
     if streams.is_empty() {
         bail!("no running Fluxer instances to stream logs from");
     }
     let mut all = futures::stream::select_all(streams);
-    let mut bufs: std::collections::HashMap<String, String> = Default::default();
-    while let Some((prefix, chunk)) = all.next().await {
+    let mut bufs: std::collections::HashMap<String, (String, Vec<u8>)> = Default::default();
+    const MAX_LINE_BYTES: usize = 64 * 1024;
+    while let Some((key, prefix, chunk)) = all.next().await {
         let Ok(chunk) = chunk else { continue };
-        let buf = bufs.entry(prefix.clone()).or_default();
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(idx) = buf.find('\n') {
-            let line: String = buf.drain(..=idx).collect();
-            println!("{prefix} {}", line.trim_end());
+        let (_, buf) = bufs.entry(key).or_insert_with(|| (prefix.clone(), Vec::new()));
+        buf.extend_from_slice(&chunk);
+        while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+            let raw: Vec<u8> = buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&raw);
+            println!("{prefix} {}", line.trim_end_matches(['\r', '\n']));
+        }
+        if buf.len() > MAX_LINE_BYTES {
+            let raw: Vec<u8> = std::mem::take(buf);
+            let line = String::from_utf8_lossy(&raw);
+            println!("{prefix} {}", line.trim_end_matches(['\r', '\n']));
+        }
+    }
+    for (_, (prefix, buf)) in bufs {
+        if !buf.is_empty() {
+            let line = String::from_utf8_lossy(&buf);
+            println!("{prefix} {}", line.trim_end_matches(['\r', '\n']));
         }
     }
     Ok(())
@@ -899,8 +975,16 @@ pub async fn restart(cfg: &CliConfig, cl: Option<&str>, service: Option<String>)
             };
             vec![app]
         }
-        None => v.services.iter().map(|s| s.app.clone()).collect(),
+        None => v
+            .services
+            .iter()
+            .filter(|s| s.status != "missing")
+            .map(|s| s.app.clone())
+            .collect(),
     };
+    if targets.is_empty() {
+        bail!("no deployed Fluxer services found to restart");
+    }
     for app in targets {
         println!("{} Restarting {app}...", deploy::arrow());
         let r: DeployResponse = c
@@ -962,12 +1046,24 @@ pub async fn config_cmd(cfg: &CliConfig, cl: Option<&str>, action: Option<Rexctl
 }
 
 async fn destroy_apps(c: &Client, v: &RexctlStatusView, purge: bool) -> Result<()> {
-    for svc in v.services.iter().rev() {
-        if c.get::<AppView>(&format!("/v1/apps/{}", svc.app)).await.is_ok() {
-            let _: bool = c
-                .delete(&format!("/v1/apps/{}?purge_volumes={purge}", svc.app))
-                .await?;
-            println!("    destroyed {}", svc.app);
+    let mut apps: Vec<String> = v.services.iter().rev().map(|s| s.app.clone()).collect();
+    if let Ok(st) = c.get::<StatusView>("/v1/status").await {
+        for a in st.apps {
+            if a.config.as_ref().and_then(|cfg| cfg.group.as_deref()) == Some(v.project.as_str())
+                && !apps.contains(&a.name)
+            {
+                apps.push(a.name);
+            }
+        }
+    }
+    for app in apps {
+        match c
+            .delete::<bool>(&format!("/v1/apps/{app}?purge_volumes={purge}"))
+            .await
+        {
+            Ok(_) => println!("    destroyed {app}"),
+            Err(e) if e.to_string().contains("404") || e.to_string().contains("not found") => {}
+            Err(e) => return Err(e).with_context(|| format!("destroying {app}")),
         }
     }
     let _: bool = c.delete("/v1/rexctl").await?;

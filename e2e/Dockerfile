@@ -6,6 +6,7 @@ RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y -q --no-
     && rm -rf /var/lib/apt/lists/*
 COPY systemctl /usr/local/bin/systemctl
 COPY entry.sh /entry.sh
-RUN chmod +x /usr/local/bin/systemctl /entry.sh && mkdir -p /etc/docker \
-    && echo '{"storage-driver":"vfs","insecure-registries":["10.77.0.0/16"],"live-restore":true}' > /etc/docker/daemon.json
+RUN sed -i 's/\r$//' /usr/local/bin/systemctl /entry.sh \
+    && chmod +x /usr/local/bin/systemctl /entry.sh && mkdir -p /etc/docker \
+    && echo '{"storage-driver":"vfs","insecure-registries":["10.77.0.0/16","127.0.0.0/8"],"live-restore":true}' > /etc/docker/daemon.json
 CMD ["/entry.sh"]

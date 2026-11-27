@@ -75,11 +75,23 @@ fn cpu_times() -> Option<(u64, u64)> {
 
 async fn disk(path: &std::path::Path) -> (f64, f64) {
     let p = if path.exists() { path.display().to_string() } else { "/".into() };
-    let Ok(out) = super::cmd("df", &["-Pk", &p]).await else { return (0.0, 0.0) };
+    let Ok(out) = super::cmd_timeout("df", &["-Pk", "--", &p], Duration::from_secs(5)).await else {
+        return (0.0, 0.0);
+    };
     let Some(line) = out.lines().nth(1) else { return (0.0, 0.0) };
+    // Parse numeric columns from the right (Filesystem column may contain spaces).
+    // POSIX `df -Pk`: <fs> <1024-blocks> <Used> <Available> <Capacity> <Mounted on>
     let cols: Vec<&str> = line.split_whitespace().collect();
-    let kb = |i: usize| cols.get(i).and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
-    (kb(1) / 1048576.0, kb(2) / 1048576.0)
+    if cols.len() < 6 {
+        return (0.0, 0.0);
+    }
+    // Find the Capacity% column (ends with '%') from the right; blocks/used precede it by 3 and 2.
+    let cap_idx = match cols.iter().rposition(|c| c.ends_with('%')) {
+        Some(idx) if idx >= 3 => idx,
+        _ => return (0.0, 0.0),
+    };
+    let kb = |i: usize| cols.get(i).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
+    (kb(cap_idx - 3) / 1048576.0, kb(cap_idx - 2) / 1048576.0)
 }
 
 /// Re-measure disk usage right away (after a cleanup).

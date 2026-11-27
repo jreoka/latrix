@@ -1,11 +1,21 @@
 # PostgreSQL with a replicated volume. Other apps connect to
 # postgres://postgres:<password>@postgres.internal:5432/postgres
 #
+# First deploy:
+#   latrix deploy --detach
 #   latrix secrets set postgres POSTGRES_PASSWORD=change-me
+#
+# For consistent backups, pass --stop:
+#   latrix backup postgres --stop
 app = "postgres"
 
 [build]
 image = "postgres:16"
+
+[env]
+# Keep PGDATA in a subdirectory of the mounted volume so initdb works cleanly
+# even if the volume root contains filesystem metadata (e.g. lost+found).
+PGDATA = "/var/lib/postgresql/data/pgdata"
 
 # latrix's own machines discover EXPOSEd ports automatically; declaring it
 # also makes it reachable on Kubernetes targets.

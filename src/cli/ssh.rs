@@ -1,8 +1,9 @@
 //! Thin wrapper around the system `ssh` / `scp` so your existing keys,
 //! agent and ~/.ssh/config just work.
 
-use crate::util::shell_quote;
+use crate::util::{shell_quote, validate_ssh_target};
 use anyhow::{bail, Context, Result};
+use std::io::IsTerminal;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -24,8 +25,17 @@ impl Ssh {
 
     /// Forget any old host key for this host (cloud IPs get reused by new servers).
     pub fn forget_host_key(&self) {
+        let host = self.host();
+        if host.is_empty() || host.starts_with('-') || host.chars().any(|c| c.is_whitespace() || c.is_control()) {
+            return;
+        }
+        let host_entry = if self.port != 22 {
+            format!("[{host}]:{}", self.port)
+        } else {
+            host.to_string()
+        };
         let mut cmd = std::process::Command::new("ssh-keygen");
-        cmd.arg("-R").arg(self.host());
+        cmd.arg("-R").arg(&host_entry);
         if let Some(f) = &self.known_hosts {
             cmd.arg("-f").arg(f);
         }
@@ -62,11 +72,13 @@ impl Ssh {
         a
     }
 
-    fn ssh_args(&self) -> Vec<String> {
+    fn ssh_args(&self) -> Result<Vec<String>> {
+        validate_ssh_target(&self.target)?;
         let mut a = vec!["-p".to_string(), self.port.to_string()];
         a.extend(self.common_args());
+        a.push("--".into());
         a.push(self.target.clone());
-        a
+        Ok(a)
     }
 
     /// Wrap a command so it runs as root.
@@ -83,21 +95,33 @@ impl Ssh {
     }
 
     pub async fn run_input(&self, cmd: &str, input: Option<&[u8]>) -> Result<String> {
-        let mut args = self.ssh_args();
+        let mut args = self.ssh_args()?;
         args.push(self.root_cmd(cmd));
         let mut child = tokio::process::Command::new("ssh")
             .args(&args)
             .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .context("could not run `ssh` — is OpenSSH installed?")?;
-        if let Some(data) = input {
+        let writer = input.map(|data| {
             let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(data).await?;
-            drop(stdin);
-        }
+            let owned = data.to_vec();
+            tokio::spawn(async move {
+                let res = stdin.write_all(&owned).await;
+                let _ = stdin.shutdown().await;
+                res
+            })
+        });
         let out = child.wait_with_output().await?;
+        if let Some(w) = writer {
+            if let Ok(Err(e)) = w.await {
+                if e.kind() != std::io::ErrorKind::BrokenPipe && out.status.success() {
+                    return Err(e.into());
+                }
+            }
+        }
         if !out.status.success() {
             let err = String::from_utf8_lossy(&out.stderr);
             let hint = if err.contains("sudo") && err.contains("password") {
@@ -114,17 +138,22 @@ impl Ssh {
 
     /// Run a script (stdin) and print its output indented as it arrives.
     pub async fn stream_script(&self, script: &str, prefix: &str) -> Result<()> {
-        let mut args = self.ssh_args();
+        let mut args = self.ssh_args()?;
         args.push(self.root_cmd("bash -s"));
         let mut child = tokio::process::Command::new("ssh")
             .args(&args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()?;
         let mut stdin = child.stdin.take().unwrap();
-        stdin.write_all(script.as_bytes()).await?;
-        drop(stdin);
+        let data = script.as_bytes().to_vec();
+        let writer = tokio::spawn(async move {
+            let res = stdin.write_all(&data).await;
+            let _ = stdin.shutdown().await;
+            res
+        });
         let out = child.stdout.take().unwrap();
         let err = child.stderr.take().unwrap();
         let p1 = prefix.to_string();
@@ -151,6 +180,7 @@ impl Ssh {
             tail
         });
         let status = child.wait().await?;
+        let _ = writer.await;
         let _ = a.await;
         let tail = b.await.unwrap_or_default();
         if !status.success() {
@@ -160,13 +190,21 @@ impl Ssh {
     }
 
     pub async fn upload(&self, local: &Path, remote: &str) -> Result<()> {
+        validate_ssh_target(&self.target)?;
+        let scp_target = match self.target.split_once('@') {
+            Some((u, h)) if h.contains(':') && !h.starts_with('[') => format!("{u}@[{h}]:{remote}"),
+            None if self.target.contains(':') && !self.target.starts_with('[') => format!("[{}]:{remote}", self.target),
+            _ => format!("{}:{remote}", self.target),
+        };
         let mut args = vec!["-q".to_string(), "-P".into(), self.port.to_string()];
         args.extend(self.common_args());
+        args.push("--".into());
         args.push(local.display().to_string());
-        args.push(format!("{}:{remote}", self.target));
+        args.push(scp_target);
         let out = tokio::process::Command::new("scp")
             .args(&args)
             .stdin(Stdio::null())
+            .kill_on_drop(true)
             .output()
             .await
             .context("could not run `scp`")?;
@@ -178,8 +216,10 @@ impl Ssh {
 
     /// Interactive session (inherits the terminal, prompts allowed).
     pub fn interactive(&self, cmd: Option<&str>) -> Result<std::process::ExitStatus> {
+        validate_ssh_target(&self.target)?;
+        let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
         let mut args = vec![
-            "-t".to_string(),
+            if tty { "-t" } else { "-T" }.to_string(),
             "-p".into(),
             self.port.to_string(),
             "-o".into(),
@@ -189,6 +229,7 @@ impl Ssh {
             args.push("-i".into());
             args.push(k.clone());
         }
+        args.push("--".into());
         args.push(self.target.clone());
         if let Some(c) = cmd {
             args.push(self.root_cmd(c));

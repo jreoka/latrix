@@ -5,9 +5,10 @@
 //! Each app also gets a virtual IP (10.78.x.y) bound on every machine; the
 //! local proxy listens there so `<app>.internal` works from any container.
 
-use super::{cmd, set_private, Agent};
-use crate::util::{OVERLAY_PREFIX, WG_PORT};
-use anyhow::{Context, Result};
+use super::{cmd, Agent};
+use crate::util::{self, OVERLAY_PREFIX, WG_PORT};
+use anyhow::{bail, Context, Result};
+use base64::Engine;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::Arc;
@@ -23,24 +24,52 @@ pub fn overlay_ip(id: u32) -> String {
     format!("{OVERLAY_PREFIX}.{}.{}", (n / 254) % 255, n % 254 + 1)
 }
 
+/// Validate a WireGuard Curve25519 public key (44-char base64 encoding of 32 bytes).
+pub fn validate_wg_pubkey(key: &str) -> Result<()> {
+    let k = key.trim();
+    if k.len() != 44 || k.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        bail!("invalid WireGuard public key");
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(k)
+        .context("invalid base64 in WireGuard public key")?;
+    if decoded.len() != 32 {
+        bail!("invalid WireGuard public key length");
+    }
+    Ok(())
+}
+
 /// Returns (private key, public key), generating the key on first use.
 pub async fn keypair(data: &Path) -> Result<(String, String)> {
-    std::fs::create_dir_all(data)?;
+    util::create_private_dir_all(data)?;
     let path = data.join("wg.key");
     if !path.exists() {
-        let key = cmd("wg", &["genkey"]).await.context("generating a WireGuard key (is wireguard-tools installed?)")?;
-        std::fs::write(&path, key.trim())?;
-        set_private(&path);
+        let key = cmd("wg", &["genkey"])
+            .await
+            .context("generating a WireGuard key (is wireguard-tools installed?)")?;
+        util::write_atomic_private(&path, key.trim().as_bytes())?;
     }
     let private = std::fs::read_to_string(&path)?.trim().to_string();
     let mut child = tokio::process::Command::new("wg")
         .arg("pubkey")
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
         .spawn()?;
-    child.stdin.take().unwrap().write_all(private.as_bytes()).await?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(private.as_bytes()).await;
+    }
     let out = child.wait_with_output().await?;
-    Ok((private, String::from_utf8_lossy(&out.stdout).trim().to_string()))
+    if !out.status.success() {
+        bail!(
+            "wg pubkey failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    let pubkey = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    validate_wg_pubkey(&pubkey).context("wg pubkey returned invalid key")?;
+    Ok((private, pubkey))
 }
 
 pub async fn sync(agent: &Arc<Agent>) -> Result<()> {
@@ -55,28 +84,34 @@ pub async fn sync(agent: &Arc<Agent>) -> Result<()> {
         if m.id == agent.me.machine_id || m.wg_pubkey.is_empty() {
             continue;
         }
+        if validate_wg_pubkey(&m.wg_pubkey).is_err()
+            || m.public_ip.parse::<std::net::IpAddr>().is_err()
+            || m.overlay_ip.parse::<std::net::Ipv4Addr>().is_err()
+        {
+            warn!("mesh: skipping peer '{}' with invalid endpoint/key metadata", m.name);
+            continue;
+        }
+        let safe_comment: String = m
+            .name
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect();
         let endpoint = if m.public_ip.contains(':') {
             format!("[{}]:{WG_PORT}", m.public_ip)
         } else {
             format!("{}:{WG_PORT}", m.public_ip)
         };
         conf.push_str(&format!(
-            "\n[Peer]\n# {}\nPublicKey = {}\nEndpoint = {endpoint}\nAllowedIPs = {}/32\nPersistentKeepalive = 25\n",
-            m.name, m.wg_pubkey, m.overlay_ip
+            "\n[Peer]\n# {safe_comment}\nPublicKey = {}\nEndpoint = {endpoint}\nAllowedIPs = {}/32\nPersistentKeepalive = 25\n",
+            m.wg_pubkey.trim(), m.overlay_ip
         ));
     }
     // Under /etc/wireguard: Ubuntu's AppArmor profile for `wg` (25.04+)
     // only lets it read files there.
     let dir = std::path::Path::new("/etc/wireguard");
-    std::fs::create_dir_all(dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
-    }
+    util::create_private_dir_all(dir)?;
     let path = dir.join(format!("{WG_IFACE}.conf"));
-    std::fs::write(&path, conf)?;
-    set_private(&path);
+    util::write_atomic_private(&path, conf.as_bytes())?;
     let _ = std::fs::remove_file(agent.data.join("wg.conf")); // old location
     cmd("wg", &["syncconf", WG_IFACE, &path.display().to_string()]).await?;
     let addrs = cmd("ip", &["-4", "-o", "addr", "show", "dev", WG_IFACE]).await.unwrap_or_default();
@@ -120,22 +155,42 @@ pub async fn sync(agent: &Arc<Agent>) -> Result<()> {
 /// iptables isn't available.
 async fn harden(agent: &Agent) {
     let me = format!("{}/32", agent.me.overlay_ip);
+    let overlay_cidr = format!("{OVERLAY_PREFIX}.0.0/16");
     let ports = format!("{},{},{}", crate::util::API_PORT, crate::util::REGISTRY_PORT, crate::util::RSYNC_PORT);
+    if cmd("iptables", &["-L", "LATRIX-GUARD", "-n"]).await.is_err()
+        && cmd("iptables", &["-N", "LATRIX-GUARD"]).await.is_err()
+    {
+        return;
+    }
+    // Always verify chain contents (firewalls like UFW/firewalld can flush custom chains).
+    let guard_return = ["-i", WG_IFACE, "-j", "RETURN"];
+    let guard_reject = ["-j", "REJECT"];
+    if cmd("iptables", &["-C", "LATRIX-GUARD", "-i", WG_IFACE, "-j", "RETURN"])
+        .await
+        .is_err()
+    {
+        if let Err(e) = cmd("iptables", &["-I", "LATRIX-GUARD", "1", "-i", WG_IFACE, "-j", "RETURN"]).await {
+            warn!("firewall rule on LATRIX-GUARD not applied: {e}");
+        }
+    }
+    if cmd("iptables", &["-C", "LATRIX-GUARD", "-j", "REJECT"])
+        .await
+        .is_err()
+    {
+        if let Err(e) = cmd("iptables", &["-A", "LATRIX-GUARD", "-j", "REJECT"]).await {
+            warn!("firewall rule on LATRIX-GUARD not applied: {e}");
+        }
+    }
+    let _ = (guard_return, guard_reject);
+
     let rules: Vec<(&str, Vec<&str>)> = vec![
         // Local: only the host itself (lo) and other machines (latrix0) may connect.
         ("INPUT", vec!["-d", &me, "-p", "tcp", "-m", "multiport", "--dports", &ports, "!", "-i", "lo", "-j", "LATRIX-GUARD"]),
-        // Forwarded: containers may not talk to other machines' mesh IPs at all.
-        // (NEW only: replies to connections other machines open to local
-        // containers must still flow.)
-        ("DOCKER-USER", vec!["-d", "10.77.0.0/16", "!", "-i", WG_IFACE, "-m", "conntrack", "--ctstate", "NEW", "-j", "REJECT"]),
+        // Forwarded: containers may not talk to mesh IPs (including pre-DNAT destination
+        // for Docker-published services like :7471 latrix-registry).
+        ("DOCKER-USER", vec!["-d", &overlay_cidr, "!", "-i", WG_IFACE, "-m", "conntrack", "--ctstate", "NEW", "-j", "REJECT"]),
+        ("DOCKER-USER", vec!["-m", "conntrack", "--ctorigdst", &overlay_cidr, "--ctstate", "NEW", "!", "-i", WG_IFACE, "-j", "REJECT"]),
     ];
-    if cmd("iptables", &["-L", "LATRIX-GUARD", "-n"]).await.is_err() {
-        if cmd("iptables", &["-N", "LATRIX-GUARD"]).await.is_err() {
-            return;
-        }
-        let _ = cmd("iptables", &["-A", "LATRIX-GUARD", "-i", WG_IFACE, "-j", "RETURN"]).await;
-        let _ = cmd("iptables", &["-A", "LATRIX-GUARD", "-j", "REJECT"]).await;
-    }
     for (chain, rule) in rules {
         let mut check = vec!["-C", chain];
         check.extend(rule.iter());
@@ -145,7 +200,7 @@ async fn harden(agent: &Agent) {
         let mut insert = vec!["-I", chain];
         insert.extend(rule.iter());
         if let Err(e) = cmd("iptables", &insert).await {
-            tracing::debug!("firewall rule on {chain} not applied: {e}");
+            warn!("firewall rule on {chain} not applied: {e}");
         }
     }
 }

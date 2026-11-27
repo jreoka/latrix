@@ -81,6 +81,17 @@ pub struct Agent {
     pub acme_wake: tokio::sync::Notify,
     /// Domains waiting for a certificate: domain -> (reason, next attempt).
     pub acme_pending: Mutex<std::collections::BTreeMap<String, (String, u64)>>,
+    /// Coalesces background state pulls triggered by `ping_loop`.
+    pub pull_in_flight: std::sync::atomic::AtomicBool,
+}
+
+/// Format an HTTP URL for a host/IP and port, bracketing IPv6 literals.
+pub fn host_port_url(ip: &str, port: u16, path_q: &str) -> String {
+    if ip.contains(':') && !ip.starts_with('[') {
+        format!("http://[{ip}]:{port}{path_q}")
+    } else {
+        format!("http://{ip}:{port}{path_q}")
+    }
 }
 
 impl Agent {
@@ -171,7 +182,7 @@ pub fn init_first(
     extra: (Option<String>, Option<ProviderRef>, Option<f64>),
     dev: bool,
 ) -> Result<()> {
-    std::fs::create_dir_all(data)?;
+    util::create_private_dir_all(data)?;
     // Re-running `machine add` on the first machine must not wipe the cluster.
     if let Ok(existing) = load_json::<NodeIdentity>(&data.join("node.json")) {
         if existing.token == token {
@@ -222,19 +233,16 @@ pub fn init_first(
         // Nothing to update on a laptop.
         state.settings.auto_updates = false;
     }
-    util::write_atomic(&data.join("node.json"), &serde_json::to_vec_pretty(&id)?)?;
-    util::write_atomic(&data.join("state.json"), &serde_json::to_vec_pretty(&state)?)?;
-    set_private(&data.join("node.json"));
+    util::write_atomic_private(&data.join("node.json"), &serde_json::to_vec_pretty(&id)?)?;
+    util::write_atomic_private(&data.join("state.json"), &serde_json::to_vec_pretty(&state)?)?;
     Ok(())
 }
 
 /// Writes identity + state received from the leader when joining.
 pub fn write_join(data: &Path, id: &NodeIdentity, state: &ClusterState) -> Result<()> {
-    std::fs::create_dir_all(data)?;
-    util::write_atomic(&data.join("node.json"), &serde_json::to_vec_pretty(id)?)?;
-    util::write_atomic(&data.join("state.json"), &serde_json::to_vec_pretty(state)?)?;
-    set_private(&data.join("node.json"));
-    set_private(&data.join("state.json"));
+    util::create_private_dir_all(data)?;
+    util::write_atomic_private(&data.join("node.json"), &serde_json::to_vec_pretty(id)?)?;
+    util::write_atomic_private(&data.join("state.json"), &serde_json::to_vec_pretty(state)?)?;
     Ok(())
 }
 
@@ -250,7 +258,7 @@ pub fn set_private(path: &Path) {
 
 pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
     let _ = rustls::crypto::ring::default_provider().install_default();
-    std::fs::create_dir_all(&data)?;
+    util::create_private_dir_all(&data)?;
 
     if dev && !data.join("node.json").exists() {
         let facts = metrics::local_facts().await;
@@ -269,7 +277,9 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
     let me: NodeIdentity = load_json(&data.join("node.json")).context(
         "this machine has not joined a cluster yet (run `latrix machine add` from your computer)",
     )?;
-    let state: ClusterState = load_json(&data.join("state.json")).unwrap_or_default();
+    let state: ClusterState = load_json(&data.join("state.json")).context(
+        "could not load cluster state (refusing to boot with empty state and stop running containers)",
+    )?;
     info!(
         "latrix agent {} starting: machine #{} ({}) in cluster '{}', state v{}",
         util::VERSION,
@@ -314,6 +324,7 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
         alert_queue: Mutex::new(vec![]),
         upgrade_now: tokio::sync::Notify::new(),
         acme_wake: tokio::sync::Notify::new(),
+        pull_in_flight: std::sync::atomic::AtomicBool::new(false),
     });
 
     if !dev {
@@ -362,7 +373,11 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
 
 fn spawn_api(agent: Arc<Agent>, ip: String) {
     tokio::spawn(async move {
-        let addr: SocketAddr = format!("{ip}:{}", util::API_PORT).parse().unwrap();
+        let Ok(parsed_ip) = ip.parse::<std::net::IpAddr>() else {
+            warn!("API: invalid bind IP '{ip}'");
+            return;
+        };
+        let addr = SocketAddr::new(parsed_ip, util::API_PORT);
         loop {
             match tokio::net::TcpListener::bind(addr).await {
                 Ok(listener) => {
@@ -407,6 +422,7 @@ pub async fn cmd(program: &str, args: &[&str]) -> Result<String> {
     let out = tokio::process::Command::new(program)
         .args(args)
         .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("running {program}"))?;
@@ -421,6 +437,33 @@ pub async fn cmd(program: &str, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
-pub async fn sh(script: &str) -> Result<String> {
-    cmd("sh", &["-c", script]).await
+/// Run a command with an explicit timeout, killing the child on timeout/drop.
+pub async fn cmd_timeout(program: &str, args: &[&str], timeout: Duration) -> Result<String> {
+    match tokio::time::timeout(timeout, cmd(program, args)).await {
+        Ok(res) => res,
+        Err(_) => anyhow::bail!("{program} timed out after {}s", timeout.as_secs()),
+    }
+}
+
+/// Run a command with a timeout without exposing full argv (e.g. secrets/env) in errors.
+pub async fn cmd_redacted(program: &str, args: &[&str], timeout: Duration) -> Result<String> {
+    let sub = args.first().copied().unwrap_or("");
+    let fut = async {
+        let out = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output()
+            .await
+            .with_context(|| format!("running {program} {sub}"))?;
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            anyhow::bail!("{program} {sub} failed: {err}");
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    };
+    match tokio::time::timeout(timeout, fut).await {
+        Ok(res) => res,
+        Err(_) => anyhow::bail!("{program} {sub} timed out after {}s", timeout.as_secs()),
+    }
 }

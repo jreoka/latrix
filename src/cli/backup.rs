@@ -18,9 +18,19 @@ use anyhow::{anyhow, bail, Context, Result};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::io::{Read, Write};
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
+
+const MAX_ARCHIVE_ENTRIES: usize = 1024;
+const MAX_ARCHIVE_BYTES: u64 = 50 * 1024 * 1024 * 1024; // 50 GiB
+
+struct TempDirGuard(PathBuf);
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
 
 pub const FORMAT: u32 = 1;
 
@@ -73,47 +83,188 @@ pub fn default_dir() -> PathBuf {
 }
 
 pub fn temp_dir(tag: &str) -> Result<PathBuf> {
-    let d = std::env::temp_dir().join(format!("latrix-{tag}-{}", util::random_id(6)));
-    std::fs::create_dir_all(&d)?;
+    let d = std::env::temp_dir().join(format!("latrix-{tag}-{}", util::random_id(8)));
+    util::create_private_dir_all(&d)?;
     Ok(d)
+}
+
+fn create_private_file(path: &Path) -> Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path).with_context(|| format!("creating {}", path.display()))
 }
 
 /// Write manifest + files into one tar file (readable only by you: it holds secrets).
 pub fn write_archive(out: &Path, manifest: &Manifest, files: &[(String, PathBuf)]) -> Result<()> {
-    if let Some(dir) = out.parent() {
+    if let Some(dir) = out.parent().filter(|p| !p.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir)?;
     }
-    let f = std::fs::File::create(out).with_context(|| format!("creating {}", out.display()))?;
-    crate::agent::set_private(out);
-    let mut tar = tar::Builder::new(f);
-    let json = serde_json::to_vec_pretty(manifest)?;
-    let mut h = tar::Header::new_gnu();
-    h.set_size(json.len() as u64);
-    h.set_mode(0o600);
-    h.set_mtime(manifest.created_at);
-    h.set_cksum();
-    tar.append_data(&mut h, "manifest.json", json.as_slice())?;
-    for (name, path) in files {
-        tar.append_path_with_name(path, name)?;
+    let tmp = out.with_extension(format!("tmp-{}", util::random_id(8)));
+    let res = (|| -> Result<()> {
+        let f = create_private_file(&tmp)?;
+        let mut tar = tar::Builder::new(f);
+        let json = serde_json::to_vec_pretty(manifest)?;
+        let mut h = tar::Header::new_gnu();
+        h.set_size(json.len() as u64);
+        h.set_mode(0o600);
+        h.set_mtime(manifest.created_at);
+        h.set_cksum();
+        tar.append_data(&mut h, "manifest.json", json.as_slice())?;
+        for (name, path) in files {
+            let mut src = std::fs::File::open(path)?;
+            let meta = src.metadata()?;
+            let mut fh = tar::Header::new_gnu();
+            fh.set_size(meta.len());
+            fh.set_mode(0o600);
+            fh.set_mtime(manifest.created_at);
+            fh.set_cksum();
+            tar.append_data(&mut fh, name, &mut src)?;
+        }
+        let mut inner = tar.into_inner()?;
+        inner.flush()?;
+        inner.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = res {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
     }
-    tar.into_inner()?.flush()?;
+    if let Err(e) = std::fs::rename(&tmp, out) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("moving backup archive into {}", out.display()));
+    }
+    crate::agent::set_private(out);
     Ok(())
+}
+
+fn validate_backup_rel_path(raw: &str) -> Result<PathBuf> {
+    if raw.contains('\0') {
+        bail!("unsafe NUL byte in backup path");
+    }
+    let norm = raw.replace('\\', "/");
+    let trimmed = norm.trim_start_matches("./");
+    let mut out = PathBuf::new();
+    for c in Path::new(trimmed).components() {
+        match c {
+            Component::Normal(part) => out.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                bail!("unsafe path in backup archive: '{raw}'");
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn is_allowed_backup_file(rel: &Path) -> bool {
+    let comps: Vec<String> = rel
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(p) => Some(p.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    match comps.as_slice() {
+        [a] if a == "manifest.json" || a == "image.tar.gz" => true,
+        [a, b] if a == "volumes" && b.ends_with(".tar.gz") && !b.starts_with('.') => true,
+        _ => false,
+    }
+}
+
+fn resolve_backup_member(dir: &Path, rel_raw: &str) -> Result<PathBuf> {
+    let rel = validate_backup_rel_path(rel_raw)?;
+    if !is_allowed_backup_file(&rel) {
+        bail!("disallowed member path '{rel_raw}' in backup manifest");
+    }
+    let full = dir.join(&rel);
+    let meta = std::fs::symlink_metadata(&full)
+        .with_context(|| format!("backup member '{rel_raw}' missing from archive"))?;
+    if !meta.file_type().is_file() {
+        bail!("backup member '{rel_raw}' is not a regular file");
+    }
+    let canon_dir = std::fs::canonicalize(dir)?;
+    let canon_file = std::fs::canonicalize(&full)?;
+    if !canon_file.starts_with(&canon_dir) {
+        bail!("backup member '{rel_raw}' escapes backup directory");
+    }
+    Ok(canon_file)
 }
 
 pub fn read_archive(path: &Path) -> Result<(Manifest, PathBuf)> {
     let dir = temp_dir("restore")?;
-    let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    tar::Archive::new(f).unpack(&dir).context("not a latrix backup file")?;
-    let m: Manifest = serde_json::from_slice(
-        &std::fs::read(dir.join("manifest.json")).context("backup has no manifest.json")?,
-    )?;
-    if m.format > FORMAT {
-        bail!("this backup was made by a newer latrix (format {}); upgrade latrix", m.format);
+    let res = (|| -> Result<Manifest> {
+        let f = std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+        let mut ar = tar::Archive::new(f);
+        let mut count = 0usize;
+        let mut total = 0u64;
+        for entry in ar.entries().context("not a latrix backup file")? {
+            count += 1;
+            if count > MAX_ARCHIVE_ENTRIES {
+                bail!("backup archive has too many entries");
+            }
+            let mut entry = entry?;
+            let etype = entry.header().entry_type();
+            let raw = entry.path()?.to_string_lossy().replace('\\', "/");
+            let rel = validate_backup_rel_path(&raw)?;
+            if rel.as_os_str().is_empty() {
+                if etype.is_dir() {
+                    continue;
+                }
+                bail!("empty path in backup archive");
+            }
+            let dest = dir.join(&rel);
+            if etype.is_dir() {
+                std::fs::create_dir_all(&dest)?;
+                continue;
+            }
+            if !etype.is_file() {
+                bail!("disallowed entry type {:?} in backup archive: '{raw}'", etype);
+            }
+            if !is_allowed_backup_file(&rel) {
+                bail!("unexpected file '{raw}' in backup archive");
+            }
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let mut out = std::fs::File::create(&dest)?;
+            crate::agent::set_private(&dest);
+            let mut buf = [0u8; 64 * 1024];
+            loop {
+                let n = entry.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                total = total.saturating_add(n as u64);
+                if total > MAX_ARCHIVE_BYTES {
+                    bail!("backup archive exceeds maximum allowed size");
+                }
+                out.write_all(&buf[..n])?;
+            }
+            out.flush()?;
+        }
+        let m: Manifest = serde_json::from_slice(
+            &std::fs::read(dir.join("manifest.json")).context("backup has no manifest.json")?,
+        )?;
+        if m.format > FORMAT {
+            bail!("this backup was made by a newer latrix (format {}); upgrade latrix", m.format);
+        }
+        Ok(m)
+    })();
+    match res {
+        Ok(m) => Ok((m, dir)),
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&dir);
+            Err(e)
+        }
     }
-    Ok((m, dir))
 }
 
-/// Stream a GET response to a file.
+/// Stream a GET response to a file (with a per-chunk stall timeout).
 pub async fn download(c: &Client, path: &str, dest: &Path) -> Result<u64> {
     let r = c.request(reqwest::Method::GET, path).send().await?;
     if !r.status().is_success() {
@@ -123,15 +274,28 @@ pub async fn download(c: &Client, path: &str, dest: &Path) -> Result<u64> {
         bail!("{status}: {msg}");
     }
     let mut f = std::fs::File::create(dest)?;
+    crate::agent::set_private(dest);
     let mut n = 0u64;
     let mut s = r.bytes_stream();
-    while let Some(chunk) = s.next().await {
+    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(120), s.next())
+        .await
+        .context("download timed out waiting for data")?
+    {
         let chunk = chunk?;
         n += chunk.len() as u64;
         f.write_all(&chunk)?;
     }
     f.flush()?;
     Ok(n)
+}
+
+fn verify_gzip_integrity(path: &Path) -> Result<()> {
+    let f = std::fs::File::open(path)?;
+    let mut dec = flate2::read::GzDecoder::new(f);
+    let mut sink = std::io::sink();
+    std::io::copy(&mut dec, &mut sink)
+        .with_context(|| format!("downloaded archive {} is corrupted or truncated", path.display()))?;
+    Ok(())
 }
 
 /// POST a file as the request body.
@@ -176,16 +340,37 @@ async fn scale_to(c: &Client, app: &str, count: u32) -> Result<()> {
     Ok(())
 }
 
+async fn restore_scale(c: &Client, app: &str, ex: &AppExport) -> Result<()> {
+    let req = if ex.config.scale.autoscale() {
+        ScaleRequest {
+            count: Some(ex.count),
+            min: ex.config.scale.min,
+            max: ex.config.scale.max,
+            ..Default::default()
+        }
+    } else {
+        ScaleRequest {
+            count: Some(ex.count),
+            ..Default::default()
+        }
+    };
+    let _: AppView = c.post(&format!("/v1/apps/{app}/scale"), &req).await?;
+    Ok(())
+}
+
 fn looks_like_database(image: &str) -> bool {
+    let lower = image.to_ascii_lowercase();
     ["postgres", "mysql", "mariadb", "mongo", "redis", "valkey", "clickhouse", "influx", "timescale"]
         .iter()
-        .any(|d| image.contains(d))
+        .any(|d| lower.contains(d))
 }
 
 /// Back up one app into `out_dir`. Returns the backup file path.
 pub async fn backup_app(c: &Client, app: &str, out_dir: &Path, with_image: bool, stop: bool) -> Result<PathBuf> {
+    util::validate_name("app", app)?;
     let ex: AppExport = c.get(&format!("/v1/apps/{app}/export")).await?;
-    let work = temp_dir("backup")?;
+    let work_guard = TempDirGuard(temp_dir("backup")?);
+    let work = &work_guard.0;
     let mut files = vec![];
     let mut manifest = Manifest {
         format: FORMAT,
@@ -206,19 +391,28 @@ pub async fn backup_app(c: &Client, app: &str, out_dir: &Path, with_image: bool,
     if with_image && !ex.sources.is_empty() {
         let dest = work.join("image.tar.gz");
         let st: StatusView = c.get("/v1/status").await?;
-        let mut machines: Vec<u32> = ex.sources.clone();
-        machines.extend(st.machines.iter().filter(|m| m.alive).map(|m| m.machine.id));
+        let mut machines: Vec<u32> = vec![];
+        for m in ex.sources.iter().copied().chain(st.machines.iter().filter(|m| m.alive).map(|m| m.machine.id)) {
+            if !machines.contains(&m) {
+                machines.push(m);
+            }
+        }
         let mut done = false;
+        let mut url_builder = reqwest::Url::parse("http://placeholder.invalid/image")?;
+        url_builder.query_pairs_mut().append_pair("ref", &ex.image);
+        let query = url_builder.query().unwrap_or("");
         for m in machines {
-            let path = format!("/v1/m/{m}/image?ref={}", ex.image);
+            let path = format!("/v1/m/{m}/image?{query}");
             if let Ok(n) = download(c, &path, &dest).await {
-                println!("    image {} ({})", ex.image, mb(n));
-                done = true;
-                break;
+                if verify_gzip_integrity(&dest).is_ok() {
+                    println!("    image {} ({})", ex.image, mb(n));
+                    done = true;
+                    break;
+                }
             }
         }
         if !done {
-            bail!("could not download the image {} from any machine", ex.image);
+            bail!("could not download a valid copy of image {} from any machine", ex.image);
         }
         files.push(("image.tar.gz".to_string(), dest));
         manifest.image_file = Some("image.tar.gz".into());
@@ -235,15 +429,19 @@ pub async fn backup_app(c: &Client, app: &str, out_dir: &Path, with_image: bool,
     if stopped {
         println!("    stopping {app} for a consistent snapshot");
         scale_to(c, app, 0).await?;
-        wait_stopped(c, app).await?;
     }
     let result: Result<()> = async {
+        if stopped {
+            wait_stopped(c, app).await?;
+        }
         for v in &ex.volumes {
             let file = format!("volumes/{}.tar.gz", v.name);
             let dest = work.join(format!("vol-{}.tar.gz", v.name));
             let n = download(c, &format!("/v1/m/{}/volume-data?volume={}", v.primary, v.id), &dest)
                 .await
                 .with_context(|| format!("downloading volume {}", v.name))?;
+            verify_gzip_integrity(&dest)
+                .with_context(|| format!("verifying downloaded volume {}", v.name))?;
             println!("    volume {} ({})", v.name, mb(n));
             files.push((file.clone(), dest));
             manifest.volumes.push(ManifestVolume { name: v.name.clone(), path: v.path.clone(), file });
@@ -252,13 +450,16 @@ pub async fn backup_app(c: &Client, app: &str, out_dir: &Path, with_image: bool,
     }
     .await;
     if stopped {
-        scale_to(c, app, ex.count).await?;
-        println!("    {app} started again");
+        if let Err(e) = restore_scale(c, app, &ex).await {
+            eprintln!("    ! failed to restart {app} after backup: {e:#}");
+        } else {
+            println!("    {app} started again");
+        }
     }
     result?;
-    let out = out_dir.join(format!("{app}-{}.latrix-backup.tar", stamp(now())));
+    let t = now();
+    let out = out_dir.join(format!("{app}-{}{:02}.latrix-backup.tar", stamp(t), t % 60));
     write_archive(&out, &manifest, &files)?;
-    let _ = std::fs::remove_dir_all(&work);
     println!(
         "    saved {} ({}, {} secret(s))",
         out.display(),
@@ -316,9 +517,10 @@ pub async fn restore_bundle(c: &Client, m: &Manifest, dir: &Path, name: &str, me
     // 1. image
     let (image, builder) = match &m.image_file {
         Some(f) => {
+            let img_path = resolve_backup_member(dir, f)?;
             let plan: BuildPlan = c.post(&format!("/v1/apps/{name}/build-plan"), &serde_json::json!({})).await?;
             println!("==> uploading the image to {}", plan.machine_name);
-            let v = upload(c, &format!("/v1/m/{}/image?app={name}&tag={}", plan.machine, plan.tag), &dir.join(f)).await?;
+            let v = upload(c, &format!("/v1/m/{}/image?app={name}&tag={}", plan.machine, plan.tag), &img_path).await?;
             let img = v["image"].as_str().ok_or_else(|| anyhow!("upload returned no image"))?.to_string();
             (img, Some(plan.machine))
         }
@@ -337,33 +539,43 @@ pub async fn restore_bundle(c: &Client, m: &Manifest, dir: &Path, name: &str, me
         )
         .await?;
 
-    // 3. secrets
-    if !m.secrets.is_empty() {
-        let _: DeployResponse = c
-            .post(&format!("/v1/apps/{name}/secrets"), &SecretsRequest { set: m.secrets.clone(), unset: vec![] })
-            .await?;
-        println!("==> restored {} secret(s)", m.secrets.len());
-    }
-
-    // 3b. CLI-managed DNS records
-    if !m.dns_records.is_empty() {
-        let _: DnsStatusView = c
-            .post(&format!("/v1/apps/{name}/dns"), &AppDnsRequest { add: m.dns_records.clone(), remove: vec![] })
-            .await?;
-        println!("==> restored {} DNS record(s)", m.dns_records.len());
-    }
-
-    // 4. volume data onto the volume's primary machine
-    if !m.volumes.is_empty() {
-        let v: AppView = c.get(&format!("/v1/apps/{name}")).await?;
-        for mv in &m.volumes {
-            let Some(vol) = v.volumes.iter().find(|x| x.volume.name == mv.name) else {
-                println!("    (volume {} is not in the config any more; skipped)", mv.name);
-                continue;
-            };
-            println!("==> restoring volume {} on {}", mv.name, vol.primary_name);
-            upload(c, &format!("/v1/m/{}/volume-data?volume={}", vol.volume.primary, vol.volume.id), &dir.join(&mv.file)).await?;
+    // If staging fails before the final deploy, clean up the half-restored stopped app.
+    let staged: Result<()> = async {
+        // 3. secrets
+        if !m.secrets.is_empty() {
+            let _: DeployResponse = c
+                .post(&format!("/v1/apps/{name}/secrets"), &SecretsRequest { set: m.secrets.clone(), unset: vec![] })
+                .await?;
+            println!("==> restored {} secret(s)", m.secrets.len());
         }
+
+        // 3b. CLI-managed DNS records
+        if !m.dns_records.is_empty() {
+            let _: DnsStatusView = c
+                .post(&format!("/v1/apps/{name}/dns"), &AppDnsRequest { add: m.dns_records.clone(), remove: vec![] })
+                .await?;
+            println!("==> restored {} DNS record(s)", m.dns_records.len());
+        }
+
+        // 4. volume data onto the volume's primary machine
+        if !m.volumes.is_empty() {
+            let v: AppView = c.get(&format!("/v1/apps/{name}")).await?;
+            for mv in &m.volumes {
+                let Some(vol) = v.volumes.iter().find(|x| x.volume.name == mv.name) else {
+                    println!("    (volume {} is not in the config any more; skipped)", mv.name);
+                    continue;
+                };
+                let vol_path = resolve_backup_member(dir, &mv.file)?;
+                println!("==> restoring volume {} on {}", mv.name, vol.primary_name);
+                upload(c, &format!("/v1/m/{}/volume-data?volume={}", vol.volume.primary, vol.volume.id), &vol_path).await?;
+            }
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(e) = staged {
+        let _ = c.delete::<bool>(&format!("/v1/apps/{name}?purge_volumes=true")).await;
+        return Err(e);
     }
 
     // 5. start it for real
@@ -381,7 +593,10 @@ pub async fn restore(cfg: &CliConfig, cl: Option<&str>, file: &Path, as_name: Op
     if p.kubernetes.is_some() {
         bail!("restore targets latrix clusters");
     }
+    // Connect before extracting secrets onto disk.
+    let c = Client::connect(&p).await?;
     let (m, dir) = read_archive(file)?;
+    let _guard = TempDirGuard(dir.clone());
     println!(
         "==> restoring {} from {} (made {}{})",
         m.app,
@@ -389,11 +604,8 @@ pub async fn restore(cfg: &CliConfig, cl: Option<&str>, file: &Path, as_name: Op
         util::ago(m.created_at),
         if m.source != "latrix" { format!(", imported from {}", m.source) } else { String::new() }
     );
-    let c = Client::connect(&p).await?;
     let name = as_name.unwrap_or_else(|| m.app.clone());
-    let res = restore_bundle(&c, &m, &dir, &name, &format!("restored from backup of {}", util::ago(m.created_at))).await;
-    let _ = std::fs::remove_dir_all(&dir);
-    res
+    restore_bundle(&c, &m, &dir, &name, &format!("restored from backup of {}", util::ago(m.created_at))).await
 }
 
 #[cfg(test)]
@@ -433,5 +645,40 @@ mod tests {
         assert_eq!(std::fs::read(unpacked.join("volumes/data.tar.gz")).unwrap(), b"volume-bytes");
         let _ = std::fs::remove_dir_all(dir);
         let _ = std::fs::remove_dir_all(unpacked);
+    }
+
+    #[test]
+    fn read_archive_rejects_traversal_symlinks_and_unexpected_files() {
+        let dir = temp_dir("bad-tar").unwrap();
+
+        // Unexpected file outside allowlist
+        let unexpected = dir.join("unexpected.tar");
+        {
+            let mut b = tar::Builder::new(std::fs::File::create(&unexpected).unwrap());
+            let mut hdr = tar::Header::new_gnu();
+            let data = b"evil";
+            hdr.set_size(data.len() as u64);
+            hdr.set_mode(0o644);
+            hdr.set_cksum();
+            b.append_data(&mut hdr, "etc/passwd", &data[..]).unwrap();
+            b.finish().unwrap();
+        }
+        assert!(read_archive(&unexpected).is_err());
+
+        // Symlink entry rejected
+        let symlink_tar = dir.join("symlink.tar");
+        {
+            let mut b = tar::Builder::new(std::fs::File::create(&symlink_tar).unwrap());
+            let mut hdr = tar::Header::new_gnu();
+            hdr.set_entry_type(tar::EntryType::Symlink);
+            hdr.set_size(0);
+            hdr.set_mode(0o777);
+            hdr.set_cksum();
+            b.append_link(&mut hdr, "manifest.json", "/etc/shadow").unwrap();
+            b.finish().unwrap();
+        }
+        assert!(read_archive(&symlink_tar).is_err());
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

@@ -27,6 +27,7 @@ use crate::util::now;
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
@@ -34,6 +35,21 @@ use std::time::Duration;
 use tracing::{debug, info, warn};
 
 pub const CF_API_BASE: &str = "https://api.cloudflare.com/client/v4";
+
+/// Typed rate-limit error returned when Cloudflare responds with HTTP 429.
+#[derive(Debug)]
+struct RateLimited {
+    retry_after_secs: u64,
+    message: String,
+}
+
+impl std::fmt::Display for RateLimited {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Cloudflare rate limited (retry after {}s): {}", self.retry_after_secs, self.message)
+    }
+}
+
+impl std::error::Error for RateLimited {}
 
 /// Shared state on the Agent for Cloudflare DNS.
 #[derive(Default)]
@@ -46,11 +62,14 @@ pub struct Shared {
 #[derive(Debug, Clone, Default)]
 pub struct RuntimeStatus {
     pub zones: Vec<CfZone>,
+    pub zones_token_hash: String,
     pub last_sync: u64,
     pub last_error: Option<String>,
     pub record_errors: BTreeMap<String, String>,
     pub last_fingerprint: String,
     pub last_warned: u64,
+    pub next_retry_at: u64,
+    pub consecutive_errors: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -116,9 +135,14 @@ pub fn eligible_domain(d: &str) -> bool {
     let d = normalize_dns_name(d);
     !d.is_empty()
         && d.contains('.')
+        && !d.contains('*')
+        && !d
+            .chars()
+            .any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | ':' | '?' | '#' | '@'))
         && !d.ends_with(".localhost")
         && !d.ends_with(".internal")
         && !d.ends_with(".sslip.io")
+        && !d.ends_with(".nip.io")
         && d.parse::<IpAddr>().is_err()
 }
 
@@ -132,13 +156,28 @@ pub fn find_zone<'a>(zones: &'a [CfZone], name: &str) -> Option<&'a CfZone> {
             let zn = normalize_dns_name(&z.name);
             n == zn || n.ends_with(&format!(".{zn}"))
         })
-        .max_by_key(|z| z.name.len())
+        .max_by_key(|z| normalize_dns_name(&z.name).len())
 }
 
 fn parse_public_ip(s: &str) -> Option<IpAddr> {
     let ip: IpAddr = s.trim().parse().ok()?;
-    if ip.is_loopback() || ip.is_unspecified() {
+    if ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() {
         return None;
+    }
+    match ip {
+        IpAddr::V4(v4) => {
+            let [a, b, _, _] = v4.octets();
+            // Reject link-local (169.254.0.0/16) and latrix internal overlay/VIP ranges (10.77/10.78).
+            if (a == 169 && b == 254) || (a == 10 && (b == 77 || b == 78)) {
+                return None;
+            }
+        }
+        IpAddr::V6(v6) => {
+            // Reject IPv6 link-local (fe80::/10).
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return None;
+            }
+        }
     }
     Some(ip)
 }
@@ -146,9 +185,10 @@ fn parse_public_ip(s: &str) -> Option<IpAddr> {
 /// Public IPs of machines that should receive cluster-wide traffic (HTTP proxy,
 /// public TCP, wildcard `base_domain`).
 ///
-/// Prefers alive `Ready` or `Cordoned` machines; falls back to any alive
-/// machine, then all machines in state (so DNS never drops to zero IPs during
-/// transient blips or single-machine maintenance).
+/// Prefers alive `Ready` or `Cordoned` machines (excluding machines queued for
+/// removal); falls back to any alive machine, then all machines in state (so
+/// DNS never drops to zero IPs during transient blips or single-machine
+/// maintenance).
 pub fn target_ips(s: &ClusterState, live: &LiveView) -> (Vec<String>, Vec<String>) {
     let collect = |machines: Vec<&crate::state::Machine>| -> (Vec<String>, Vec<String>) {
         let mut v4 = BTreeSet::new();
@@ -167,32 +207,48 @@ pub fn target_ips(s: &ClusterState, live: &LiveView) -> (Vec<String>, Vec<String
         }
         (v4.into_iter().collect(), v6.into_iter().collect())
     };
+    let is_removing = |m: &crate::state::Machine| -> bool {
+        m.maintenance.as_ref().map(|t| t.kind == "remove").unwrap_or(false)
+    };
 
     let active: Vec<_> = s
         .machines
         .values()
         .filter(|m| {
-            live.is_alive(m.id) && matches!(m.status, MachineStatus::Ready | MachineStatus::Cordoned)
+            live.is_alive(m.id)
+                && matches!(m.status, MachineStatus::Ready | MachineStatus::Cordoned)
+                && !is_removing(m)
         })
         .collect();
     let res = collect(active);
     if !res.0.is_empty() || !res.1.is_empty() {
         return res;
     }
-    let alive: Vec<_> = s.machines.values().filter(|m| live.is_alive(m.id)).collect();
+    let alive: Vec<_> = s
+        .machines
+        .values()
+        .filter(|m| live.is_alive(m.id) && !is_removing(m))
+        .collect();
     let res = collect(alive);
+    if !res.0.is_empty() || !res.1.is_empty() {
+        return res;
+    }
+    let alive_any: Vec<_> = s.machines.values().filter(|m| live.is_alive(m.id)).collect();
+    let res = collect(alive_any);
     if !res.0.is_empty() || !res.1.is_empty() {
         return res;
     }
     collect(s.machines.values().collect())
 }
 
-/// Public IPs of machines running non-stopping instances of a UDP-direct app.
+/// Public IPs of machines running instances of a UDP-direct app.
+/// Falls back to stopping instances during in-place/rolling redeploys so DNS
+/// does not transiently delete the app's A/AAAA records.
 pub fn app_direct_ips(s: &ClusterState, live: &LiveView, app: &str) -> (Vec<String>, Vec<String>) {
-    let collect = |only_alive: bool| -> (Vec<String>, Vec<String>) {
+    let collect = |only_alive: bool, include_stopping: bool| -> (Vec<String>, Vec<String>) {
         let mut v4 = BTreeSet::new();
         let mut v6 = BTreeSet::new();
-        for i in s.instances_of(app).filter(|i| !i.stopping) {
+        for i in s.instances_of(app).filter(|i| include_stopping || !i.stopping) {
             if only_alive && !live.is_alive(i.machine) {
                 continue;
             }
@@ -211,11 +267,22 @@ pub fn app_direct_ips(s: &ClusterState, live: &LiveView, app: &str) -> (Vec<Stri
         }
         (v4.into_iter().collect(), v6.into_iter().collect())
     };
-    let res = collect(true);
+    let res = collect(true, false);
     if !res.0.is_empty() || !res.1.is_empty() {
         return res;
     }
-    collect(false)
+    let res = collect(false, false);
+    if !res.0.is_empty() || !res.1.is_empty() {
+        return res;
+    }
+    if s.apps.get(app).map(|a| a.count > 0).unwrap_or(false) {
+        let res = collect(true, true);
+        if !res.0.is_empty() || !res.1.is_empty() {
+            return res;
+        }
+        return collect(false, true);
+    }
+    (vec![], vec![])
 }
 
 fn effective_ttl(proxied: bool, ttl: u32) -> u32 {
@@ -228,15 +295,56 @@ fn effective_ttl(proxied: bool, ttl: u32) -> u32 {
     }
 }
 
-fn record_spec_key(r: &DnsRecordConfig) -> (String, String) {
+fn record_spec_key(r: &DnsRecordConfig) -> (String, String, Option<String>) {
     let name = normalize_dns_name(&r.name);
-    let ty = match (r.record_type.as_deref(), r.content.as_deref()) {
-        (Some(t), _) => t.trim().to_ascii_uppercase(),
-        (None, Some(c)) if c.trim().parse::<std::net::Ipv4Addr>().is_ok() => "A".into(),
-        (None, Some(c)) if c.trim().parse::<std::net::Ipv6Addr>().is_ok() => "AAAA".into(),
+    let content_opt = r
+        .content
+        .as_deref()
+        .map(str::trim)
+        .filter(|c| !c.is_empty());
+    let ty = match (r.record_type.as_deref(), content_opt) {
+        (Some(t), _) if !t.trim().is_empty() => t.trim().to_ascii_uppercase(),
+        (_, Some(c)) if c.parse::<std::net::Ipv4Addr>().is_ok() => "A".into(),
+        (_, Some(c)) if c.parse::<std::net::Ipv6Addr>().is_ok() => "AAAA".into(),
         _ => "AUTO".into(),
     };
-    (name, ty)
+    let norm_content = content_opt.map(|c| {
+        if ty == "SRV" {
+            srv_effective_content(c, r.priority)
+                .map(|(p, w, port, t)| format!("{p} {w} {port} {t}"))
+                .unwrap_or_else(|_| normalize_content(&ty, c))
+        } else if ty == "CAA" {
+            caa_effective_content(c)
+                .map(|(f, tag, val)| format!("{f} {tag} {val}"))
+                .unwrap_or_else(|_| normalize_content(&ty, c))
+        } else {
+            normalize_content(&ty, c)
+        }
+    });
+    (name, ty, norm_content)
+}
+
+fn cli_overrides_config(
+    cfg_key: &(String, String, Option<String>),
+    cli_keys: &[(String, String, Option<String>)],
+) -> bool {
+    let (name, ty, content) = cfg_key;
+    cli_keys.iter().any(|(cn, cty, ccontent)| {
+        if cn != name {
+            return false;
+        }
+        match ty.as_str() {
+            "AUTO" => matches!(cty.as_str(), "AUTO" | "CNAME" | "A" | "AAAA"),
+            "CNAME" => matches!(cty.as_str(), "AUTO" | "CNAME" | "A" | "AAAA"),
+            "A" | "AAAA" => {
+                matches!(cty.as_str(), "AUTO" | "CNAME")
+                    || (cty == ty && ccontent == content)
+            }
+            // Multi-valued types (TXT, MX, SRV, CAA): only override matching content so
+            // adding a CLI TXT/MX record does not delete unrelated config TXT/MX records.
+            _ => cty == ty && ccontent == content,
+        }
+    })
 }
 
 /// Compute every DNS record the cluster wants in Cloudflare right now.
@@ -256,7 +364,7 @@ pub fn desired_records(s: &ClusterState, live: &LiveView) -> Vec<DesiredRecord> 
         let key = (
             rec.name.clone(),
             rec.record_type.clone(),
-            normalize_content(&rec.record_type, &rec.content),
+            desired_normalized_content(&rec),
         );
         if seen.insert(key) {
             out.push(rec);
@@ -266,25 +374,24 @@ pub fn desired_records(s: &ClusterState, live: &LiveView) -> Vec<DesiredRecord> 
     for (app_name, app) in &s.apps {
         let cfg = app.config();
         let is_direct = cfg.map(scheduler::direct).unwrap_or(false);
-        let (ips_v4, ips_v6) = if is_direct {
-            let direct = app_direct_ips(s, live, app_name);
-            if direct.0.is_empty() && direct.1.is_empty() {
-                // App not scheduled onto a machine yet; skip until placed.
-                (vec![], vec![])
-            } else {
-                direct
-            }
+        let direct_ips = if is_direct {
+            app_direct_ips(s, live, app_name)
         } else {
-            (cluster_v4.clone(), cluster_v6.clone())
+            (vec![], vec![])
         };
+        let http_domains: BTreeSet<String> = cfg
+            .and_then(|c| c.http.as_ref())
+            .map(|h| h.domains.iter().map(|d| normalize_dns_name(d)).collect())
+            .unwrap_or_default();
 
         // Merge latrix.toml [[dns]] with CLI-managed app.dns_records.
-        // CLI records override config records with the same (name, type).
         let mut combined: Vec<(DnsRecordConfig, &'static str)> = vec![];
-        let cli_keys: BTreeSet<(String, String)> = app.dns_records.iter().map(record_spec_key).collect();
+        let cli_keys: Vec<(String, String, Option<String>)> =
+            app.dns_records.iter().map(record_spec_key).collect();
         if let Some(c) = cfg {
             for r in &c.dns {
-                if !cli_keys.contains(&record_spec_key(r)) {
+                let k = record_spec_key(r);
+                if !cli_overrides_config(&k, &cli_keys) {
                     combined.push((r.clone(), "config"));
                 }
             }
@@ -302,6 +409,14 @@ pub fn desired_records(s: &ClusterState, live: &LiveView) -> Vec<DesiredRecord> 
             if !eligible_domain(&name) {
                 continue;
             }
+            // For hybrid HTTP+UDP apps, hostnames declared in [http].domains route through
+            // the cluster HTTP proxy rather than direct UDP machine IPs.
+            let use_direct = is_direct && !http_domains.contains(&name);
+            let (ips_v4, ips_v6) = if use_direct {
+                (&direct_ips.0, &direct_ips.1)
+            } else {
+                (&cluster_v4, &cluster_v6)
+            };
             let content_opt = r
                 .content
                 .as_deref()
@@ -318,7 +433,7 @@ pub fn desired_records(s: &ClusterState, live: &LiveView) -> Vec<DesiredRecord> 
                 None => {
                     // Auto-IP A/AAAA record(s)
                     covered_hosts.insert(name.clone());
-                    let proxied = if is_direct {
+                    let proxied = if use_direct {
                         false
                     } else {
                         r.proxied.unwrap_or(default_proxied)
@@ -327,7 +442,7 @@ pub fn desired_records(s: &ClusterState, live: &LiveView) -> Vec<DesiredRecord> 
                     let want_v4 = matches!(ty_opt.as_deref(), None | Some("A"));
                     let want_v6 = matches!(ty_opt.as_deref(), None | Some("AAAA"));
                     if want_v4 {
-                        for ip in &ips_v4 {
+                        for ip in ips_v4 {
                             push_unique(&mut out, &mut seen, DesiredRecord {
                                 app: Some(app_name.clone()),
                                 name: name.clone(),
@@ -342,7 +457,7 @@ pub fn desired_records(s: &ClusterState, live: &LiveView) -> Vec<DesiredRecord> 
                         }
                     }
                     if want_v6 {
-                        for ip in &ips_v6 {
+                        for ip in ips_v6 {
                             push_unique(&mut out, &mut seen, DesiredRecord {
                                 app: Some(app_name.clone()),
                                 name: name.clone(),
@@ -368,7 +483,7 @@ pub fn desired_records(s: &ClusterState, live: &LiveView) -> Vec<DesiredRecord> 
                         covered_hosts.insert(name.clone());
                     }
                     let proxied = if is_proxyable(&record_type) {
-                        r.proxied.unwrap_or(if is_direct { false } else { default_proxied })
+                        r.proxied.unwrap_or(if use_direct { false } else { default_proxied })
                     } else {
                         false
                     };
@@ -471,13 +586,44 @@ pub fn desired_records(s: &ClusterState, live: &LiveView) -> Vec<DesiredRecord> 
     out
 }
 
+fn normalize_target(s: &str) -> String {
+    let t = s.trim();
+    if t == "." {
+        ".".into()
+    } else {
+        t.trim_end_matches('.').to_ascii_lowercase()
+    }
+}
+
+fn parse_caa_parts(content: &str) -> Option<(&str, &str, &str)> {
+    let s = content.trim();
+    let i1 = s.find(char::is_whitespace)?;
+    let flags = &s[..i1];
+    let rest = s[i1..].trim_start();
+    let i2 = rest.find(char::is_whitespace)?;
+    let tag = &rest[..i2];
+    let val = rest[i2..].trim();
+    if flags.is_empty() || tag.is_empty() || val.is_empty() {
+        return None;
+    }
+    Some((flags, tag, val))
+}
+
 pub fn normalize_content(record_type: &str, content: &str) -> String {
     let c = content.trim();
     match record_type {
-        "CNAME" | "MX" => c.trim_end_matches('.').to_ascii_lowercase(),
+        "A" => c
+            .parse::<std::net::Ipv4Addr>()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|_| c.to_string()),
+        "AAAA" => c
+            .parse::<std::net::Ipv6Addr>()
+            .map(|ip| ip.to_string())
+            .unwrap_or_else(|_| c.to_ascii_lowercase()),
+        "CNAME" | "MX" => normalize_target(c),
         "TXT" => c.trim_matches('"').to_string(),
         "SRV" => {
-            // Normalize whitespace and strip trailing dot from target
+            // Normalize whitespace and strip trailing dot from target (preserving RFC 2782 Null SRV ".").
             let parts: Vec<&str> = c.split_whitespace().collect();
             if parts.len() == 4 {
                 format!(
@@ -485,28 +631,22 @@ pub fn normalize_content(record_type: &str, content: &str) -> String {
                     parts[0],
                     parts[1],
                     parts[2],
-                    parts[3].trim_end_matches('.').to_ascii_lowercase()
+                    normalize_target(parts[3])
                 )
             } else if parts.len() == 3 {
                 format!(
                     "{} {} {}",
                     parts[0],
                     parts[1],
-                    parts[2].trim_end_matches('.').to_ascii_lowercase()
+                    normalize_target(parts[2])
                 )
             } else {
                 c.to_string()
             }
         }
         "CAA" => {
-            let parts: Vec<&str> = c.splitn(3, char::is_whitespace).collect();
-            if parts.len() == 3 {
-                format!(
-                    "{} {} {}",
-                    parts[0],
-                    parts[1].to_ascii_lowercase(),
-                    parts[2].trim().trim_matches('"')
-                )
+            if let Some((flags, tag, val)) = parse_caa_parts(c) {
+                format!("{} {} {}", flags, tag.to_ascii_lowercase(), val.trim_matches('"'))
             } else {
                 c.to_string()
             }
@@ -522,32 +662,31 @@ fn srv_effective_content(content: &str, priority: Option<u16>) -> Result<(u16, u
             p.parse().context("SRV priority must be a number")?,
             w.parse().context("SRV weight must be a number")?,
             port.parse().context("SRV port must be a number")?,
-            target.trim_end_matches('.').to_ascii_lowercase(),
+            normalize_target(target),
         )),
         ([w, port, target], Some(p)) => Ok((
             p,
             w.parse().context("SRV weight must be a number")?,
             port.parse().context("SRV port must be a number")?,
-            target.trim_end_matches('.').to_ascii_lowercase(),
+            normalize_target(target),
         )),
         ([w, port, target], None) => Ok((
             0,
             w.parse().context("SRV weight must be a number")?,
             port.parse().context("SRV port must be a number")?,
-            target.trim_end_matches('.').to_ascii_lowercase(),
+            normalize_target(target),
         )),
         _ => bail!("SRV content must be \"<priority> <weight> <port> <target>\" (or \"<weight> <port> <target>\" with priority)"),
     }
 }
 
 fn caa_effective_content(content: &str) -> Result<(u8, String, String)> {
-    let parts: Vec<&str> = content.trim().splitn(3, char::is_whitespace).collect();
-    if parts.len() != 3 {
+    let Some((flags_s, tag_s, val_s)) = parse_caa_parts(content) else {
         bail!("CAA content must be \"<flags> <tag> <value>\" (e.g. 0 issue \"letsencrypt.org\")");
-    }
-    let flags: u8 = parts[0].parse().context("CAA flags must be 0..=255")?;
-    let tag = parts[1].trim().to_ascii_lowercase();
-    let value = parts[2].trim().trim_matches('"').to_string();
+    };
+    let flags: u8 = flags_s.parse().context("CAA flags must be 0..=255")?;
+    let tag = tag_s.to_ascii_lowercase();
+    let value = val_s.trim_matches('"').to_string();
     Ok((flags, tag, value))
 }
 
@@ -560,7 +699,7 @@ fn cf_record_content(r: &CfRecord) -> String {
                 d["port"].as_u64(),
                 d["target"].as_str(),
             ) {
-                return format!("{p} {w} {port} {}", t.trim_end_matches('.').to_ascii_lowercase());
+                return format!("{p} {w} {port} {}", normalize_target(t));
             }
         }
         // Cloudflare sometimes returns "weight port target" in content with priority separate.
@@ -571,7 +710,7 @@ fn cf_record_content(r: &CfRecord) -> String {
                 "{p} {} {} {}",
                 parts[0],
                 parts[1],
-                parts[2].trim_end_matches('.').to_ascii_lowercase()
+                normalize_target(parts[2])
             );
         }
     }
@@ -642,6 +781,12 @@ pub fn plan_zone_sync(
     let is_owned = |r: &CfRecord| -> bool {
         managed_ids.contains(r.id.as_str()) || r.comment.as_deref() == Some(tag.as_str())
     };
+    let has_other_latrix_comment = |r: &CfRecord| -> bool {
+        r.comment
+            .as_deref()
+            .map(|c| c.starts_with("latrix:") && c != tag.as_str())
+            .unwrap_or(false)
+    };
 
     // Group desired and existing by (name, record_type).
     let mut desired_by_key: BTreeMap<(String, String), Vec<&DesiredRecord>> = BTreeMap::new();
@@ -700,17 +845,27 @@ pub fn plan_zone_sync(
 
         let mut remaining_want: Vec<&DesiredRecord> = vec![];
         let mut used_have: BTreeSet<String> = BTreeSet::new();
+        let is_addr_or_cname = matches!(ty.as_str(), "A" | "AAAA" | "CNAME");
 
-        // Pass A: exact content match (either already identical, or update metadata/proxied/ttl/comment).
+        // Pass A: exact content match (prefer records we already own; never hijack another
+        // latrix cluster's record or take ownership of a user's manual TXT/MX/SRV/CAA record).
         for w in want_list {
             let w_norm = desired_normalized_content(w);
-            if let Some(h) = have_list
+            let matched = have_list
                 .iter()
-                .find(|h| !used_have.contains(&h.id) && cf_record_content(h) == w_norm)
-            {
+                .find(|h| !used_have.contains(&h.id) && is_owned(h) && cf_record_content(h) == w_norm)
+                .or_else(|| {
+                    have_list.iter().find(|h| {
+                        !used_have.contains(&h.id)
+                            && !has_other_latrix_comment(h)
+                            && cf_record_content(h) == w_norm
+                    })
+                });
+            if let Some(h) = matched {
                 used_have.insert(h.id.clone());
                 claimed_existing.insert(h.id.clone());
-                if !record_matches(h, w, &tag) {
+                // Only update/tag records we already own, or untagged A/AAAA/CNAME on our hostname.
+                if (is_owned(h) || is_addr_or_cname) && !record_matches(h, w, &tag) {
                     updates.push(SyncAction::Update {
                         id: h.id.clone(),
                         desired: (*w).clone(),
@@ -722,14 +877,15 @@ pub fn plan_zone_sync(
         }
 
         // Remaining unmatched existing records of the same (name, type).
-        // For A, AAAA, CNAME: all records on this managed hostname belong to this set
+        // Never touch records belonging to another latrix cluster (`latrix:<other>`).
+        // For A, AAAA, CNAME: untagged records on this managed hostname belong to this set
         // (so stale IPs from dead/old servers are replaced/cleaned up).
         // For TXT, MX, SRV, CAA: ONLY touch records owned by latrix so user's other
         // TXT/MX records on the same hostname are never modified or deleted!
         let replaceable_have: Vec<&CfRecord> = have_list
             .into_iter()
-            .filter(|h| !used_have.contains(&h.id))
-            .filter(|h| matches!(ty.as_str(), "A" | "AAAA" | "CNAME") || is_owned(h))
+            .filter(|h| !used_have.contains(&h.id) && !has_other_latrix_comment(h))
+            .filter(|h| is_addr_or_cname || is_owned(h))
             .collect();
 
         // Pass B: pair up remaining wants with replaceable existing records to update in-place
@@ -857,7 +1013,31 @@ impl CfClient {
         }
         let resp = rb.send().await.with_context(|| format!("Cloudflare API {path}"))?;
         let status = resp.status();
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(60)
+            .clamp(5, 3600);
         let text = resp.text().await?;
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            let msg = serde_json::from_str::<CfEnvelope<Value>>(&text)
+                .ok()
+                .map(|e| {
+                    e.errors
+                        .into_iter()
+                        .map(|err| err.message)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+                .filter(|m| !m.is_empty())
+                .unwrap_or_else(|| "429 Too Many Requests".into());
+            return Err(anyhow::Error::new(RateLimited {
+                retry_after_secs: retry_after,
+                message: msg,
+            }));
+        }
         let env: CfEnvelope<T> = serde_json::from_str(&text).with_context(|| {
             format!(
                 "Cloudflare API {path} returned {status}: {}",
@@ -892,8 +1072,10 @@ impl CfClient {
 
     /// List all accessible active zones for this token.
     pub async fn list_zones(&self) -> Result<Vec<CfZone>> {
+        const MAX_ZONE_PAGES: u32 = 20;
         let mut all = vec![];
-        for page in 1..=20u32 {
+        let mut completed = false;
+        for page in 1..=MAX_ZONE_PAGES {
             let (mut list, info): (Vec<CfZone>, _) = self
                 .request(
                     reqwest::Method::GET,
@@ -901,11 +1083,16 @@ impl CfClient {
                     None,
                 )
                 .await?;
+            let empty = list.is_empty();
             all.append(&mut list);
             let total_pages = info.map(|i| i.total_pages).unwrap_or(1);
-            if page >= total_pages {
+            if empty || page >= total_pages {
+                completed = true;
                 break;
             }
+        }
+        if !completed {
+            bail!("Cloudflare account has more than {MAX_ZONE_PAGES} pages of zones; refusing partial DNS sync");
         }
         all.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(all)
@@ -913,8 +1100,10 @@ impl CfClient {
 
     /// List all DNS records in a zone.
     pub async fn list_records(&self, zone_id: &str) -> Result<Vec<CfRecord>> {
+        const MAX_RECORD_PAGES: u32 = 50;
         let mut all = vec![];
-        for page in 1..=50u32 {
+        let mut completed = false;
+        for page in 1..=MAX_RECORD_PAGES {
             let (mut list, info): (Vec<CfRecord>, _) = self
                 .request(
                     reqwest::Method::GET,
@@ -922,11 +1111,16 @@ impl CfClient {
                     None,
                 )
                 .await?;
+            let empty = list.is_empty();
             all.append(&mut list);
             let total_pages = info.map(|i| i.total_pages).unwrap_or(1);
-            if page >= total_pages {
+            if empty || page >= total_pages {
+                completed = true;
                 break;
             }
+        }
+        if !completed {
+            bail!("Cloudflare zone {zone_id} has more than {MAX_RECORD_PAGES} pages of DNS records; refusing partial DNS sync");
         }
         Ok(all)
     }
@@ -966,11 +1160,11 @@ impl CfClient {
                 );
             }
             "MX" => {
-                obj.insert("content".into(), json!(d.content.trim().trim_end_matches('.')));
+                obj.insert("content".into(), json!(normalize_target(&d.content)));
                 obj.insert("priority".into(), json!(d.priority.unwrap_or(10)));
             }
             "CNAME" => {
-                obj.insert("content".into(), json!(d.content.trim().trim_end_matches('.')));
+                obj.insert("content".into(), json!(normalize_target(&d.content)));
             }
             _ => {
                 obj.insert("content".into(), json!(d.content.trim()));
@@ -1032,9 +1226,11 @@ impl CfClient {
         domain: &str,
         value: &str,
     ) -> Result<String> {
+        let clean = normalize_dns_name(domain);
+        let clean = clean.strip_prefix("*.").unwrap_or(&clean);
         let d = DesiredRecord {
             app: None,
-            name: format!("_acme-challenge.{}", normalize_dns_name(domain)),
+            name: format!("_acme-challenge.{clean}"),
             record_type: "TXT".into(),
             content: value.to_string(),
             proxied: false,
@@ -1061,13 +1257,24 @@ pub async fn verify_token(http: &reqwest::Client, token: &str) -> Result<Vec<CfZ
     Ok(zones)
 }
 
+fn token_hash(token: &str) -> String {
+    let mut h = Sha256::new();
+    h.update(token.as_bytes());
+    format!("{:x}", h.finalize())
+}
+
 /// Helper for ACME DNS-01: find the Cloudflare zone for `domain` using the cluster token.
 pub async fn find_zone_for_domain(agent: &Agent, domain: &str) -> Option<(String, String, CfZone)> {
     let token = agent.snapshot().cloudflare_token.clone()?;
-    // Check cached zones first, fall back to live query.
+    let thash = token_hash(&token);
+    // Check cached zones only if they were fetched with the current token.
     let cached = {
         let st = agent.cloudflare.status.lock().unwrap();
-        find_zone(&st.zones, domain).cloned()
+        if st.zones_token_hash == thash {
+            find_zone(&st.zones, domain).cloned()
+        } else {
+            None
+        }
     };
     if let Some(z) = cached {
         return Some((token, domain.to_string(), z));
@@ -1078,6 +1285,7 @@ pub async fn find_zone_for_domain(agent: &Agent, domain: &str) -> Option<(String
     {
         let mut st = agent.cloudflare.status.lock().unwrap();
         st.zones = zones;
+        st.zones_token_hash = thash;
     }
     found.map(|z| (token, domain.to_string(), z))
 }
@@ -1089,20 +1297,27 @@ fn record_key(name: &str, record_type: &str, content: &str) -> String {
     format!("{name}|{record_type}|{}", normalize_content(record_type, content))
 }
 
+fn record_key_desired(d: &DesiredRecord) -> String {
+    format!("{}|{}|{}", d.name, d.record_type, desired_normalized_content(d))
+}
+
 fn compute_fingerprint(token: &str, desired: &[DesiredRecord]) -> String {
     let mut parts: Vec<String> = desired
         .iter()
         .map(|d| {
             format!(
                 "{}|{}|{}|{}|{}|{:?}",
-                d.name, d.record_type, d.content, d.proxied, d.ttl, d.priority
+                d.name,
+                d.record_type,
+                desired_normalized_content(d),
+                d.proxied,
+                d.ttl,
+                d.priority
             )
         })
         .collect();
     parts.sort();
-    // Include token length & tail (not full token) plus desired records.
-    let tail: String = token.chars().rev().take(6).collect();
-    format!("{}:{}|{}", token.len(), tail, parts.join("\n"))
+    format!("{}|{}", token_hash(token), parts.join("\n"))
 }
 
 /// Build the user-facing `DnsStatusView` for `GET /v1/dns` and `latrix dns`.
@@ -1122,7 +1337,7 @@ pub fn status_view(agent: &Agent) -> DnsStatusView {
     let records = desired
         .into_iter()
         .map(|d| {
-            let key = record_key(&d.name, &d.record_type, &d.content);
+            let key = record_key_desired(&d);
             let zone = find_zone(&rt.zones, &d.name).map(|z| z.name.clone());
             let err = rt.record_errors.get(&key).cloned();
             let (status, error) = if !configured {
@@ -1184,7 +1399,19 @@ pub async fn sync_now(agent: &Arc<Agent>) -> Result<DnsSyncResult> {
     sync_locked(agent, CF_API_BASE).await
 }
 
+fn rate_limit_retry_after(err: &anyhow::Error) -> Option<u64> {
+    err.chain()
+        .find_map(|e| e.downcast_ref::<RateLimited>())
+        .map(|r| r.retry_after_secs)
+}
+
 async fn sync_locked(agent: &Arc<Agent>, api_base: &str) -> Result<DnsSyncResult> {
+    if !agent.is_leader() {
+        return Ok(DnsSyncResult {
+            status: status_view(agent),
+            ..Default::default()
+        });
+    }
     let s = agent.snapshot();
     let Some(token) = s.cloudflare_token.clone() else {
         return Ok(DnsSyncResult {
@@ -1192,6 +1419,7 @@ async fn sync_locked(agent: &Arc<Agent>, api_base: &str) -> Result<DnsSyncResult
             ..Default::default()
         });
     };
+    let thash = token_hash(&token);
     let live = agent.live();
     let desired = desired_records(&s, &live.view());
     let cf = CfClient::with_base(agent.http.clone(), &token, api_base);
@@ -1199,9 +1427,13 @@ async fn sync_locked(agent: &Arc<Agent>, api_base: &str) -> Result<DnsSyncResult
         Ok(z) => z,
         Err(e) => {
             let msg = format!("{e:#}");
+            let rl = rate_limit_retry_after(&e);
             {
                 let mut rt = agent.cloudflare.status.lock().unwrap();
-                rt.last_error = Some(msg.clone());
+                rt.last_error = Some(msg);
+                rt.consecutive_errors = rt.consecutive_errors.saturating_add(1);
+                let backoff = rl.unwrap_or_else(|| (30u64 << rt.consecutive_errors.min(4)).min(300));
+                rt.next_retry_at = now().saturating_add(backoff);
             }
             return Err(e);
         }
@@ -1231,6 +1463,7 @@ async fn sync_locked(agent: &Arc<Agent>, api_base: &str) -> Result<DnsSyncResult
     let mut errors: Vec<String> = vec![];
     let mut record_errors: BTreeMap<String, String> = BTreeMap::new();
     let mut new_managed: Vec<ManagedDnsRecord> = vec![];
+    let mut rate_limited_retry: Option<u64> = None;
 
     // Carry forward managed records from zones we couldn't inspect (if any).
     let touched_zones: BTreeSet<String> = by_zone.keys().cloned().collect();
@@ -1247,13 +1480,23 @@ async fn sync_locked(agent: &Arc<Agent>, api_base: &str) -> Result<DnsSyncResult
     zone_entries.sort_by(|a, b| a.1.name.cmp(&b.1.name));
 
     for (zone_id, zone, zone_desired) in zone_entries {
+        if rate_limited_retry.is_some() || !agent.is_leader() {
+            // Preserve existing managed entries for remaining zones we did not inspect.
+            for m in s.managed_dns.iter().filter(|m| m.zone_id == zone_id) {
+                new_managed.push(m.clone());
+            }
+            continue;
+        }
         let existing = match cf.list_records(&zone_id).await {
             Ok(list) => list,
             Err(e) => {
+                if let Some(ra) = rate_limit_retry_after(&e) {
+                    rate_limited_retry = Some(rate_limited_retry.map_or(ra, |cur| cur.max(ra)));
+                }
                 let msg = format!("{}: {e:#}", zone.name);
                 errors.push(msg.clone());
                 for d in &zone_desired {
-                    record_errors.insert(record_key(&d.name, &d.record_type, &d.content), msg.clone());
+                    record_errors.insert(record_key_desired(d), msg.clone());
                 }
                 // Preserve existing managed entries for this zone on transient read failure.
                 for m in s.managed_dns.iter().filter(|m| m.zone_id == zone_id) {
@@ -1264,12 +1507,21 @@ async fn sync_locked(agent: &Arc<Agent>, api_base: &str) -> Result<DnsSyncResult
         };
 
         let actions = plan_zone_sync(&s.cluster, zone, &zone_desired, &existing, &s.managed_dns);
+        let prev_managed_ids: BTreeSet<&str> = s
+            .managed_dns
+            .iter()
+            .filter(|m| m.zone_id == zone_id)
+            .map(|m| m.record_id.as_str())
+            .collect();
 
-        // Track live record IDs by (name, type, normalized_content) for updating ClusterState.managed_dns.
+        // Track live record IDs for updating ClusterState.managed_dns.
         let mut live_by_id: HashMap<String, CfRecord> =
             existing.into_iter().map(|r| (r.id.clone(), r)).collect();
 
         for action in actions {
+            if !agent.is_leader() {
+                break;
+            }
             match action {
                 SyncAction::Create(d) => match cf.create_record(&zone_id, &d, &tag).await {
                     Ok(rec) => {
@@ -1278,9 +1530,14 @@ async fn sync_locked(agent: &Arc<Agent>, api_base: &str) -> Result<DnsSyncResult
                         live_by_id.insert(rec.id.clone(), rec);
                     }
                     Err(e) => {
+                        let rl = rate_limit_retry_after(&e);
                         let msg = format!("create {} {} ({}): {e:#}", d.record_type, d.name, d.content);
-                        record_errors.insert(record_key(&d.name, &d.record_type, &d.content), format!("{e:#}"));
+                        record_errors.insert(record_key_desired(&d), format!("{e:#}"));
                         errors.push(msg);
+                        if let Some(ra) = rl {
+                            rate_limited_retry = Some(rate_limited_retry.map_or(ra, |cur| cur.max(ra)));
+                            break;
+                        }
                     }
                 },
                 SyncAction::Update { id, desired: d } => {
@@ -1291,9 +1548,14 @@ async fn sync_locked(agent: &Arc<Agent>, api_base: &str) -> Result<DnsSyncResult
                             live_by_id.insert(rec.id.clone(), rec);
                         }
                         Err(e) => {
+                            let rl = rate_limit_retry_after(&e);
                             let msg = format!("update {} {} ({}): {e:#}", d.record_type, d.name, d.content);
-                            record_errors.insert(record_key(&d.name, &d.record_type, &d.content), format!("{e:#}"));
+                            record_errors.insert(record_key_desired(&d), format!("{e:#}"));
                             errors.push(msg);
+                            if let Some(ra) = rl {
+                                rate_limited_retry = Some(rate_limited_retry.map_or(ra, |cur| cur.max(ra)));
+                                break;
+                            }
                         }
                     }
                 }
@@ -1309,26 +1571,31 @@ async fn sync_locked(agent: &Arc<Agent>, api_base: &str) -> Result<DnsSyncResult
                         live_by_id.remove(&id);
                     }
                     Err(e) => {
+                        let rl = rate_limit_retry_after(&e);
                         errors.push(format!("delete {record_type} {name} ({content}): {e:#}"));
+                        if let Some(ra) = rl {
+                            rate_limited_retry = Some(rate_limited_retry.map_or(ra, |cur| cur.max(ra)));
+                            break;
+                        }
                     }
                 },
             }
         }
 
-        // Rebuild managed_dns entries for this zone from all records currently in Cloudflare
-        // that match our desired set (or still carry our comment after a failed delete).
+        // Rebuild managed_dns entries for this zone strictly from records owned by this cluster
+        // (tagged with our comment or previously tracked in managed_dns).
         let desired_apps: HashMap<String, Option<String>> = zone_desired
             .iter()
-            .map(|d| (record_key(&d.name, &d.record_type, &d.content), d.app.clone()))
+            .map(|d| (record_key_desired(d), d.app.clone()))
             .collect();
         for rec in live_by_id.values() {
             let norm_name = normalize_dns_name(&rec.name);
             let norm_ty = rec.record_type.to_ascii_uppercase();
             let norm_content = cf_record_content(rec);
             let k = record_key(&norm_name, &norm_ty, &norm_content);
-            let is_desired = desired_apps.contains_key(&k);
             let is_tagged = rec.comment.as_deref() == Some(tag.as_str());
-            if is_desired || is_tagged {
+            let was_managed = prev_managed_ids.contains(rec.id.as_str());
+            if is_tagged || was_managed {
                 new_managed.push(ManagedDnsRecord {
                     zone_id: zone.id.clone(),
                     zone_name: zone.name.clone(),
@@ -1354,14 +1621,23 @@ async fn sync_locked(agent: &Arc<Agent>, api_base: &str) -> Result<DnsSyncResult
         ))
     });
 
+    let mut mutate_ok = true;
     if new_managed != s.managed_dns && agent.is_leader() {
         let updated_managed = new_managed.clone();
-        let _ = agent
+        let expected_token = token.clone();
+        if let Err(e) = agent
             .mutate(move |st| {
-                st.managed_dns = updated_managed;
+                // Avoid overwriting cleared state if the Cloudflare token was removed/rotated mid-sync.
+                if st.cloudflare_token.as_deref() == Some(expected_token.as_str()) {
+                    st.managed_dns = updated_managed;
+                }
                 Ok(())
             })
-            .await;
+            .await
+        {
+            warn!("cloudflare: failed to persist managed_dns state: {e:#}");
+            mutate_ok = false;
+        }
     }
 
     let last_error = if errors.is_empty() {
@@ -1373,13 +1649,20 @@ async fn sync_locked(agent: &Arc<Agent>, api_base: &str) -> Result<DnsSyncResult
     {
         let mut rt = agent.cloudflare.status.lock().unwrap();
         rt.zones = zones;
+        rt.zones_token_hash = thash;
         rt.last_sync = now();
         rt.last_error = last_error.clone();
         rt.record_errors = record_errors;
-        if errors.is_empty() {
+        if errors.is_empty() && mutate_ok {
             rt.last_fingerprint = fingerprint;
+            rt.consecutive_errors = 0;
+            rt.next_retry_at = 0;
         } else {
             rt.last_fingerprint.clear();
+            rt.consecutive_errors = rt.consecutive_errors.saturating_add(1);
+            let backoff = rate_limited_retry
+                .unwrap_or_else(|| (30u64 << rt.consecutive_errors.min(4)).min(300));
+            rt.next_retry_at = now().saturating_add(backoff);
         }
     }
 
@@ -1451,15 +1734,19 @@ pub async fn run(agent: Arc<Agent>) {
         let Some(token) = s.cloudflare_token.as_deref() else {
             continue;
         };
-        // Skip redundant API calls when nothing changed recently (re-verify against Cloudflare every 5 minutes).
+        // Respect rate-limit / error backoff and skip redundant API calls when unchanged.
         if !forced {
             let live = agent.live();
             let desired = desired_records(&s, &live.view());
             let fp = compute_fingerprint(token, &desired);
             let rt = agent.cloudflare.status.lock().unwrap();
+            let t = now();
+            if t < rt.next_retry_at {
+                continue;
+            }
             if !rt.last_fingerprint.is_empty()
                 && rt.last_fingerprint == fp
-                && now().saturating_sub(rt.last_sync) < 300
+                && t.saturating_sub(rt.last_sync) < 300
             {
                 continue;
             }
@@ -1945,5 +2232,80 @@ name = "play.example.com"
 
         cf.delete_record("zone1", &created.id).await.unwrap();
         assert!(cf.list_records("zone1").await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn plan_zone_sync_protects_other_clusters_and_normalizes_records() {
+        let zone = CfZone { id: "z1".into(), name: "example.com".into(), status: "active".into() };
+        let existing = vec![
+            // Owned by a different cluster — must NEVER be updated or deleted!
+            CfRecord {
+                id: "other-cluster".into(),
+                name: "shared.example.com".into(),
+                record_type: "A".into(),
+                content: "203.0.113.99".into(),
+                proxied: false,
+                ttl: 60,
+                priority: None,
+                comment: Some("latrix:staging".into()),
+                data: None,
+            },
+            // Untagged manual TXT record at the same name — must NEVER be hijacked!
+            CfRecord {
+                id: "manual-txt".into(),
+                name: "shared.example.com".into(),
+                record_type: "TXT".into(),
+                content: "manual=1".into(),
+                proxied: false,
+                ttl: 300,
+                priority: None,
+                comment: None,
+                data: None,
+            },
+            // Canonical IPv6 AAAA owned by this cluster
+            CfRecord {
+                id: "v6".into(),
+                name: "v6.example.com".into(),
+                record_type: "AAAA".into(),
+                content: "2001:db8::1".into(),
+                proxied: false,
+                ttl: 60,
+                priority: None,
+                comment: Some(comment_tag("prod")),
+                data: None,
+            },
+        ];
+        let desired = vec![
+            DesiredRecord {
+                app: Some("app".into()),
+                name: "shared.example.com".into(),
+                record_type: "A".into(),
+                content: "203.0.113.10".into(),
+                proxied: false,
+                ttl: 60,
+                priority: None,
+                source: "http".into(),
+                auto_ip: true,
+            },
+            DesiredRecord {
+                app: Some("app".into()),
+                name: "v6.example.com".into(),
+                record_type: "AAAA".into(),
+                content: "2001:0db8:0000:0000::0001".into(),
+                proxied: false,
+                ttl: 60,
+                priority: None,
+                source: "cli".into(),
+                auto_ip: false,
+            },
+        ];
+        let actions = plan_zone_sync("prod", &zone, &desired, &existing, &[]);
+        // Should ONLY create shared.example.com -> 203.0.113.10; never touch other-cluster, manual-txt, or canonicalized v6.
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert!(matches!(&actions[0], SyncAction::Create(d) if d.name == "shared.example.com" && d.content == "203.0.113.10"));
+
+        // Null MX target "." stays ".", and multi-space CAA parses cleanly
+        assert_eq!(normalize_target("."), ".");
+        assert_eq!(caa_effective_content("0   issue   \"letsencrypt.org\"").unwrap(), (0, "issue".into(), "letsencrypt.org".into()));
     }
 }

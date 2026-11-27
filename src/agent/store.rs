@@ -62,12 +62,13 @@ impl Agent {
         let s = self.snapshot();
         let alive = self.alive_set();
         let leader = s.machines.keys().copied().filter(|m| alive.contains(m)).min();
+        let lowest_configured = s.machines.keys().copied().min();
         // Right after start, give the mesh a moment before claiming leadership
-        // of a multi-machine cluster on our own.
+        // of a multi-machine cluster when lower-id peers haven't answered yet.
         if leader == Some(self.me.machine_id)
             && s.machines.len() > 1
-            && alive.len() == 1
             && self.started.elapsed() < Duration::from_secs(20)
+            && (alive.len() == 1 || lowest_configured != Some(self.me.machine_id))
         {
             return None;
         }
@@ -95,10 +96,9 @@ impl Agent {
         match serde_json::to_vec(s) {
             Ok(bytes) => {
                 let path = self.data.join("state.json");
-                if let Err(e) = util::write_atomic(&path, &bytes) {
+                if let Err(e) = util::write_atomic_private(&path, &bytes) {
                     warn!("could not persist state: {e}");
                 }
-                super::set_private(&path); // contains secrets
             }
             Err(e) => warn!("could not serialize state: {e}"),
         }
@@ -114,14 +114,15 @@ impl Agent {
         arc
     }
 
-    /// Accept a replicated state if it is newer than ours.
-    pub fn accept_state(&self, s: ClusterState) -> bool {
-        let cur = self.snapshot().version;
-        if s.version <= cur {
+    /// Accept a replicated state if it is newer than ours (serialized under `write_lock`).
+    pub async fn accept_state(&self, s: ClusterState) -> bool {
+        if s.cluster != self.me.cluster {
+            warn!("ignoring state for another cluster '{}'", s.cluster);
             return false;
         }
-        if s.cluster != self.me.cluster && !s.cluster.is_empty() {
-            warn!("ignoring state for another cluster '{}'", s.cluster);
+        let _guard = self.write_lock.lock().await;
+        let cur = self.snapshot().version;
+        if s.version <= cur {
             return false;
         }
         debug!("accepting state v{} (had v{cur})", s.version);
@@ -138,6 +139,9 @@ impl Agent {
             bail!("this machine is not the leader");
         }
         let _guard = self.write_lock.lock().await;
+        if !self.is_leader() {
+            bail!("this machine lost leadership before committing");
+        }
         let mut s = (*self.snapshot()).clone();
         let out = f(&mut s)?;
         self.commit(s);
@@ -158,7 +162,7 @@ impl Agent {
             }
             let agent = self.clone();
             let s = s.clone();
-            let url = format!("http://{}:{}/v1/local/state", m.overlay_ip, API_PORT);
+            let url = super::host_port_url(&m.overlay_ip, API_PORT, "/v1/local/state");
             tokio::spawn(async move {
                 let res = agent
                     .http
@@ -168,8 +172,12 @@ impl Agent {
                     .json(&*s)
                     .send()
                     .await;
-                if let Err(e) = res {
-                    debug!("state push to {url} failed: {e}");
+                match res {
+                    Ok(r) if !r.status().is_success() => {
+                        debug!("state push to {url} rejected: {}", r.status());
+                    }
+                    Err(e) => debug!("state push to {url} failed: {e}"),
+                    _ => {}
                 }
             });
         }
@@ -183,6 +191,7 @@ impl Agent {
             .lock()
             .unwrap()
             .iter()
+            .filter(|(_, (t, _))| t.elapsed() < Duration::from_secs(30))
             .map(|(k, (_, r))| (*k, r.clone()))
             .collect();
         // The leader's own report is always fresh.
@@ -209,12 +218,13 @@ impl Agent {
             build_cache_gb: self.rt.build_cache_gb(),
             docker_ok: self.rt.docker_ok(),
             events: vec![],
+            replica_volumes: self.vols.replica_volumes(&self.data, &self.snapshot(), self.me.machine_id),
         }
     }
 
     /// GET a JSON document from another machine's agent.
     pub async fn peer_get<T: for<'de> Deserialize<'de>>(&self, ip: &str, path: &str) -> Result<T> {
-        let url = format!("http://{ip}:{API_PORT}{path}");
+        let url = super::host_port_url(ip, API_PORT, path);
         let resp = self
             .http
             .get(&url)
@@ -231,7 +241,7 @@ impl Agent {
     async fn pull_state_from(&self, ip: &str) {
         match self.peer_get::<ClusterState>(ip, "/v1/local/state").await {
             Ok(s) => {
-                self.accept_state(s);
+                self.accept_state(s).await;
             }
             Err(e) => debug!("state pull from {ip} failed: {e}"),
         }
@@ -270,8 +280,16 @@ pub async fn ping_loop(agent: Arc<Agent>) {
                 }
             }
         }
+        // Prune removed machines from liveness map.
+        agent.alive.lock().unwrap().retain(|id, _| s.machines.contains_key(id));
         if let Some((_, ip)) = newest {
-            agent.pull_state_from(&ip).await;
+            if !agent.pull_in_flight.swap(true, Ordering::AcqRel) {
+                let agent_pull = agent.clone();
+                tokio::spawn(async move {
+                    agent_pull.pull_state_from(&ip).await;
+                    agent_pull.pull_in_flight.store(false, Ordering::Release);
+                });
+            }
         }
 
         // Track who is leader and since when.
@@ -313,10 +331,11 @@ pub async fn report_loop(agent: Arc<Agent>) {
         if leader == agent.me.machine_id {
             continue; // the leader reads its own report directly
         }
-        let mut report = agent.build_report();
-        report.events = std::mem::take(&mut *agent.outbox.lock().unwrap());
         let Some(ip) = agent.ip_of(leader) else { continue };
-        let url = format!("http://{ip}:{API_PORT}/v1/local/report");
+        let mut report = agent.build_report();
+        let sent_events = std::mem::take(&mut *agent.outbox.lock().unwrap());
+        report.events = sent_events.clone();
+        let url = super::host_port_url(&ip, API_PORT, "/v1/local/report");
         let res = agent
             .http
             .post(&url)
@@ -325,16 +344,33 @@ pub async fn report_loop(agent: Arc<Agent>) {
             .json(&report)
             .send()
             .await;
-        match res {
+        let ok = match res {
             Ok(r) if r.status().is_success() => {
                 if let Ok(ack) = r.json::<ReportAck>().await {
                     if ack.version > agent.snapshot().version {
                         agent.pull_state_from(&ip).await;
                     }
                 }
+                true
             }
-            Ok(r) => debug!("report rejected: {}", r.status()),
-            Err(e) => debug!("report to leader failed: {e}"),
+            Ok(r) => {
+                debug!("report rejected: {}", r.status());
+                false
+            }
+            Err(e) => {
+                debug!("report to leader failed: {e}");
+                false
+            }
+        };
+        if !ok && !sent_events.is_empty() {
+            let mut out = agent.outbox.lock().unwrap();
+            let mut combined = sent_events;
+            combined.extend(out.drain(..));
+            if combined.len() > 50 {
+                let drop_n = combined.len() - 50;
+                combined.drain(..drop_n);
+            }
+            *out = combined;
         }
     }
 }
@@ -350,6 +386,7 @@ pub async fn leader_loop(agent: Arc<Agent>) {
         }
         if !agent.is_leader() {
             agent.dead_since.lock().unwrap().clear();
+            agent.reports.lock().unwrap().clear();
             continue;
         }
         // Track how long machines have been unreachable.
@@ -357,6 +394,7 @@ pub async fn leader_loop(agent: Arc<Agent>) {
             let alive = agent.alive_set();
             let s = agent.snapshot();
             let mut ds = agent.dead_since.lock().unwrap();
+            ds.retain(|id, _| s.machines.contains_key(id));
             for m in s.machines.keys() {
                 if alive.contains(m) {
                     ds.remove(m);
@@ -364,6 +402,7 @@ pub async fn leader_loop(agent: Arc<Agent>) {
                     ds.entry(*m).or_insert_with(now);
                 }
             }
+            agent.reports.lock().unwrap().retain(|id, _| s.machines.contains_key(id));
         }
         if agent.leader_for() < 3 && agent.snapshot().machines.len() > 1 {
             continue;
@@ -371,13 +410,19 @@ pub async fn leader_loop(agent: Arc<Agent>) {
         let live = agent.live();
         let events = {
             let _guard = agent.write_lock.lock().await;
+            if !agent.is_leader() {
+                continue;
+            }
             let before = agent.snapshot();
             let mut s = (*before).clone();
             let events = {
                 let mut mem = agent.sched_mem.lock().unwrap();
                 scheduler::reconcile(&mut s, &live.view(), &mut mem)
             };
-            let changed = serde_json::to_vec(&s).ok() != serde_json::to_vec(&*before).ok();
+            let changed = match (serde_json::to_vec(&s), serde_json::to_vec(&*before)) {
+                (Ok(a), Ok(b)) => a != b,
+                _ => false,
+            };
             if changed {
                 agent.commit(s);
             }

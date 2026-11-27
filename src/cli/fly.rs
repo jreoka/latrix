@@ -52,7 +52,32 @@ fn fly(bin: &str, args: &[&str]) -> Result<String> {
 
 fn sanitize(s: &str) -> String {
     let s: String = s.to_ascii_lowercase().chars().map(|c| if c.is_ascii_alphanumeric() { c } else { '-' }).collect();
-    s.trim_matches('-').chars().take(48).collect()
+    let truncated: String = s.trim_matches('-').chars().take(48).collect();
+    let clean = truncated.trim_end_matches('-');
+    if clean.is_empty() {
+        "app".into()
+    } else {
+        clean.to_string()
+    }
+}
+
+struct RemoveDirGuard(PathBuf);
+impl Drop for RemoveDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn selected_process_group(f: &Value) -> String {
+    if let Some(p) = f["processes"].as_object() {
+        if p.contains_key("app") {
+            "app".into()
+        } else {
+            p.keys().next().cloned().unwrap_or_else(|| "app".into())
+        }
+    } else {
+        "app".into()
+    }
 }
 
 fn as_list(v: &Value) -> Vec<Value> {
@@ -187,14 +212,20 @@ pub fn convert_fly(f: &Value, name: &str, instances: u32, domains: Vec<String>) 
 
     // [[vm]] / [vm]
     if let Some(vm) = as_list(&f["vm"]).first() {
-        if let Some(m) = fly_memory(&vm["memory"]).or_else(|| fly_memory(&vm["memory_mb"])) {
+        let mem_set = if let Some(m) = fly_memory(&vm["memory"]).or_else(|| fly_memory(&vm["memory_mb"])) {
             cfg.scale.memory = m;
-        }
-        if let Some(c) = vm["cpus"].as_f64() {
+            true
+        } else {
+            false
+        };
+        if let Some(c) = vm["cpus"].as_f64().filter(|c| c.is_finite() && *c > 0.0) {
             cfg.scale.cpu = c;
         }
-    } else if let Some(size) = f["vm"]["size"].as_str() {
-        warnings.push(format!("VM size '{size}' — check [scale] cpu/memory in latrix.toml"));
+        if !mem_set {
+            if let Some(size) = vm["size"].as_str() {
+                warnings.push(format!("VM size '{size}' — check [scale] cpu/memory in latrix.toml"));
+            }
+        }
     }
 
     // [[mounts]]
@@ -274,9 +305,19 @@ pub fn secret_names(v: &Value) -> Vec<String> {
         .collect()
 }
 
-/// Pick the secret values out of `env` output.
+/// Pick the secret values out of `env -0` (NUL-delimited) or plain `env` output.
 pub fn secrets_from_env(env: &str, names: &[String]) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
+    if env.contains('\0') {
+        for entry in env.split('\0') {
+            if let Some((k, v)) = entry.split_once('=') {
+                if names.iter().any(|n| n == k) {
+                    out.insert(k.to_string(), v.to_string());
+                }
+            }
+        }
+        return out;
+    }
     for line in env.lines() {
         let line = line.trim_end_matches('\r');
         if let Some((k, v)) = line.split_once('=') {
@@ -288,15 +329,20 @@ pub fn secrets_from_env(env: &str, names: &[String]) -> BTreeMap<String, String>
     out
 }
 
-fn count_machines(v: &Value) -> u32 {
+fn count_machines_for_group(v: &Value, group: &str) -> u32 {
     as_list(v)
         .iter()
         .filter(|m| m["state"].as_str().map(|s| s != "destroyed" && s != "destroying").unwrap_or(true))
         .filter(|m| {
             let g = m["config"]["metadata"]["fly_process_group"].as_str().unwrap_or("app");
-            g == "app" || g.is_empty()
+            g == group || (group == "app" && g.is_empty())
         })
         .count() as u32
+}
+
+#[cfg(test)]
+fn count_machines(v: &Value) -> u32 {
+    count_machines_for_group(v, "app")
 }
 
 fn hostnames(v: &Value) -> Vec<String> {
@@ -441,6 +487,9 @@ fn copy_volume_from_fly(bin: &str, app: &str, remote_path: &str, dest: &Path, wo
         let _ = std::io::stdout().flush();
     }
 
+    if stream_res.is_err() {
+        let _ = child.kill();
+    }
     let status = child.wait()?;
     let stderr = stderr_thread.join().unwrap_or_default();
     let stderr_trim = stderr.trim();
@@ -508,24 +557,31 @@ pub async fn import(cfg: &CliConfig, cl: Option<&str>, o: ImportOptions) -> Resu
     let certs = fly(bin, &["certs", "list", "-a", app, "--json"]).ok().and_then(|t| serde_json::from_str(&t).ok()).unwrap_or(Value::Null);
     let domains = hostnames(&certs);
     let name = o.name.clone().unwrap_or_else(|| sanitize(app));
-    let (config, warnings) = convert_fly(&f, &name, count_machines(&machines), domains.clone());
+    let proc_group = selected_process_group(&f);
+    let (config, warnings) = convert_fly(&f, &name, count_machines_for_group(&machines, &proc_group), domains.clone());
     config.validate().context("the converted config is not valid")?;
     for w in &warnings {
         println!("    note: {w}");
     }
 
-    let work = backup::temp_dir("fly")?;
+    let work_guard = RemoveDirGuard(backup::temp_dir("fly")?);
+    let work = &work_guard.0;
     let mut files: Vec<(String, PathBuf)> = vec![];
 
     // secrets
     let mut secrets = BTreeMap::new();
     if !o.no_secrets {
-        let names = secret_names(&serde_json::from_str(&fly(bin, &["secrets", "list", "-a", app, "--json"])?).unwrap_or(Value::Null));
+        let raw_secrets = fly(bin, &["secrets", "list", "-a", app, "--json"])?;
+        let parsed_secrets: Value =
+            serde_json::from_str(&raw_secrets).context("invalid JSON from `fly secrets list --json`")?;
+        let names = secret_names(&parsed_secrets);
         if !names.is_empty() {
             println!("==> reading {} secret value(s) from a running machine", names.len());
-            let env = fly(bin, &["ssh", "console", "-a", app, "-C", "env"]).context(
-                "reading secrets needs a running machine with SSH (start one with `fly machine start`, or pass --no-secrets and set them with `latrix secrets set`)",
-            )?;
+            let env = fly(bin, &["ssh", "console", "--pty=false", "-q", "-a", app, "-C", "env -0"])
+                .or_else(|_| fly(bin, &["ssh", "console", "--pty=false", "-q", "-a", app, "-C", "env"]))
+                .context(
+                    "reading secrets needs a running machine with SSH (start one with `fly machine start`, or pass --no-secrets and set them with `latrix secrets set`)",
+                )?;
             secrets = secrets_from_env(&env, &names);
             let missing: Vec<&String> = names.iter().filter(|n| !secrets.contains_key(*n)).collect();
             if !missing.is_empty() {
@@ -551,6 +607,7 @@ pub async fn import(cfg: &CliConfig, cl: Option<&str>, o: ImportOptions) -> Resu
             });
         match refs {
             Some(r) => {
+                util::validate_image_ref(&r)?;
                 println!("==> pulling the deployed image {r} (needs Docker running locally)");
                 let _ = fly(bin, &["auth", "docker"]);
                 let st = std::process::Command::new("docker").args(["pull", &r]).status().context("running docker (install Docker, or use --from-source)")?;
@@ -575,7 +632,7 @@ pub async fn import(cfg: &CliConfig, cl: Option<&str>, o: ImportOptions) -> Resu
         for v in &config.volumes {
             println!("==> copying volume '{}' ({})", v.name, v.path);
             let local = work.join(format!("vol-{}.tar.gz", v.name));
-            let size = copy_volume_from_fly(bin, app, &v.path, &local, &work)?;
+            let size = copy_volume_from_fly(bin, app, &v.path, &local, work)?;
             println!("    {:.1} MB", size as f64 / 1048576.0);
             let file = format!("volumes/{}.tar.gz", v.name);
             files.push((file.clone(), local));
@@ -586,7 +643,7 @@ pub async fn import(cfg: &CliConfig, cl: Option<&str>, o: ImportOptions) -> Resu
     // Keep a local copy, then restore it onto the cluster.
     let manifest = Manifest {
         format: backup::FORMAT,
-        app: name.clone(),
+        app: config.app.clone(),
         created_at: now(),
         source: format!("fly:{app}"),
         config: config.clone(),
@@ -597,9 +654,9 @@ pub async fn import(cfg: &CliConfig, cl: Option<&str>, o: ImportOptions) -> Resu
         volumes,
         dns_records: vec![],
     };
-    let archive = backup::default_dir().join(format!("fly-{app}-{}.latrix-backup.tar", backup::stamp(now())));
+    let archive = backup::default_dir().join(format!("fly-{}-{}.latrix-backup.tar", config.app, backup::stamp(now())));
     backup::write_archive(&archive, &manifest, &files)?;
-    let _ = std::fs::remove_dir_all(&work);
+    drop(work_guard);
     println!("==> saved a copy as {}", archive.display());
 
     if !Path::new("latrix.toml").exists() {
@@ -614,20 +671,20 @@ pub async fn import(cfg: &CliConfig, cl: Option<&str>, o: ImportOptions) -> Resu
     let c = Client::connect(&p).await?;
     if build_from_source {
         // Create it stopped with secrets + data, then build & deploy from here.
-        let (m2, dir) = backup::read_archive(&archive)?;
-        let mut m2 = m2;
+        let (mut m2, dir) = backup::read_archive(&archive)?;
+        let _dir_guard = RemoveDirGuard(dir.clone());
         m2.image = "busybox:1.36".into();
         m2.count = 0;
         m2.config.scale.count = Some(0);
         m2.config.scale.min = None;
         m2.config.scale.max = None;
-        backup::restore_bundle(&c, &m2, &dir, &name, "imported from Fly (data)").await?;
-        let _ = std::fs::remove_dir_all(&dir);
+        backup::restore_bundle(&c, &m2, &dir, &config.app, "imported from Fly (data)").await?;
+        drop(_dir_guard);
         super::deploy::deploy_one(&c, &config, Path::new("."), false, Some(format!("imported from Fly app {app}"))).await?;
     } else {
         let (m, dir) = backup::read_archive(&archive)?;
-        backup::restore_bundle(&c, &m, &dir, &name, &format!("imported from Fly app {app}")).await?;
-        let _ = std::fs::remove_dir_all(&dir);
+        let _dir_guard = RemoveDirGuard(dir.clone());
+        backup::restore_bundle(&c, &m, &dir, &config.app, &format!("imported from Fly app {app}")).await?;
     }
 
     let st: StatusView = c.get("/v1/status").await?;
@@ -778,5 +835,21 @@ primary_region = "ams"
         std::fs::write(&bad_path, &gz_bytes[..gz_bytes.len() - 4]).unwrap();
         assert!(verify_gzip(&bad_path).is_err());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn nul_env_multiline_secrets_and_vm_size_warning() {
+        let names = vec!["TLS_KEY".to_string(), "API_KEY".to_string()];
+        let env0 = "PATH=/usr/bin\0TLS_KEY=-----BEGIN KEY-----\nline1\nline2\n-----END KEY-----\0API_KEY=tok=123\0";
+        let secrets = secrets_from_env(env0, &names);
+        assert_eq!(secrets["TLS_KEY"], "-----BEGIN KEY-----\nline1\nline2\n-----END KEY-----");
+        assert_eq!(secrets["API_KEY"], "tok=123");
+
+        let f = json!({
+            "app": "my-app",
+            "vm": [{"size": "shared-cpu-4x"}]
+        });
+        let (_cfg, warnings) = convert_fly(&f, "my-app", 1, vec![]);
+        assert!(warnings.iter().any(|w| w.contains("shared-cpu-4x")));
     }
 }

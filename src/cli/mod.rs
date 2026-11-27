@@ -65,7 +65,7 @@ pub enum Cmd {
         #[arg(long)]
         image: Option<String>,
         /// Port your app listens on
-        #[arg(long)]
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
         port: Option<u16>,
         /// Overwrite an existing latrix.toml
         #[arg(long)]
@@ -213,7 +213,7 @@ pub enum Cmd {
     /// Open the web dashboard
     Dashboard {
         /// Local port for the dashboard
-        #[arg(long, default_value_t = 7475)]
+        #[arg(long, default_value_t = 7475, value_parser = clap::value_parser!(u16).range(1..))]
         port: u16,
         /// Don't open a browser
         #[arg(long)]
@@ -279,7 +279,7 @@ pub struct DestroyArgs {
     #[arg(short, long)]
     pub yes: bool,
     /// Keep the app's volume data on the machines (deleted by default)
-    #[arg(long)]
+    #[arg(long, conflicts_with = "purge_volumes")]
     pub keep_volumes: bool,
     /// (old flag; volume data is now deleted by default)
     #[arg(long, hide = true)]
@@ -416,13 +416,13 @@ pub struct DeployArgs {
     #[arg(short, long, default_value = "latrix.toml")]
     pub config: PathBuf,
     /// Deploy this image instead of building
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["git", "compose"])]
     pub image: Option<String>,
     /// Build from this git repository on the cluster (url[#branch])
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["image", "compose"])]
     pub git: Option<String>,
     /// Deploy every service of a docker-compose file
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["image", "git"])]
     pub compose: Option<PathBuf>,
     /// Don't wait for the rollout to finish
     #[arg(short, long)]
@@ -435,10 +435,18 @@ pub struct DeployArgs {
 #[derive(Subcommand)]
 pub enum SecretsCmd {
     /// Set secrets: latrix secrets set myapp KEY=value OTHER=value
-    Set { app: String, pairs: Vec<String> },
+    Set {
+        app: String,
+        #[arg(required = true)]
+        pairs: Vec<String>,
+    },
     /// Remove secrets
     #[command(alias = "rm", alias = "delete")]
-    Unset { app: String, names: Vec<String> },
+    Unset {
+        app: String,
+        #[arg(required = true)]
+        names: Vec<String>,
+    },
     /// List secret names
     #[command(alias = "ls")]
     List { app: String },
@@ -454,7 +462,7 @@ pub enum MachineCmd {
         #[arg(long)]
         name: Option<String>,
         /// SSH port
-        #[arg(short, long, default_value_t = 22)]
+        #[arg(short, long, default_value_t = 22, value_parser = clap::value_parser!(u16).range(1..))]
         port: u16,
         /// SSH private key
         #[arg(short = 'i', long)]
@@ -772,7 +780,7 @@ pub enum ClusterCmd {
         /// user@host of any machine in the cluster
         target: String,
         /// SSH port
-        #[arg(short, long, default_value_t = 22)]
+        #[arg(short, long, default_value_t = 22, value_parser = clap::value_parser!(u16).range(1..))]
         port: u16,
         /// SSH private key
         #[arg(short = 'i', long)]

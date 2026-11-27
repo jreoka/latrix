@@ -69,14 +69,21 @@ impl Kube {
             .stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            .kill_on_drop(true)
             .spawn()
             .context("could not run `kubectl` — install it and make sure it can reach your cluster")?;
         if let Some(i) = input {
-            let mut stdin = child.stdin.take().unwrap();
-            stdin.write_all(i.as_bytes()).await?;
-            drop(stdin);
+            if let Some(mut stdin) = child.stdin.take() {
+                if let Err(e) = stdin.write_all(i.as_bytes()).await {
+                    if e.kind() != std::io::ErrorKind::BrokenPipe {
+                        return Err(e.into());
+                    }
+                }
+            }
         }
-        let out = child.wait_with_output().await?;
+        let out = tokio::time::timeout(std::time::Duration::from_secs(600), child.wait_with_output())
+            .await
+            .context("kubectl command timed out after 10 minutes")??;
         if !out.status.success() {
             bail!(
                 "kubectl {}: {}",
@@ -136,11 +143,25 @@ fn cpu_quantity(cpu: f64) -> String {
 }
 
 pub fn hosts(cfg: &AppConfig, t: &K8sTarget) -> Vec<String> {
-    let mut h: Vec<String> = cfg.http.iter().flat_map(|h| h.domains.iter().cloned()).collect();
+    let mut h: Vec<String> = vec![];
+    for d in cfg.http.iter().flat_map(|h| h.domains.iter()) {
+        let d = crate::config::normalize_dns_name(d);
+        if !d.is_empty() && !h.contains(&d) {
+            h.push(d);
+        }
+    }
     if let (Some(base), Some(_)) = (&t.base_domain, &cfg.http) {
-        h.push(format!("{}.{}", cfg.app, base));
+        let sub = format!("{}.{}", cfg.app, crate::config::normalize_dns_name(base));
+        if !h.contains(&sub) {
+            h.push(sub);
+        }
     }
     h
+}
+
+fn escape_k8s_env(val: &str) -> String {
+    // Kubernetes interprets `$(VAR)` in literal env values; doubling `$` escapes it.
+    val.replace('$', "$$")
 }
 
 fn workload_kind(cfg: &AppConfig) -> &'static str {
@@ -166,18 +187,26 @@ pub fn render(cfg: &AppConfig, image: &str, version: u64, t: &K8sTarget) -> Vec<
     }
     for (k, v) in &cfg.env {
         env.retain(|e| e["name"] != json!(k));
-        env.push(json!({"name": k, "value": v}));
+        env.push(json!({"name": k, "value": escape_k8s_env(v)}));
+    }
+    let mut seen_cports = std::collections::BTreeSet::new();
+    let mut container_ports = vec![];
+    for p in &ports {
+        if seen_cports.insert((*p, "TCP")) {
+            container_ports.push(json!({"containerPort": p, "name": format!("p{p}")}));
+        }
+    }
+    for (_, p) in cfg.udp_ports() {
+        if seen_cports.insert((p, "UDP")) {
+            container_ports.push(json!({"containerPort": p, "name": format!("u{p}"), "protocol": "UDP"}));
+        }
     }
     let mut container = json!({
         "name": app,
         "image": image,
         "env": env,
         "envFrom": [{"secretRef": {"name": format!("{app}-secrets"), "optional": true}}],
-        "ports": ports
-            .iter()
-            .map(|p| json!({"containerPort": p, "name": format!("p{p}")}))
-            .chain(cfg.udp_ports().iter().map(|(_, p)| json!({"containerPort": p, "name": format!("u{p}"), "protocol": "UDP"})))
-            .collect::<Vec<_>>(),
+        "ports": container_ports,
         "resources": {
             "requests": {"cpu": cpu_quantity(cfg.scale.cpu.max(0.01)), "memory": format!("{}Mi", cfg.scale.memory_mb())},
             "limits": {"memory": format!("{}Mi", cfg.scale.memory_mb())},
@@ -236,7 +265,12 @@ pub fn render(cfg: &AppConfig, image: &str, version: u64, t: &K8sTarget) -> Vec<
             .volumes
             .iter()
             .map(|v| {
-                let size = v.size.as_deref().and_then(|s| parse_size_mb(s).ok()).unwrap_or(10 * 1024);
+                let size = v
+                    .size
+                    .as_deref()
+                    .and_then(|s| parse_size_mb(s).ok())
+                    .unwrap_or(10 * 1024)
+                    .max(1);
                 let mut c = json!({
                     "metadata": {"name": v.name, "labels": lbl},
                     "spec": {
@@ -250,17 +284,32 @@ pub fn render(cfg: &AppConfig, image: &str, version: u64, t: &K8sTarget) -> Vec<
                 c
             })
             .collect();
+        let headless_name = format!("{app}-headless");
         docs.push(json!({
             "apiVersion": "apps/v1",
             "kind": "StatefulSet",
             "metadata": {"name": app, "labels": lbl},
             "spec": {
                 "replicas": cfg.scale.initial().min(1),
-                "serviceName": app,
+                "serviceName": headless_name,
                 "selector": {"matchLabels": selector(cfg)},
                 "template": pod,
                 "volumeClaimTemplates": claims,
             },
+        }));
+        let headless_ports: Vec<Value> = ports
+            .iter()
+            .map(|p| json!({"name": format!("p{p}"), "port": p, "targetPort": p}))
+            .collect();
+        let mut headless_spec = json!({"clusterIP": "None", "selector": selector(cfg)});
+        if !headless_ports.is_empty() {
+            headless_spec["ports"] = json!(headless_ports);
+        }
+        docs.push(json!({
+            "apiVersion": "v1",
+            "kind": "Service",
+            "metadata": {"name": headless_name, "labels": lbl},
+            "spec": headless_spec,
         }));
     } else {
         let strategy = if cfg.deploy.rolling() {
@@ -307,18 +356,23 @@ pub fn render(cfg: &AppConfig, image: &str, version: u64, t: &K8sTarget) -> Vec<
             }
         }
     }
+    let mut seen_pub = std::collections::BTreeSet::new();
     let public: Vec<Value> = cfg
         .ports
         .iter()
         .filter(|p| p.public)
-        .map(|p| {
+        .filter_map(|p| {
             let udp = p.protocol == "udp";
-            json!({
-                "name": format!("{}{}", if udp { "u" } else { "p" }, p.port),
-                "port": p.public_port.unwrap_or(p.port),
+            let pub_port = p.public_port.unwrap_or(p.port);
+            if !seen_pub.insert((pub_port, udp)) {
+                return None;
+            }
+            Some(json!({
+                "name": format!("{}{}", if udp { "u" } else { "p" }, pub_port),
+                "port": pub_port,
                 "targetPort": p.port,
                 "protocol": if udp { "UDP" } else { "TCP" },
-            })
+            }))
         })
         .collect();
     if !public.is_empty() {
@@ -355,8 +409,8 @@ pub fn render(cfg: &AppConfig, image: &str, version: u64, t: &K8sTarget) -> Vec<
         docs.push(ing);
     }
 
-    // --- autoscaling
-    if cfg.scale.autoscale() {
+    // --- autoscaling (only for stateless workloads with max > 1)
+    if cfg.scale.autoscale() && !cfg.stateful() && max > 1 {
         docs.push(json!({
             "apiVersion": "autoscaling/v2", "kind": "HorizontalPodAutoscaler",
             "metadata": {"name": app, "labels": lbl},
@@ -411,10 +465,12 @@ pub struct K8sRelease {
 
 async fn load_history(k: &Kube, app: &str) -> Result<Vec<K8sRelease>> {
     match k.json(&["get", "configmap", &format!("{app}-latrix")]).await {
-        Ok(v) => Ok(v["data"]["releases.json"]
-            .as_str()
-            .and_then(|s| serde_json::from_str(s).ok())
-            .unwrap_or_default()),
+        Ok(v) => match v["data"]["releases.json"].as_str() {
+            Some(s) if !s.trim().is_empty() => {
+                serde_json::from_str(s).with_context(|| format!("corrupt release history in ConfigMap {app}-latrix"))
+            }
+            _ => Ok(vec![]),
+        },
         Err(e) if e.to_string().contains("NotFound") || e.to_string().contains("not found") => Ok(vec![]),
         Err(e) => Err(e),
     }
@@ -454,6 +510,28 @@ async fn run_local(program: &str, args: &[String], dir: Option<&Path>) -> Result
     Ok(())
 }
 
+struct RemoveDirGuard(std::path::PathBuf);
+impl Drop for RemoveDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn confine_subpath(root: &Path, sub: &str, label: &str) -> Result<std::path::PathBuf> {
+    let p = Path::new(sub);
+    if p.is_absolute() {
+        bail!("{label} '{sub}' must be a relative path");
+    }
+    let joined = root.join(p);
+    let canon_root = std::fs::canonicalize(root).with_context(|| format!("resolving {}", root.display()))?;
+    let canon_target = std::fs::canonicalize(&joined)
+        .with_context(|| format!("{label} '{}' does not exist", joined.display()))?;
+    if !canon_target.starts_with(&canon_root) {
+        bail!("{label} '{sub}' escapes the build root");
+    }
+    Ok(canon_target)
+}
+
 /// Build with local Docker (buildx) and push to the target's registry.
 /// The previous `:latest` image doubles as the build cache (inline cache),
 /// so builds from any computer reuse layers.
@@ -468,24 +546,33 @@ async fn build_and_push(cfg: &AppConfig, base: &Path, t: &K8sTarget) -> Result<S
     let repo = format!("{}/{}", reg.trim_end_matches('/'), cfg.app);
     let tag = format!("{}-{}", now(), util::random_id(4));
     let image = format!("{repo}:{tag}");
-    let tmp;
-    let ctx = match &cfg.build.git {
+    let mut _git_guard: Option<RemoveDirGuard> = None;
+    let (ctx, dockerfile) = match &cfg.build.git {
         Some(url) => {
-            tmp = std::env::temp_dir().join(format!("latrix-git-{}", util::random_id(6)));
+            util::validate_git_url(url)?;
+            let tmp = std::env::temp_dir().join(format!("latrix-git-{}", util::random_id(8)));
+            _git_guard = Some(RemoveDirGuard(tmp.clone()));
             let mut args = vec!["clone".to_string(), "--depth".into(), "1".into()];
             if let Some(b) = &cfg.build.branch {
+                util::validate_git_branch(b)?;
                 args.push("--branch".into());
                 args.push(b.clone());
             }
+            args.push("--".into());
             args.push(url.clone());
             args.push(tmp.display().to_string());
-            println!("==> cloning {url}");
+            println!("==> cloning {}", util::redact_url_creds(url));
             run_local("git", &args, None).await?;
-            tmp.join(cfg.build.context.as_deref().unwrap_or("."))
+            let ctx = confine_subpath(&tmp, cfg.build.context.as_deref().unwrap_or("."), "build.context")?;
+            let df = confine_subpath(&ctx, cfg.build.dockerfile.as_deref().unwrap_or("Dockerfile"), "build.dockerfile")?;
+            (ctx, df)
         }
-        None => base.join(cfg.build.context.as_deref().unwrap_or(".")),
+        None => {
+            let ctx = base.join(cfg.build.context.as_deref().unwrap_or("."));
+            let df = ctx.join(cfg.build.dockerfile.as_deref().unwrap_or("Dockerfile"));
+            (ctx, df)
+        }
     };
-    let dockerfile = ctx.join(cfg.build.dockerfile.as_deref().unwrap_or("Dockerfile"));
     let mut args: Vec<String> = vec![
         "buildx".into(),
         "build".into(),
@@ -515,9 +602,7 @@ async fn build_and_push(cfg: &AppConfig, base: &Path, t: &K8sTarget) -> Result<S
     args.push(ctx.display().to_string());
     println!("==> building {image} ({}) with local Docker", t.platform);
     let res = run_local("docker", &args, None).await;
-    if cfg.build.git.is_some() {
-        let _ = std::fs::remove_dir_all(ctx.ancestors().last().unwrap_or(&ctx));
-    }
+    drop(_git_guard);
     res.context("docker build/push failed (is Docker running, and are you logged in to the registry?)")?;
     Ok(image)
 }
@@ -529,16 +614,18 @@ async fn kube_for(t: &K8sTarget) -> Kube {
     Kube { t: t.clone() }
 }
 
-async fn apply_release(k: &Kube, cfg: &AppConfig, image: &str, version: u64, prev: Option<&K8sRelease>) -> Result<()> {
+async fn apply_docs(k: &Kube, cfg: &AppConfig, image: &str, version: u64) -> Result<Vec<Value>> {
     let docs = render(cfg, image, version, &k.t);
     k.apply(&to_yaml(&docs)?).await?;
-    if let Some(p) = prev {
-        let old = render(&p.config, &p.image, p.version, &k.t);
-        for (kind, name) in stale(&old, &docs) {
-            let _ = k.run(&["delete", &kind.to_ascii_lowercase(), &name, "--ignore-not-found"]).await;
-        }
+    Ok(docs)
+}
+
+async fn prune_stale(k: &Kube, old: &[Value], cur: &[Value]) {
+    for (kind, name) in stale(old, cur) {
+        let _ = k
+            .run(&["delete", &kind.to_ascii_lowercase(), &name, "--ignore-not-found"])
+            .await;
     }
-    Ok(())
 }
 
 async fn wait_rollout(k: &Kube, cfg: &AppConfig) -> Result<()> {
@@ -591,6 +678,9 @@ pub async fn deploy(t: &K8sTarget, cfg: &AppConfig, base: &Path, message: Option
 async fn release(k: &Kube, cfg: AppConfig, image: String, description: String) -> Result<()> {
     let mut hist = load_history(k, &cfg.app).await?;
     let prev = current(&hist).cloned();
+    let prev_docs = prev
+        .as_ref()
+        .map(|p| render(&p.config, &p.image, p.version, &k.t));
     let version = hist.iter().map(|r| r.version).max().unwrap_or(0) + 1;
     hist.push(K8sRelease {
         version,
@@ -601,7 +691,16 @@ async fn release(k: &Kube, cfg: AppConfig, image: String, description: String) -
         description,
     });
     save_history(k, &cfg, hist.clone()).await?;
-    apply_release(k, &cfg, &image, version, prev.as_ref()).await?;
+    let new_docs = match apply_docs(k, &cfg, &image, version).await {
+        Ok(docs) => docs,
+        Err(e) => {
+            for r in hist.iter_mut().filter(|r| r.version == version) {
+                r.status = "failed".into();
+            }
+            let _ = save_history(k, &cfg, hist).await;
+            return Err(e);
+        }
+    };
     println!("==> Release v{version} applied, waiting for the rollout");
     let ok = wait_rollout(k, &cfg).await;
     for r in hist.iter_mut() {
@@ -614,6 +713,9 @@ async fn release(k: &Kube, cfg: AppConfig, image: String, description: String) -
     save_history(k, &cfg, hist).await?;
     match ok {
         Ok(()) => {
+            if let Some(old) = &prev_docs {
+                prune_stale(k, old, &new_docs).await;
+            }
             println!("\n✓ {} v{version} is live", cfg.app);
             print_urls(k, &cfg).await;
             Ok(())
@@ -621,7 +723,8 @@ async fn release(k: &Kube, cfg: AppConfig, image: String, description: String) -
         Err(e) => {
             if let Some(p) = prev {
                 println!("==> rollout failed, rolling back to v{}", p.version);
-                apply_release(k, &p.config, &p.image, p.version, None).await?;
+                let restored = apply_docs(k, &p.config, &p.image, p.version).await?;
+                prune_stale(k, &new_docs, &restored).await;
                 let _ = wait_rollout(k, &p.config).await;
             }
             bail!("release v{version} did not become ready ({e:#}).\n  See what happened: latrix logs {}", cfg.app)
@@ -654,7 +757,7 @@ fn pod_rows(pods: &Value) -> Vec<Vec<String>> {
                 p["spec"]["nodeName"].as_str().unwrap_or("-").to_string(),
                 p["status"]["phase"].as_str().unwrap_or("").to_lowercase(),
                 if cs["ready"].as_bool().unwrap_or(false) { "✓".into() } else { "✗".into() },
-                cs["restartCount"].to_string(),
+                cs["restartCount"].as_u64().unwrap_or(0).to_string(),
                 started.to_string(),
             ]
         })
@@ -694,7 +797,13 @@ pub async fn status(name: &str, t: &K8sTarget) -> Result<()> {
             format!("v{} {}", cur.version, cur.status),
             format!("{ready}/{want}"),
             workload_kind(&cur.config).to_string(),
-            hosts(&cur.config, t).first().cloned().unwrap_or_else(|| format!("{app}:{}", cur.config.container_ports().first().map(|p| p.to_string()).unwrap_or_default())),
+            hosts(&cur.config, t).first().cloned().unwrap_or_else(|| {
+                cur.config
+                    .container_ports()
+                    .first()
+                    .map(|p| format!("{app}:{p}"))
+                    .unwrap_or_else(|| "-".into())
+            }),
         ]);
     }
     if rows.is_empty() {
@@ -744,7 +853,9 @@ async fn ps(k: &Kube, app: &str) -> Result<()> {
     );
     print_urls(k, c).await;
     println!();
-    let pods = k.json(&["get", "pods", "-l", &format!("app.kubernetes.io/name={app}")]).await?;
+    let pods = k
+        .json(&["get", "pods", "-l", &format!("app.kubernetes.io/name={app},{MANAGED}")])
+        .await?;
     print_table(&["POD", "REL", "NODE", "PHASE", "READY", "RESTARTS", "STARTED"], pod_rows(&pods));
     println!();
     print_history(&load_history(k, app).await?);
@@ -761,21 +872,40 @@ fn print_history(h: &[K8sRelease]) {
     print_table(&["VERSION", "STATUS", "CREATED", "DESCRIPTION", "IMAGE"], rows);
 }
 
-async fn get_secret(k: &Kube, app: &str) -> Result<BTreeMap<String, String>> {
+async fn get_secret(k: &Kube, app: &str) -> Result<(BTreeMap<String, String>, Option<String>)> {
     use base64::Engine;
     let v = match k.json(&["get", "secret", &format!("{app}-secrets")]).await {
         Ok(v) => v,
-        Err(e) if e.to_string().contains("NotFound") || e.to_string().contains("not found") => return Ok(BTreeMap::new()),
+        Err(e) if e.to_string().contains("NotFound") || e.to_string().contains("not found") => {
+            return Ok((BTreeMap::new(), None))
+        }
         Err(e) => return Err(e),
     };
+    let rv = v["metadata"]["resourceVersion"].as_str().map(String::from);
     let mut out = BTreeMap::new();
     for (key, val) in v["data"].as_object().cloned().unwrap_or_default() {
+        let encoded = val
+            .as_str()
+            .ok_or_else(|| anyhow!("secret key '{key}' in {app}-secrets is not a string"))?;
         let raw = base64::engine::general_purpose::STANDARD
-            .decode(val.as_str().unwrap_or(""))
-            .unwrap_or_default();
-        out.insert(key, String::from_utf8_lossy(&raw).to_string());
+            .decode(encoded)
+            .with_context(|| format!("decoding base64 secret '{key}' in {app}-secrets"))?;
+        let decoded = String::from_utf8(raw)
+            .with_context(|| format!("secret '{key}' in {app}-secrets is not valid UTF-8"))?;
+        out.insert(key, decoded);
     }
-    Ok(out)
+    Ok((out, rv))
+}
+
+fn validate_secret_key(key: &str) -> Result<()> {
+    if key.is_empty()
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+    {
+        bail!("invalid secret key '{key}' (use letters, digits, '_', '-', or '.')");
+    }
+    Ok(())
 }
 
 /// Commands on a Kubernetes target.
@@ -804,18 +934,34 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
         }
         Cmd::Status => status(name, &t).await,
         Cmd::Apps { action: None | Some(AppsCmd::List { .. }), .. } => status(name, &t).await,
-        Cmd::Apps { action: Some(AppsCmd::Show { app }), .. } => ps(&k, &app).await,
+        Cmd::Apps { action: Some(AppsCmd::Show { app }), .. } => {
+            util::validate_name("app", &app)?;
+            ps(&k, &app).await
+        }
         Cmd::Apps { action: Some(AppsCmd::Destroy(a)), .. } => destroy(&k, &t, a).await,
-        Cmd::Ps { app } => ps(&k, &app).await,
+        Cmd::Ps { app } => {
+            util::validate_name("app", &app)?;
+            ps(&k, &app).await
+        }
         Cmd::Releases { app } => {
+            util::validate_name("app", &app)?;
             print_history(&load_history(&k, &app).await?);
             Ok(())
         }
         Cmd::Logs { app, follow, tail, instance } => {
+            util::validate_name("app", &app)?;
             let tail = format!("--tail={tail}");
             let target = match &instance {
-                Some(pod) => vec![pod.clone()],
-                None => vec!["-l".into(), format!("app.kubernetes.io/name={app}"), "--prefix".into(), "--max-log-requests=50".into()],
+                Some(pod) => {
+                    util::validate_name("instance", pod)?;
+                    vec![pod.clone()]
+                }
+                None => vec![
+                    "-l".into(),
+                    format!("app.kubernetes.io/name={app},{MANAGED}"),
+                    "--prefix".into(),
+                    "--max-log-requests=50".into(),
+                ],
             };
             let mut a: Vec<String> = vec!["logs".into(), tail, "--timestamps".into()];
             a.extend(target);
@@ -827,6 +973,10 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
             Ok(())
         }
         Cmd::Scale { app, count, min, max, cpu, memory } => {
+            util::validate_name("app", &app)?;
+            if count.is_none() && min.is_none() && max.is_none() && cpu.is_none() && memory.is_none() {
+                bail!("specify at least one of --count, --min, --max, --cpu, or --memory");
+            }
             let (cur, _) = workload(&k, &app).await?;
             let mut c = cur.config.clone();
             if let Some(n) = count {
@@ -844,6 +994,9 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
             }
             let restart = cpu.is_some() || memory.is_some();
             if let Some(x) = cpu {
+                if !x.is_finite() || x < 0.0 {
+                    bail!("--cpu must be a finite non-negative number");
+                }
                 c.scale.cpu = x;
             }
             if let Some(m) = memory {
@@ -857,7 +1010,9 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
                 release(&k, c, cur.image, "scale (resources)".into()).await
             } else {
                 // Same release: only replica counts change, pods are not restarted.
-                apply_release(&k, &c, &cur.image, cur.version, Some(&cur)).await?;
+                let old_docs = render(&cur.config, &cur.image, cur.version, &k.t);
+                let new_docs = apply_docs(&k, &c, &cur.image, cur.version).await?;
+                prune_stale(&k, &old_docs, &new_docs).await;
                 let mut hist = load_history(&k, &app).await?;
                 for r in hist.iter_mut().filter(|r| r.version == cur.version) {
                     r.config = c.clone();
@@ -873,30 +1028,46 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
             }
         }
         Cmd::Restart { app } => {
+            util::validate_name("app", &app)?;
             let (cur, _) = workload(&k, &app).await?;
             release(&k, cur.config, cur.image, "restart".into()).await
         }
         Cmd::Rollback { app, version } => {
+            util::validate_name("app", &app)?;
             let hist = load_history(&k, &app).await?;
-            let cur = current(&hist).map(|r| r.version).unwrap_or(u64::MAX);
+            let active_ver = current(&hist).map(|r| r.version);
             let target = match version {
-                Some(v) => hist.iter().find(|r| r.version == v).cloned().ok_or_else(|| anyhow!("release v{v} not found"))?,
-                None => hist
+                Some(v) => hist
                     .iter()
-                    .filter(|r| r.version < cur && r.status != "failed")
-                    .max_by_key(|r| r.version)
+                    .find(|r| r.version == v)
                     .cloned()
-                    .ok_or_else(|| anyhow!("no earlier release to roll back to"))?,
+                    .ok_or_else(|| anyhow!("release v{v} not found"))?,
+                None => match active_ver {
+                    Some(cur) => hist
+                        .iter()
+                        .filter(|r| r.version < cur && r.status != "failed")
+                        .max_by_key(|r| r.version)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("no earlier release to roll back to"))?,
+                    None => hist
+                        .iter()
+                        .filter(|r| r.status != "failed")
+                        .max_by_key(|r| r.version)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("no successful release to roll back to"))?,
+                },
             };
             release(&k, target.config, target.image, format!("rollback to v{}", target.version)).await
         }
         Cmd::Destroy(a) => destroy(&k, &t, a).await,
         Cmd::Secrets(s) => {
+            use base64::Engine;
             let (app, set, unset, list) = match s {
                 SecretsCmd::Set { app, pairs } => {
                     let mut m = BTreeMap::new();
                     for p in pairs {
                         let (a, b) = p.split_once('=').ok_or_else(|| anyhow!("expected KEY=value, got '{p}'"))?;
+                        validate_secret_key(a)?;
                         m.insert(a.to_string(), b.to_string());
                     }
                     (app, m, vec![], false)
@@ -904,8 +1075,9 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
                 SecretsCmd::Unset { app, names } => (app, BTreeMap::new(), names, false),
                 SecretsCmd::List { app } => (app, BTreeMap::new(), vec![], true),
             };
+            util::validate_name("app", &app)?;
             let (cur, w) = workload(&k, &app).await?;
-            let mut secrets = get_secret(&k, &app).await?;
+            let (mut secrets, resource_version) = get_secret(&k, &app).await?;
             if list {
                 for key in secrets.keys() {
                     println!("{key}");
@@ -916,20 +1088,38 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
             for u in unset {
                 secrets.remove(&u);
             }
-            let doc = json!({
-                "apiVersion": "v1", "kind": "Secret",
-                "metadata": {"name": format!("{app}-secrets"), "labels": labels(&cur.config)},
-                "type": "Opaque",
-                "stringData": secrets,
+            let encoded: BTreeMap<String, String> = secrets
+                .into_iter()
+                .map(|(k, v)| (k, base64::engine::general_purpose::STANDARD.encode(v.as_bytes())))
+                .collect();
+            let mut meta = json!({
+                "name": format!("{app}-secrets"),
+                "labels": labels(&cur.config),
             });
-            // Replace (not merge) so unset keys really disappear.
-            let _ = k.run(&["delete", "secret", &format!("{app}-secrets"), "--ignore-not-found"]).await;
-            k.apply(&to_yaml(&[doc])?).await?;
+            if let Some(rv) = &resource_version {
+                meta["resourceVersion"] = json!(rv);
+            }
+            let doc = json!({
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": meta,
+                "type": "Opaque",
+                "data": encoded,
+            });
+            let yaml = to_yaml(&[doc])?;
+            // Atomically create or replace (never delete-then-apply, and never embed plaintext
+            // secrets in `kubectl.kubernetes.io/last-applied-configuration`).
+            if resource_version.is_some() {
+                k.exec(&["replace", "-f", "-"], Some(&yaml), true).await?;
+            } else {
+                k.exec(&["create", "-f", "-"], Some(&yaml), true).await?;
+            }
             k.run(&["rollout", "restart", &w]).await?;
             println!("secrets updated; restarting {app}");
             k.run(&["rollout", "status", &w, "--timeout=300s"]).await.map(|_| ())
         }
         Cmd::Console { app, cmd } => {
+            util::validate_name("app", &app)?;
             let (_, w) = workload(&k, &app).await?;
             let mut a = vec!["exec".to_string(), "-it".into(), w, "--".into()];
             if cmd.is_empty() {
@@ -977,6 +1167,7 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
 
 async fn destroy(k: &Kube, t: &K8sTarget, a: DestroyArgs) -> Result<()> {
     let app = a.app.clone();
+    util::validate_name("app", &app)?;
     let purge = !a.keep_volumes;
     if !a.yes {
         print!(
@@ -991,7 +1182,7 @@ async fn destroy(k: &Kube, t: &K8sTarget, a: DestroyArgs) -> Result<()> {
             bail!("aborted");
         }
     }
-    let sel = format!("app.kubernetes.io/name={app}");
+    let sel = format!("app.kubernetes.io/name={app},{MANAGED}");
     k.run(&["delete", "deployment,statefulset,service,ingress,hpa,configmap,secret", "-l", &sel, "--ignore-not-found"]).await?;
     if purge {
         k.run(&["delete", "pvc", "-l", &sel, "--ignore-not-found"]).await?;
@@ -1197,5 +1388,38 @@ mod tests {
         assert!(s.contains(&("Ingress".into(), "x".into())));
         assert!(s.contains(&("Service".into(), "x-public".into())));
         assert!(!s.contains(&("Deployment".into(), "x".into())));
+    }
+
+    #[test]
+    fn env_dollar_escaping_headless_service_and_stateful_no_hpa() {
+        let cfg: AppConfig = toml::from_str(
+            r#"
+app = "db"
+[env]
+PASS = "p$ss$(VAR)"
+[scale]
+min = 1
+max = 3
+[[ports]]
+port = 5432
+[[volumes]]
+name = "data"
+path = "/data"
+"#,
+        )
+        .unwrap();
+        let docs = render(&cfg, "postgres:16", 1, &target());
+        let k = kinds(&docs);
+        assert!(k.contains(&("StatefulSet".into(), "db".into())));
+        assert!(k.contains(&("Service".into(), "db-headless".into())));
+        assert!(!k.iter().any(|(kind, _)| kind == "HorizontalPodAutoscaler"), "stateful app must not get HPA");
+
+        let headless = docs.iter().find(|d| d["metadata"]["name"] == "db-headless").unwrap();
+        assert_eq!(headless["spec"]["clusterIP"], "None");
+
+        let sts = &docs[0];
+        let env = sts["spec"]["template"]["spec"]["containers"][0]["env"].as_array().unwrap();
+        let pass = env.iter().find(|e| e["name"] == "PASS").unwrap();
+        assert_eq!(pass["value"], "p$$ss$$(VAR)");
     }
 }

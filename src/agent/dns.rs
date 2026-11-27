@@ -3,14 +3,19 @@
 //! everything else to the machine's normal resolver.
 
 use super::Agent;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
+use tokio::sync::Semaphore;
 use tracing::{debug, info, warn};
 
 pub async fn run(agent: Arc<Agent>) {
-    let addr: SocketAddr = format!("{}:53", agent.me.overlay_ip).parse().unwrap();
+    let Ok(ip) = agent.me.overlay_ip.parse::<IpAddr>() else {
+        warn!("dns: invalid overlay IP '{}'", agent.me.overlay_ip);
+        return;
+    };
+    let addr = SocketAddr::new(ip, 53);
     let sock = loop {
         match UdpSocket::bind(addr).await {
             Ok(s) => break Arc::new(s),
@@ -20,19 +25,35 @@ pub async fn run(agent: Arc<Agent>) {
             }
         }
     };
-    let upstream = upstream_resolver();
-    info!("internal DNS on {addr} (upstream {upstream})");
+    let upstreams = Arc::new(upstream_resolvers());
+    info!("internal DNS on {addr} (upstream {})", upstreams.join(", "));
+    let permits = Arc::new(Semaphore::new(256));
     let mut buf = vec![0u8; 1500];
     loop {
-        let Ok((n, peer)) = sock.recv_from(&mut buf).await else { continue };
+        let (n, peer) = match sock.recv_from(&mut buf).await {
+            Ok(x) => x,
+            Err(e) => {
+                debug!("dns: recv_from error: {e}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+        };
+        // Drop truncated packets or DNS response packets (QR=1) to prevent amplification/FD exhaustion.
+        if n < 12 || (buf[2] & 0x80) != 0 {
+            continue;
+        }
+        let Ok(permit) = permits.clone().try_acquire_owned() else {
+            continue;
+        };
         let query = buf[..n].to_vec();
         let agent = agent.clone();
         let sock = sock.clone();
-        let upstream = upstream.clone();
+        let upstreams = upstreams.clone();
         tokio::spawn(async move {
+            let _permit = permit;
             let resp = match answer_local(&agent, &query) {
                 Some(r) => Some(r),
-                None => forward(&upstream, &query).await,
+                None => forward_any(&upstreams, &query).await,
             };
             if let Some(r) = resp {
                 let _ = sock.send_to(&r, peer).await;
@@ -41,33 +62,75 @@ pub async fn run(agent: Arc<Agent>) {
     }
 }
 
-fn upstream_resolver() -> String {
+fn upstream_resolvers() -> Vec<String> {
     let text = std::fs::read_to_string("/etc/resolv.conf").unwrap_or_default();
-    text.lines()
-        .filter_map(|l| l.trim().strip_prefix("nameserver"))
-        .map(|s| s.trim().to_string())
-        .find(|ip| !ip.starts_with("10.77.") && ip.parse::<std::net::IpAddr>().is_ok())
+    let overlay_prefix = format!("{}.", crate::util::OVERLAY_PREFIX);
+    let mut list: Vec<String> = text
+        .lines()
+        .filter_map(|l| {
+            let clean = l.split(['#', ';']).next().unwrap_or("").trim();
+            let rest = clean.strip_prefix("nameserver")?;
+            if !rest.starts_with(char::is_whitespace) {
+                return None;
+            }
+            rest.split_whitespace().next().map(str::to_string)
+        })
+        .filter(|ip| !ip.starts_with(&overlay_prefix) && ip.parse::<IpAddr>().is_ok())
         .map(|ip| if ip.contains(':') { format!("[{ip}]:53") } else { format!("{ip}:53") })
-        .unwrap_or_else(|| "1.1.1.1:53".into())
+        .collect();
+    list.dedup();
+    if list.is_empty() {
+        list.push("1.1.1.1:53".into());
+        list.push("8.8.8.8:53".into());
+    }
+    list
+}
+
+async fn forward_any(upstreams: &[String], query: &[u8]) -> Option<Vec<u8>> {
+    for u in upstreams {
+        if let Some(resp) = forward(u, query).await {
+            return Some(resp);
+        }
+    }
+    None
 }
 
 async fn forward(upstream: &str, query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
     let bind = if upstream.starts_with('[') { "[::]:0" } else { "0.0.0.0:0" };
     let sock = UdpSocket::bind(bind).await.ok()?;
-    sock.send_to(query, upstream).await.ok()?;
+    // Connecting the UDP socket ensures the kernel rejects packets from any other peer.
+    sock.connect(upstream).await.ok()?;
+    sock.send(query).await.ok()?;
     let mut buf = vec![0u8; 4096];
-    match tokio::time::timeout(Duration::from_secs(4), sock.recv(&mut buf)).await {
-        Ok(Ok(n)) => Some(buf[..n].to_vec()),
-        _ => {
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let Some(rem) = deadline.checked_duration_since(Instant::now()) else {
             warn!("dns: upstream {upstream} did not answer");
-            None
+            return None;
+        };
+        match tokio::time::timeout(rem, sock.recv(&mut buf)).await {
+            Ok(Ok(n)) if n >= 12 && buf[0..2] == query[0..2] && (buf[2] & 0x80) != 0 => {
+                return Some(buf[..n].to_vec());
+            }
+            Ok(Ok(_)) => continue, // ignore mismatched txid or non-response
+            _ => {
+                warn!("dns: upstream {upstream} did not answer");
+                return None;
+            }
         }
     }
 }
 
 /// Parse the (single) question: returns (lowercase name, qtype, end offset).
 pub fn parse_question(q: &[u8]) -> Option<(String, u16, usize)> {
-    if q.len() < 12 || u16::from_be_bytes([q[4], q[5]]) != 1 {
+    if q.len() < 12
+        || (q[2] & 0x80) != 0 // must be a query (QR=0)
+        || (q[2] & 0x78) != 0 // standard query (OPCODE=0)
+        || u16::from_be_bytes([q[4], q[5]]) != 1
+    {
         return None;
     }
     let mut i = 12;
@@ -89,10 +152,17 @@ pub fn parse_question(q: &[u8]) -> Option<(String, u16, usize)> {
         return None; // truncated question (no QCLASS)
     }
     let qtype = u16::from_be_bytes([q[i], q[i + 1]]);
+    let qclass = u16::from_be_bytes([q[i + 2], q[i + 3]]);
+    if qclass != 1 {
+        return None;
+    }
     Some((labels.join("."), qtype, i + 4))
 }
 
 pub fn build_answer(q: &[u8], end: usize, ip: Option<Ipv4Addr>, nxdomain: bool) -> Vec<u8> {
+    if q.len() < 12 || end < 12 || end > q.len() {
+        return Vec::new();
+    }
     let mut r = Vec::with_capacity(end + 16);
     r.extend_from_slice(&q[0..2]); // id
     let rd = q[2] & 0x01;
@@ -151,5 +221,27 @@ mod tests {
         assert_eq!(&r[r.len() - 4..], &[10, 78, 0, 2]);
         let nx = build_answer(&q, end, None, true);
         assert_eq!(nx[3] & 0x0f, 3);
+    }
+
+    #[test]
+    fn parse_question_rejects_malformed_and_responses() {
+        // Too short
+        assert!(parse_question(&[0u8; 11]).is_none());
+
+        // Response packet (QR=1) must be rejected so we never reflect/amplify
+        let mut resp = query("web.internal", 1);
+        resp[2] |= 0x80;
+        assert!(parse_question(&resp).is_none());
+
+        // Non-zero OPCODE rejected
+        let mut op = query("web.internal", 1);
+        op[2] |= 0x08;
+        assert!(parse_question(&op).is_none());
+
+        // Non-IN QCLASS (CH = 3) rejected
+        let mut ch = query("web.internal", 1);
+        let n = ch.len();
+        ch[n - 1] = 3;
+        assert!(parse_question(&ch).is_none());
     }
 }

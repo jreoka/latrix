@@ -118,7 +118,9 @@ pub async fn create_machine(cfg: &mut CliConfig, cl: Option<&str>, o: CreateOpti
         Some(i) => i,
         None => providers::latest_ubuntu(&offer.provider, &token, &offer.size).await,
     };
-    let name = o.name.unwrap_or_else(|| format!("{}-{}", offer.location, util::random_id(4)));
+    let name = o
+        .name
+        .unwrap_or_else(|| format!("{}-{}", offer.location.to_ascii_lowercase(), util::random_id(4)));
     util::validate_name("machine", &name)?;
     let (pubkey, key) = providers::ssh_key(o.key.as_deref())?;
     println!(
@@ -134,38 +136,56 @@ pub async fn create_machine(cfg: &mut CliConfig, cl: Option<&str>, o: CreateOpti
     println!("==> creating server '{name}' with {image}");
     let created = providers::create(&offer.provider, &token, &name, &offer.size, &offer.location, &image, std::slice::from_ref(&pubkey)).await?;
     println!("==> server is up at {}", created.ip);
-    let ssh = ssh::Ssh::new(&format!("root@{}", created.ip), 22, key.clone());
-    ssh.forget_host_key(); // cloud IPs get reused
-    print!("==> waiting for SSH");
-    let start = std::time::Instant::now();
-    loop {
-        if ssh.run("true").await.is_ok() {
-            println!();
-            break;
+    let created_provider = created.provider.clone();
+    let setup: Result<()> = async {
+        let ssh = ssh::Ssh::new(&format!("root@{}", created.ip), 22, key.clone());
+        ssh.forget_host_key(); // cloud IPs get reused
+        print!("==> waiting for SSH");
+        let start = std::time::Instant::now();
+        loop {
+            if ssh.run("true").await.is_ok() {
+                println!();
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(240) {
+                println!();
+                bail!("SSH to {} never became available", created.ip);
+            }
+            print!(".");
+            std::io::stdout().flush()?;
+            tokio::time::sleep(Duration::from_secs(5)).await;
         }
-        if start.elapsed() > Duration::from_secs(240) {
-            bail!("SSH to {} never became available", created.ip);
-        }
-        print!(".");
-        std::io::stdout().flush()?;
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        machine::add(
+            cfg,
+            cl,
+            machine::AddOptions {
+                target: format!("root@{}", created.ip),
+                name: Some(name),
+                port: 22,
+                key: key.clone(),
+                region: Some(offer.location.clone()),
+                public_ip: Some(created.ip.clone()),
+                agent_binary: o.agent_binary,
+                provider: Some(created.provider),
+                monthly_cost: created.monthly_cost.or(Some(offer.price)),
+            },
+        )
+        .await
     }
-    machine::add(
-        cfg,
-        cl,
-        machine::AddOptions {
-            target: format!("root@{}", created.ip),
-            name: Some(name),
-            port: 22,
-            key: key.clone(),
-            region: Some(offer.location.clone()),
-            public_ip: Some(created.ip.clone()),
-            agent_binary: o.agent_binary,
-            provider: Some(created.provider),
-            monthly_cost: created.monthly_cost.or(Some(offer.price)),
-        },
-    )
-    .await?;
+    .await;
+    if let Err(e) = setup {
+        eprintln!(
+            "==> setup failed; deleting newly created server ({}:{}) so it doesn't keep billing...",
+            created_provider.provider, created_provider.id
+        );
+        if let Err(de) = providers::destroy(&created_provider, &token).await {
+            eprintln!(
+                "    warning: could not delete {}:{} automatically: {de:#}",
+                created_provider.provider, created_provider.id
+            );
+        }
+        return Err(e);
+    }
     // Remember the key for servers the autopilot adds later.
     let mut fresh = CliConfig::load()?;
     if let Ok(cname) = fresh.cluster_name(cl) {
@@ -181,6 +201,16 @@ pub async fn create_machine(cfg: &mut CliConfig, cl: Option<&str>, o: CreateOpti
 }
 
 async fn autopilot_on(cfg: &CliConfig, cl: Option<&str>, budget: Option<f64>, min: Option<u32>, max: Option<u32>, only: &[String]) -> Result<()> {
+    if let Some(b) = budget {
+        if !b.is_finite() || b < 0.0 {
+            bail!("--budget must be a finite non-negative number");
+        }
+    }
+    if let (Some(lo), Some(hi)) = (min, max) {
+        if lo > hi {
+            bail!("--min-machines ({lo}) must be <= --max-machines ({hi})");
+        }
+    }
     let tokens: std::collections::BTreeMap<String, String> = if only.is_empty() {
         providers_with_tokens(cfg, None)?.into_iter().collect()
     } else {
@@ -277,8 +307,16 @@ fn parse_pairs(pairs: &[String]) -> Result<std::collections::BTreeMap<String, St
         .collect()
 }
 
+async fn app_health_timeout(c: &Client, app: &str) -> u64 {
+    c.get::<AppView>(&format!("/v1/apps/{app}"))
+        .await
+        .ok()
+        .and_then(|v| v.config.map(|cfg| cfg.deploy.health_timeout_secs()))
+        .unwrap_or(120)
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
-    let cl = cli.cluster.as_deref();
+    let cl = cli.cluster.as_deref().map(str::trim).filter(|s| !s.is_empty());
     match cli.cmd {
         Cmd::Agent(a) => return agent_cmd(a).await,
         Cmd::Launch { name, image, port, force } => return deploy::launch(name, image, port, force),
@@ -313,29 +351,50 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Ps { app } => Box::pin(ps(&cfg, cl, &app)).await,
         Cmd::Logs { app, follow, tail, instance } => Box::pin(logs(&cfg, cl, &app, follow, tail, instance)).await,
         Cmd::Scale { app, count, min, max, cpu, memory } => {
-            let (_, _, c) = connect(&cfg, cl).await?;
+            util::validate_name("app", &app)?;
             if count.is_none() && min.is_none() && max.is_none() && cpu.is_none() && memory.is_none() {
                 bail!("nothing to change: pass a count (latrix scale {app} 3) or --min/--max/--cpu/--memory");
             }
+            if let Some(c_val) = cpu {
+                if !c_val.is_finite() || c_val <= 0.0 {
+                    bail!("--cpu must be a finite positive number");
+                }
+            }
+            if let (Some(lo), Some(hi)) = (min, max) {
+                if lo > hi {
+                    bail!("--min ({lo}) must be <= --max ({hi})");
+                }
+            }
+            let (_, _, c) = connect(&cfg, cl).await?;
             let v: AppView = c
-                .post(&format!("/v1/apps/{app}/scale"), &ScaleRequest { count, min, max, cpu, memory })
+                .post(&format!("/v1/apps/{app}/scale"), &ScaleRequest { count, min, max, cpu, memory: memory.clone() })
                 .await?;
             if v.autoscale {
                 println!("{app}: autoscaling between {} and {} (now {})", v.min, v.max, v.count);
             } else {
                 println!("{app}: {} instance(s), {} CPU, {} each", v.count, v.cpu, v.memory);
             }
+            if (cpu.is_some() || memory.is_some())
+                && v.release_status == Some(crate::state::ReleaseStatus::Deploying)
+            {
+                let timeout = v.config.as_ref().map(|cfg| cfg.deploy.health_timeout_secs()).unwrap_or(120);
+                deploy::watch(&c, &app, v.current, timeout).await?;
+            }
             Ok(())
         }
         Cmd::Restart { app } => {
+            util::validate_name("app", &app)?;
             let (_, _, c) = connect(&cfg, cl).await?;
+            let timeout = app_health_timeout(&c, &app).await;
             let r: DeployResponse = c.post(&format!("/v1/apps/{app}/restart"), &serde_json::json!({})).await?;
-            deploy::watch(&c, &app, r.version, 120).await
+            deploy::watch(&c, &app, r.version, timeout).await
         }
         Cmd::Rollback { app, version } => {
+            util::validate_name("app", &app)?;
             let (_, _, c) = connect(&cfg, cl).await?;
+            let timeout = app_health_timeout(&c, &app).await;
             let r: DeployResponse = c.post(&format!("/v1/apps/{app}/rollback"), &RollbackRequest { version }).await?;
-            deploy::watch(&c, &app, r.version, 120).await
+            deploy::watch(&c, &app, r.version, timeout).await
         }
         Cmd::Releases { app } => {
             let (_, _, c) = connect(&cfg, cl).await?;
@@ -453,10 +512,16 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         },
         Cmd::Up { budget, provider, max_machines } => {
-            let has_cluster = cfg
-                .profile(cl)
-                .map(|(_, p)| !p.local && p.kubernetes.is_none() && !p.machines.is_empty())
-                .unwrap_or(false);
+            if let Some(b) = budget {
+                if !b.is_finite() || b < 0.0 {
+                    bail!("--budget must be a finite non-negative number");
+                }
+            }
+            let has_cluster = match cfg.profile(cl) {
+                Ok((_, p)) => !p.local && p.kubernetes.is_none() && !p.machines.is_empty(),
+                Err(e) if cfg.clusters.len() > 1 && cl.is_none() && cfg.current.is_none() => return Err(e),
+                Err(_) => false,
+            };
             if !has_cluster {
                 println!("==> no cluster yet: buying the cheapest server that fits");
                 create_machine(
@@ -528,6 +593,14 @@ async fn agent_cmd(a: AgentCmd) -> Result<()> {
 }
 
 async fn dev(data: Option<std::path::PathBuf>) -> Result<()> {
+    // Check early before overwriting the saved "local" profile so a second `latrix dev`
+    // doesn't clobber an active agent's config only to fail binding the port.
+    if std::net::TcpListener::bind(("127.0.0.1", util::API_PORT)).is_err() {
+        bail!(
+            "port {} is already in use on 127.0.0.1 (is `latrix dev` or another agent already running?)",
+            util::API_PORT
+        );
+    }
     let dir = data.unwrap_or_else(|| agent::default_data_dir(true));
     if !dir.join("node.json").exists() {
         let facts = agent::metrics::local_facts().await;
@@ -611,7 +684,7 @@ async fn cluster_connect(target: &str, port: u16, key: Option<String>) -> Result
     let ssh = super::ssh::Ssh::new(target, port, key.clone());
     println!("==> reading the cluster identity from {}", ssh.host());
     let raw = ssh
-        .run(&ssh.root_cmd("cat /var/lib/latrix/node.json"))
+        .run("cat /var/lib/latrix/node.json")
         .await
         .with_context(|| format!("could not read latrix's identity on {target} (is it a latrix machine, and does this key log in?)"))?;
     let id: crate::agent::NodeIdentity =
@@ -630,7 +703,7 @@ async fn cluster_connect(target: &str, port: u16, key: Option<String>) -> Result
     // Every machine, reached the same way (the one we came through first).
     let mut machines = vec![];
     for m in &st.machines {
-        let this = m.machine.public_ip == host || m.machine.name == host;
+        let this = m.machine.id == id.machine_id || m.machine.public_ip == host || m.machine.name == host;
         machines.push(super::profile::MachineSsh {
             name: m.machine.name.clone(),
             ssh: if this { target.to_string() } else { format!("{user}@{}", m.machine.public_ip) },
@@ -643,7 +716,11 @@ async fn cluster_connect(target: &str, port: u16, key: Option<String>) -> Result
     let mut cfg = CliConfig::load()?;
     if let Some(old) = cfg.clusters.get(&id.cluster) {
         if old.token != id.token {
-            println!("    note: replacing a different cluster that was also called '{}'", id.cluster);
+            bail!(
+                "a different cluster named '{}' is already saved locally; run `latrix cluster forget {}` first if you want to replace it",
+                id.cluster,
+                id.cluster
+            );
         }
     }
     let n = profile.machines.len();
@@ -667,15 +744,19 @@ async fn keys_cmd(cfg: &CliConfig, cl: Option<&str>, action: KeysCmd) -> Result<
     use crate::api_types::{SshKeysRequest, SshKeysView};
     let (_, p, c) = connect(cfg, cl).await?;
     let read_key = |k: &str| -> Result<String> {
-        let path = std::path::Path::new(k);
-        if path.exists() {
+        let trimmed = k.trim();
+        let looks_like_key = trimmed.starts_with("ssh-")
+            || trimmed.starts_with("ecdsa-")
+            || trimmed.starts_with("sk-");
+        let path = std::path::Path::new(trimmed);
+        if !looks_like_key && path.is_file() {
             let text = std::fs::read_to_string(path)?;
             if text.contains("PRIVATE KEY") {
                 bail!("{k} is a private key; pass the .pub file");
             }
             Ok(text.trim().to_string())
         } else {
-            Ok(k.trim().to_string())
+            Ok(trimmed.to_string())
         }
     };
     let v: SshKeysView = match action {
@@ -690,8 +771,12 @@ async fn keys_cmd(cfg: &CliConfig, cl: Option<&str>, action: KeysCmd) -> Result<
             v
         }
         KeysCmd::Remove { key } => {
+            let selector = key.trim();
+            if selector.is_empty() {
+                bail!("key selector must not be empty");
+            }
             let current: SshKeysView = c.get("/v1/ssh-keys").await?;
-            let k = read_key(&key)?;
+            let k = read_key(selector)?;
             let found: Vec<String> = if key_id(&k).is_some() {
                 vec![k]
             } else {
@@ -699,7 +784,10 @@ async fn keys_cmd(cfg: &CliConfig, cl: Option<&str>, action: KeysCmd) -> Result<
                 current
                     .keys
                     .iter()
-                    .filter(|x| x.split_whitespace().skip(2).collect::<Vec<_>>().join(" ") == key || x.split_whitespace().nth(1).map(|b| b.ends_with(&key)).unwrap_or(false))
+                    .filter(|x| {
+                        x.split_whitespace().skip(2).collect::<Vec<_>>().join(" ") == selector
+                            || x.split_whitespace().nth(1).map(|b| b.ends_with(selector)).unwrap_or(false)
+                    })
                     .cloned()
                     .collect()
             };
@@ -730,6 +818,10 @@ async fn provider_cmd(p: ProviderCmd) -> Result<()> {
     let mut cfg = CliConfig::load()?;
     match p {
         ProviderCmd::Set { provider, token } => {
+            let token = token.trim().to_string();
+            if token.is_empty() {
+                bail!("provider token must not be empty");
+            }
             let lower = provider.to_ascii_lowercase();
             if lower == "cloudflare" || lower == "cf" {
                 cfg.providers.insert("cloudflare".into(), token);
@@ -814,9 +906,11 @@ async fn dns_cmd(cfg: &CliConfig, cl: Option<&str>, action: DnsCmd) -> Result<()
         DnsCmd::Cloudflare { token, proxied, no_proxied, ttl } => {
             let prox = if proxied { Some(true) } else if no_proxied { Some(false) } else { None };
             let resolved_token = token
-                .or_else(|| std::env::var("CLOUDFLARE_API_TOKEN").ok().filter(|s| !s.trim().is_empty()))
-                .or_else(|| std::env::var("CF_API_TOKEN").ok().filter(|s| !s.trim().is_empty()))
-                .or_else(|| cfg.providers.get("cloudflare").cloned());
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or_else(|| std::env::var("CLOUDFLARE_API_TOKEN").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+                .or_else(|| std::env::var("CF_API_TOKEN").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()))
+                .or_else(|| cfg.providers.get("cloudflare").map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
             if resolved_token.is_none() && prox.is_none() && ttl.is_none() {
                 bail!(
                     "pass a Cloudflare API token:\n  latrix dns cloudflare <token>\n  (or set CLOUDFLARE_API_TOKEN, or run `latrix provider set cloudflare <token>`)\n  Create a token with Zone:Read and Zone:DNS:Edit at https://dash.cloudflare.com/profile/api-tokens"
@@ -846,6 +940,7 @@ async fn dns_cmd(cfg: &CliConfig, cl: Option<&str>, action: DnsCmd) -> Result<()
             println!("✓ Cloudflare DNS disabled (existing records in Cloudflare were left as-is)");
         }
         DnsCmd::Add { app, name, record_type, content, proxied, no_proxied, ttl, priority } => {
+            util::validate_name("app", &app)?;
             let prox = if proxied { Some(true) } else if no_proxied { Some(false) } else { None };
             let rec = crate::config::DnsRecordConfig {
                 name: name.clone(),
@@ -866,6 +961,7 @@ async fn dns_cmd(cfg: &CliConfig, cl: Option<&str>, action: DnsCmd) -> Result<()
             print_dns_status(&v, Some(&app));
         }
         DnsCmd::Remove { app, name, record_type, content } => {
+            util::validate_name("app", &app)?;
             let v: DnsStatusView = c
                 .post(
                     &format!("/v1/apps/{app}/dns"),
@@ -987,9 +1083,9 @@ fn bar(frac: f64) -> String {
     format!("{}{}", "█".repeat(n), "░".repeat(10 - n))
 }
 
-fn partition_fluxer_apps<'a>(
-    st: &'a StatusView,
-) -> (Vec<&'a AppView>, Vec<&'a AppView>, Option<&'a FluxerSummary>) {
+fn partition_fluxer_apps(
+    st: &StatusView,
+) -> (Vec<&AppView>, Vec<&AppView>, Option<&FluxerSummary>) {
     let Some(fx) = st.fluxer.as_ref() else {
         return (st.apps.iter().collect(), vec![], None);
     };
@@ -1104,7 +1200,11 @@ async fn status(cfg: &CliConfig, cl: Option<&str>) -> Result<()> {
                 m.updates
                     .as_ref()
                     .filter(|u| u.pending > 0 || u.reboot_required)
-                    .map(|u| format!("{} updates", u.pending))
+                    .map(|u| match (u.pending, u.reboot_required) {
+                        (0, true) => "reboot required".into(),
+                        (n, true) => format!("{n} updates +reboot"),
+                        (n, false) => format!("{n} updates"),
+                    })
                     .unwrap_or_default(),
             ]
         })
@@ -1335,6 +1435,7 @@ async fn volumes(cfg: &CliConfig, cl: Option<&str>) -> Result<()> {
     let unused = unused_volumes(&c, &st).await;
     if !unused.is_empty() {
         println!("\nUNATTACHED DATA (no app uses it; deleted automatically)");
+        let now = util::now();
         let rows = unused
             .iter()
             .map(|(m, u)| {
@@ -1343,10 +1444,12 @@ async fn volumes(cfg: &CliConfig, cl: Option<&str>) -> Result<()> {
                     u.volume.replace("__", "/"),
                     format!("{} MB", u.size_mb),
                     ago(u.unused_since),
-                    if u.delete_at <= util::now() {
+                    if u.delete_at == 0 {
+                        "never (retention=0)".into()
+                    } else if u.delete_at <= now {
                         "on the next scan".into()
                     } else {
-                        format!("in {}", human_duration(u.delete_at - util::now()))
+                        format!("in {}", human_duration(u.delete_at - now))
                     },
                 ]
             })
@@ -1391,17 +1494,34 @@ async fn prune_volumes(cfg: &CliConfig, cl: Option<&str>, yes: bool) -> Result<(
             bail!("aborted");
         }
     }
+    let mut deleted_mb = 0u64;
+    let mut failed = 0usize;
     for (m, u) in &unused {
-        let id = st.machines.iter().find(|x| &x.machine.name == m).map(|x| x.machine.id).unwrap_or(0);
+        let Some(id) = st.machines.iter().find(|x| &x.machine.name == m).map(|x| x.machine.id) else {
+            eprintln!("  ✗ {m}: machine not found in status");
+            failed += 1;
+            continue;
+        };
+        if !util::safe_id(&u.volume) {
+            eprintln!("  ✗ {m}: refusing unsafe volume id '{}'", u.volume);
+            failed += 1;
+            continue;
+        }
         let r = c
             .request(reqwest::Method::DELETE, &format!("/v1/m/{id}/unused-volumes?volume={}", u.volume))
             .send()
             .await?;
         if !r.status().is_success() {
-            println!("  ✗ {m}: {}: {}", u.volume, r.text().await.unwrap_or_default());
+            println!("  ✗ {m}: {}: {}", u.volume, r.text().await.unwrap_or_default().trim());
+            failed += 1;
+        } else {
+            deleted_mb += u.size_mb;
         }
     }
-    println!("deleted {total} MB of unused volume data");
+    println!("deleted {deleted_mb} MB of unused volume data");
+    if failed > 0 {
+        bail!("{failed} unused volume(s) could not be deleted");
+    }
     Ok(())
 }
 
@@ -1444,6 +1564,10 @@ async fn snapshot_now(cfg: &CliConfig, cl: Option<&str>, app: &str) -> Result<()
 }
 
 async fn snapshot_rollback(cfg: &CliConfig, cl: Option<&str>, app: &str, snap: &str, only: Option<&str>, yes: bool) -> Result<()> {
+    util::validate_name("app", app)?;
+    if !util::safe_id(snap) {
+        bail!("invalid snapshot name '{snap}'");
+    }
     let (_, _, c) = connect(cfg, cl).await?;
     let vols: Vec<VolumeView> = app_volumes(&c, app)
         .await?
@@ -1466,38 +1590,51 @@ async fn snapshot_rollback(cfg: &CliConfig, cl: Option<&str>, app: &str, snap: &
         }
     }
     let v: AppView = c.get(&format!("/v1/apps/{app}")).await?;
-    let count = v.count;
+    let orig_scale = ScaleRequest {
+        count: Some(v.count),
+        min: v.autoscale.then_some(v.min),
+        max: v.autoscale.then_some(v.max),
+        ..Default::default()
+    };
     println!("==> stopping {app}");
     let _: AppView = c.post(&format!("/v1/apps/{app}/scale"), &ScaleRequest { count: Some(0), ..Default::default() }).await?;
-    let start = std::time::Instant::now();
-    loop {
-        let v: AppView = c.get(&format!("/v1/apps/{app}")).await?;
-        if v.instances.is_empty() {
-            break;
+    let result: Result<()> = async {
+        let start = std::time::Instant::now();
+        loop {
+            let v: AppView = c.get(&format!("/v1/apps/{app}")).await?;
+            if v.instances.is_empty() {
+                break;
+            }
+            if start.elapsed() > Duration::from_secs(180) {
+                bail!("{app} did not stop within 180s");
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
         }
-        if start.elapsed() > Duration::from_secs(180) {
-            bail!("{app} did not stop; it was left scaled to 0 — `latrix scale {app} {count}` restarts it");
+        for vol in &vols {
+            println!("==> restoring {app}/{} from {snap}", vol.volume.name);
+            let r = c
+                .request(
+                    reqwest::Method::POST,
+                    &format!("/v1/m/{}/snapshots?volume={}&action=restore&snapshot={snap}", vol.volume.primary, vol.volume.id),
+                )
+                .send()
+                .await?;
+            if !r.status().is_success() {
+                bail!("{}: {}", vol.volume.name, r.text().await.unwrap_or_default().trim());
+            }
         }
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        Ok(())
     }
-    let mut result = Ok(());
-    for vol in &vols {
-        println!("==> restoring {app}/{} from {snap}", vol.volume.name);
-        let r = c
-            .request(
-                reqwest::Method::POST,
-                &format!("/v1/m/{}/snapshots?volume={}&action=restore&snapshot={snap}", vol.volume.primary, vol.volume.id),
-            )
-            .send()
-            .await?;
-        if !r.status().is_success() {
-            result = Err(anyhow!("{}: {}", vol.volume.name, r.text().await.unwrap_or_default()));
-            break;
-        }
-    }
+    .await;
     println!("==> starting {app}");
-    let _: AppView = c.post(&format!("/v1/apps/{app}/scale"), &ScaleRequest { count: Some(count), ..Default::default() }).await?;
-    result?;
+    let restart_res: Result<AppView> = c.post(&format!("/v1/apps/{app}/scale"), &orig_scale).await;
+    if let Err(e) = result {
+        if let Err(re) = restart_res {
+            bail!("{e:#} (and failed to restart {app}: {re:#})");
+        }
+        return Err(e);
+    }
+    restart_res?;
     println!("✓ {app} is back on snapshot {snap}");
     Ok(())
 }
@@ -1545,6 +1682,12 @@ async fn destroy(cfg: &CliConfig, cl: Option<&str>, a: DestroyArgs) -> Result<()
 }
 
 async fn logs(cfg: &CliConfig, cl: Option<&str>, app: &str, follow: bool, tail: u32, only: Option<String>) -> Result<()> {
+    util::validate_name("app", app)?;
+    if let Some(ref o) = only {
+        if !util::safe_id(o) {
+            bail!("invalid instance id '{o}'");
+        }
+    }
     let (_, _, c) = connect(cfg, cl).await?;
     let v: AppView = c.get(&format!("/v1/apps/{app}")).await?;
     let insts: Vec<&InstanceView> = v
@@ -1555,8 +1698,10 @@ async fn logs(cfg: &CliConfig, cl: Option<&str>, app: &str, follow: bool, tail: 
     if insts.is_empty() {
         bail!("{app} has no instances");
     }
+    let use_color = deploy::tty_width().is_some() && std::env::var_os("NO_COLOR").is_none();
     let colors = ["36", "35", "33", "32", "34", "31"];
     let mut streams = vec![];
+    let mut prefixes: std::collections::HashMap<String, String> = Default::default();
     for (n, i) in insts.iter().enumerate() {
         let path = format!(
             "/v1/m/{}/logs?instance={}&tail={tail}&follow={follow}",
@@ -1567,18 +1712,46 @@ async fn logs(cfg: &CliConfig, cl: Option<&str>, app: &str, follow: bool, tail: 
             eprintln!("({}: {})", i.instance.id, resp.text().await.unwrap_or_default().trim());
             continue;
         }
-        let prefix = format!("\x1b[{}m{}@{}\x1b[0m", colors[n % colors.len()], i.instance.id, i.machine_name);
-        streams.push(resp.bytes_stream().map(move |b| (prefix.clone(), b)).boxed());
+        let prefix = if use_color {
+            format!("\x1b[{}m{}@{}\x1b[0m", colors[n % colors.len()], i.instance.id, i.machine_name)
+        } else {
+            format!("{}@{}", i.instance.id, i.machine_name)
+        };
+        let key = i.instance.id.clone();
+        prefixes.insert(key.clone(), prefix);
+        streams.push(resp.bytes_stream().map(move |b| (key.clone(), b)).boxed());
+    }
+    if streams.is_empty() {
+        bail!("could not open logs for any instance of {app}");
     }
     let mut all = futures::stream::select_all(streams);
-    let mut bufs: std::collections::HashMap<String, String> = Default::default();
-    while let Some((prefix, chunk)) = all.next().await {
+    let mut bufs: std::collections::HashMap<String, Vec<u8>> = Default::default();
+    const MAX_LINE_BYTES: usize = 64 * 1024;
+    while let Some((key, chunk)) = all.next().await {
         let Ok(chunk) = chunk else { continue };
-        let buf = bufs.entry(prefix.clone()).or_default();
-        buf.push_str(&String::from_utf8_lossy(&chunk));
-        while let Some(idx) = buf.find('\n') {
-            let line: String = buf.drain(..=idx).collect();
-            println!("{prefix} {}", line.trim_end());
+        let buf = bufs.entry(key.clone()).or_default();
+        buf.extend_from_slice(&chunk);
+        while let Some(idx) = buf.iter().position(|&b| b == b'\n') {
+            let mut line: Vec<u8> = buf.drain(..=idx).collect();
+            while matches!(line.last(), Some(b'\n' | b'\r')) {
+                line.pop();
+            }
+            let prefix = prefixes.get(&key).map(|s| s.as_str()).unwrap_or(&key);
+            println!("{prefix} {}", String::from_utf8_lossy(&line));
+        }
+        if buf.len() > MAX_LINE_BYTES {
+            let prefix = prefixes.get(&key).map(|s| s.as_str()).unwrap_or(&key);
+            let line = std::mem::take(buf);
+            println!("{prefix} {}", String::from_utf8_lossy(&line));
+        }
+    }
+    for (key, mut rem) in bufs {
+        while matches!(rem.last(), Some(b'\n' | b'\r')) {
+            rem.pop();
+        }
+        if !rem.is_empty() {
+            let prefix = prefixes.get(&key).map(|s| s.as_str()).unwrap_or(&key);
+            println!("{prefix} {}", String::from_utf8_lossy(&rem));
         }
     }
     Ok(())
@@ -1588,23 +1761,31 @@ async fn secrets(cfg: &CliConfig, cl: Option<&str>, s: SecretsCmd) -> Result<()>
     let (_, _, c) = connect(cfg, cl).await?;
     match s {
         SecretsCmd::Set { app, pairs } => {
+            util::validate_name("app", &app)?;
             if pairs.is_empty() {
                 bail!("usage: latrix secrets set {app} KEY=value ...");
             }
+            let timeout = app_health_timeout(&c, &app).await;
             let r: DeployResponse = c
                 .post(&format!("/v1/apps/{app}/secrets"), &SecretsRequest { set: parse_pairs(&pairs)?, unset: vec![] })
                 .await?;
             println!("secrets updated; rolling out v{}", r.version);
-            deploy::watch(&c, &app, r.version, 120).await
+            deploy::watch(&c, &app, r.version, timeout).await
         }
         SecretsCmd::Unset { app, names } => {
+            util::validate_name("app", &app)?;
+            if names.is_empty() {
+                bail!("usage: latrix secrets unset {app} KEY ...");
+            }
+            let timeout = app_health_timeout(&c, &app).await;
             let r: DeployResponse = c
                 .post(&format!("/v1/apps/{app}/secrets"), &SecretsRequest { set: Default::default(), unset: names })
                 .await?;
             println!("secrets removed; rolling out v{}", r.version);
-            deploy::watch(&c, &app, r.version, 120).await
+            deploy::watch(&c, &app, r.version, timeout).await
         }
         SecretsCmd::List { app } => {
+            util::validate_name("app", &app)?;
             let v: AppView = c.get(&format!("/v1/apps/{app}")).await?;
             for n in v.secret_names {
                 println!("{n}");
@@ -1615,6 +1796,7 @@ async fn secrets(cfg: &CliConfig, cl: Option<&str>, s: SecretsCmd) -> Result<()>
 }
 
 async fn console(cfg: &CliConfig, cl: Option<&str>, app: &str, cmd: Vec<String>) -> Result<()> {
+    util::validate_name("app", app)?;
     let (_, profile, c) = connect(cfg, cl).await?;
     let v: AppView = c.get(&format!("/v1/apps/{app}")).await?;
     let inst = v
@@ -1625,13 +1807,22 @@ async fn console(cfg: &CliConfig, cl: Option<&str>, app: &str, cmd: Vec<String>)
         .ok_or_else(|| anyhow!("{app} has no running instances"))?;
     let name = agent::runtime::container_name(app, &inst.instance.id);
     let inner = if cmd.is_empty() { vec!["sh".to_string()] } else { cmd };
-    let mut docker = vec!["docker".to_string(), "exec".into(), "-it".into(), name];
+    let tty_flag = if std::io::IsTerminal::is_terminal(&std::io::stdin())
+        && std::io::IsTerminal::is_terminal(&std::io::stdout())
+    {
+        "-it"
+    } else {
+        "-i"
+    };
+    let mut docker = vec!["docker".to_string(), "exec".into(), tty_flag.into(), name];
     docker.extend(inner);
     if profile.local {
         let st = std::process::Command::new(&docker[0]).args(&docker[1..]).status()?;
         std::process::exit(st.code().unwrap_or(1));
     }
-    let ssh = machine::find_ssh(cfg, cl, &inst.machine_name)?;
+    // Reload local config after connect() synced any autopilot-added machines.
+    let fresh_cfg = CliConfig::load().unwrap_or_else(|_| cfg.clone());
+    let ssh = machine::find_ssh(&fresh_cfg, cl, &inst.machine_name)?;
     let line = docker.iter().map(|a| util::shell_quote(a)).collect::<Vec<_>>().join(" ");
     drop(c);
     let st = ssh.interactive(Some(&line))?;
@@ -1675,7 +1866,19 @@ async fn machine_cmd(cfg: &mut CliConfig, cl: Option<&str>, m: MachineCmd) -> Re
             machine::action(&c, &name, "update").await
         }
         MachineCmd::Ssh { name } => {
-            let ssh = machine::find_ssh(cfg, cl, &name)?;
+            let ssh = match machine::find_ssh(cfg, cl, &name) {
+                Ok(s) => s,
+                Err(_) => {
+                    // Sync autopilot-added machines from the cluster and retry once.
+                    if let Ok((_, _, c)) = connect(cfg, cl).await {
+                        drop(c);
+                        if let Ok(fresh) = CliConfig::load() {
+                            *cfg = fresh;
+                        }
+                    }
+                    machine::find_ssh(cfg, cl, &name)?
+                }
+            };
             let st = ssh.interactive(None)?;
             std::process::exit(st.code().unwrap_or(0));
         }
@@ -1707,14 +1910,45 @@ async fn dashboard(cfg: &CliConfig, cl: Option<&str>, port: u16, no_open: bool) 
         open(&url);
         return Ok(());
     }
+    let probe = reqwest::Client::builder()
+        .no_proxy()
+        .connect_timeout(Duration::from_secs(4))
+        .timeout(Duration::from_secs(5))
+        .build()?;
     let mut last = None;
     for m in &p.machines {
         match Tunnel::open(m, Some(port)) {
-            Ok(t) => {
+            Ok(mut t) => {
+                let ping_url = format!("http://127.0.0.1:{}/v1/local/ping", t.port);
+                match probe.get(&ping_url).send().await {
+                    Ok(r) if r.status().is_success() => {}
+                    Ok(r) => {
+                        last = Some(anyhow!("agent on {} returned HTTP {}", m.name, r.status()));
+                        continue;
+                    }
+                    Err(e) => {
+                        last = Some(anyhow!("agent on {} not reachable over tunnel: {e}", m.name));
+                        continue;
+                    }
+                }
                 let url = format!("http://127.0.0.1:{}/", t.port);
                 println!("dashboard: {url}  (via {}, Ctrl-C to close)", m.name);
                 open(&url);
-                tokio::signal::ctrl_c().await?;
+                let mut tick = tokio::time::interval(Duration::from_secs(1));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tokio::select! {
+                        res = tokio::signal::ctrl_c() => {
+                            res?;
+                            break;
+                        }
+                        _ = tick.tick() => {
+                            if let Some(st) = t.exited() {
+                                bail!("SSH tunnel to {} closed unexpectedly ({st})", m.name);
+                            }
+                        }
+                    }
+                }
                 drop(t);
                 return Ok(());
             }

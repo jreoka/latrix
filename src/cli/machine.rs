@@ -66,14 +66,21 @@ fn default_name(host: &str) -> String {
     } else {
         host.split('.').next().unwrap_or(host).to_string()
     };
-    base.to_ascii_lowercase()
+    let clean: String = base
+        .to_ascii_lowercase()
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
         .collect::<String>()
         .trim_matches('-')
         .chars()
         .take(40)
-        .collect()
+        .collect();
+    let trimmed = clean.trim_end_matches('-');
+    if trimmed.is_empty() {
+        "node".into()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 /// Copy (or download) a Linux build of latrix onto the machine.
@@ -82,7 +89,7 @@ pub async fn install_binary(ssh: &Ssh, explicit: Option<&Path>) -> Result<()> {
     let arch = normalize_arch(&arch).to_string();
     let explicit = explicit
         .map(|p| p.to_path_buf())
-        .or_else(|| std::env::var("LATRIX_AGENT_BINARY").ok().map(PathBuf::from));
+        .or_else(|| std::env::var("LATRIX_AGENT_BINARY").ok().filter(|s| !s.trim().is_empty()).map(PathBuf::from));
     let local = match explicit {
         Some(p) => Some(p),
         None if cfg!(target_os = "linux") && normalize_arch(std::env::consts::ARCH) == arch => {
@@ -90,41 +97,62 @@ pub async fn install_binary(ssh: &Ssh, explicit: Option<&Path>) -> Result<()> {
         }
         None => None,
     };
-    let tmp = format!("/tmp/latrix-upload-{}", util::random_id(6));
-    match local {
-        Some(path) => {
-            ssh.upload(&path, &tmp).await.context("uploading latrix")?;
-        }
+    let tmp = format!("/tmp/latrix-upload-{}", util::random_id(8));
+    let fetch_res: Result<()> = match local {
+        Some(path) => ssh.upload(&path, &tmp).await.context("uploading latrix"),
         None => {
-            let base = std::env::var("LATRIX_RELEASE_BASE")
-                .unwrap_or_else(|_| format!("https://github.com/jreoka/latrix/releases/download/v{}", util::VERSION));
+            let custom_base = std::env::var("LATRIX_RELEASE_BASE").ok().filter(|s| !s.trim().is_empty());
+            let base = custom_base
+                .clone()
+                .unwrap_or_else(|| format!("https://github.com/jreoka/latrix/releases/download/v{}", util::VERSION));
             let file = format!("latrix-{arch}-unknown-linux-musl");
             let url = format!("{base}/{file}");
             let latest = format!("https://github.com/jreoka/latrix/releases/latest/download/{file}");
+            let proto = if custom_base.is_none() { "--proto '=https' --tlsv1.2 " } else { "" };
             println!("      downloading {url}");
-            let exact = ssh.run(&format!("curl -fsSL {} -o {tmp}", shell_quote(&url))).await;
+            let exact = ssh
+                .run(&format!("curl -fsSL {proto}{} -o {tmp}", shell_quote(&url)))
+                .await;
             if exact.is_err() {
                 println!("      not published for this version, trying the latest release");
-                ssh.run(&format!("curl -fsSL {} -o {tmp}", shell_quote(&latest)))
-                    .await
-                    .with_context(|| {
-                        format!(
-                            "could not download a Linux build of latrix for {arch} (no GitHub release found).\n  \
-                             Build one with `cargo build --release --target {arch}-unknown-linux-musl` on Linux/WSL \
-                             and pass --agent-binary <path>"
-                        )
-                    })?;
+                ssh.run(&format!(
+                    "curl -fsSL --proto '=https' --tlsv1.2 {} -o {tmp}",
+                    shell_quote(&latest)
+                ))
+                .await
+                .with_context(|| {
+                    format!(
+                        "could not download a Linux build of latrix for {arch} (no GitHub release found).\n  \
+                         Build one with `cargo build --release --target {arch}-unknown-linux-musl` on Linux/WSL \
+                         and pass --agent-binary <path>"
+                    )
+                })?;
             }
+            Ok(())
         }
+    };
+    if let Err(e) = fetch_res {
+        let _ = ssh.run(&format!("rm -f {tmp}")).await;
+        return Err(e);
     }
-    ssh.run(&format!("install -m 0755 {tmp} /usr/local/bin/latrix && rm -f {tmp}"))
-        .await?;
-    let v = ssh.run("/usr/local/bin/latrix --version").await.map_err(|e| {
-        anyhow!(
-            "the uploaded latrix binary does not run on this machine ({e}).\n  \
-             Use a static build: cargo build --release --target {arch}-unknown-linux-musl, then pass --agent-binary"
-        )
-    })?;
+    // Verify the uploaded binary actually runs on this architecture BEFORE overwriting /usr/local/bin/latrix.
+    let v = match ssh.run(&format!("chmod 0755 {tmp} && {tmp} --version")).await {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = ssh.run(&format!("rm -f {tmp}")).await;
+            return Err(anyhow!(
+                "the uploaded latrix binary does not run on this machine ({e}).\n  \
+                 Use a static build: cargo build --release --target {arch}-unknown-linux-musl, then pass --agent-binary"
+            ));
+        }
+    };
+    if let Err(e) = ssh
+        .run(&format!("install -m 0755 {tmp} /usr/local/bin/latrix && rm -f {tmp}"))
+        .await
+    {
+        let _ = ssh.run(&format!("rm -f {tmp}")).await;
+        return Err(e);
+    }
     println!("      installed {}", v.trim());
     Ok(())
 }
@@ -133,26 +161,60 @@ async fn resolve_ip(host: &str) -> Result<String> {
     if host.parse::<std::net::IpAddr>().is_ok() {
         return Ok(host.to_string());
     }
-    let mut addrs = tokio::net::lookup_host(format!("{host}:22")).await?;
+    let addrs: Vec<std::net::SocketAddr> = tokio::net::lookup_host(format!("{host}:22")).await?.collect();
     addrs
+        .iter()
         .find(|a| a.is_ipv4())
+        .or_else(|| addrs.first())
         .map(|a| a.ip().to_string())
         .ok_or_else(|| anyhow!("could not resolve {host}"))
 }
 
 pub async fn add(cfg: &mut CliConfig, cluster: Option<&str>, opts: AddOptions) -> Result<()> {
     let ssh = Ssh::new(&opts.target, opts.port, opts.key.clone());
+    util::validate_ssh_target(&ssh.target)?;
     let name = opts.name.clone().unwrap_or_else(|| default_name(ssh.host()));
     validate_name("machine", &name)?;
 
     // Which cluster? An existing one, or a brand new one.
-    let cluster_name = match cluster {
-        Some(c) => c.to_string(),
-        None => cfg
-            .cluster_name(None)
-            .ok()
-            .filter(|c| !cfg.clusters[c].local)
-            .unwrap_or_else(|| "default".into()),
+    let cluster_name = match cluster.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(c) => {
+            validate_name("cluster", c)?;
+            c.to_string()
+        }
+        None => {
+            let remote_clusters: Vec<&String> = cfg
+                .clusters
+                .iter()
+                .filter(|(_, p)| !p.local && p.kubernetes.is_none())
+                .map(|(k, _)| k)
+                .collect();
+            if let Some(cur) = cfg.current.as_deref() {
+                if let Some(p) = cfg.clusters.get(cur) {
+                    if !p.local && p.kubernetes.is_none() {
+                        cur.to_string()
+                    } else if remote_clusters.is_empty() {
+                        "default".into()
+                    } else if remote_clusters.len() == 1 {
+                        remote_clusters[0].clone()
+                    } else {
+                        bail!("several clusters configured; pick one with --cluster <name> or `latrix cluster use <name>`");
+                    }
+                } else if remote_clusters.is_empty() {
+                    "default".into()
+                } else if remote_clusters.len() == 1 {
+                    remote_clusters[0].clone()
+                } else {
+                    bail!("several clusters configured; pick one with --cluster <name> or `latrix cluster use <name>`");
+                }
+            } else if remote_clusters.is_empty() {
+                "default".into()
+            } else if remote_clusters.len() == 1 {
+                remote_clusters[0].clone()
+            } else {
+                bail!("several clusters configured; pick one with --cluster <name> or `latrix cluster use <name>`");
+            }
+        }
     };
     let mut profile = cfg.clusters.get(&cluster_name).cloned().unwrap_or_else(|| ClusterProfile {
         token: util::random_token(),
@@ -167,7 +229,14 @@ pub async fn add(cfg: &mut CliConfig, cluster: Option<&str>, opts: AddOptions) -
     if profile.local {
         bail!("'{cluster_name}' is the local dev cluster; use --cluster <name> to create a real one");
     }
-    let first = profile.machines.iter().all(|m| m.name == name);
+    if let Some(existing) = profile.machines.iter().find(|m| m.name == name && m.ssh != ssh.target) {
+        bail!(
+            "cluster '{cluster_name}' already has a machine named '{name}' ({}); pass --name <other> to add a new machine",
+            existing.ssh
+        );
+    }
+    let first = profile.machines.is_empty()
+        || (profile.machines.len() == 1 && profile.machines[0].name == name && profile.machines[0].ssh == ssh.target);
     let total = 5;
 
     step(1, total, &format!("connecting to {}", ssh.target));
@@ -179,11 +248,12 @@ pub async fn add(cfg: &mut CliConfig, cluster: Option<&str>, opts: AddOptions) -
         Some(Client::connect(&profile).await.context("the cluster must be reachable to add a machine")?)
     };
 
-    step(2, total, "installing latrix");
-    install_binary(&ssh, opts.agent_binary.as_deref()).await?;
-
-    step(3, total, "setting up the machine (Docker, WireGuard, firewall, systemd)");
+    // Bootstrap first so curl / ca-certificates / Docker / WireGuard are installed before downloading latrix.
+    step(2, total, "setting up the machine (Docker, WireGuard, firewall, systemd)");
     ssh.stream_script(BOOTSTRAP, "      ").await?;
+
+    step(3, total, "installing latrix");
+    install_binary(&ssh, opts.agent_binary.as_deref()).await?;
 
     step(4, total, &format!("joining cluster '{cluster_name}'"));
     let pubkey = ssh.run("/usr/local/bin/latrix agent keygen").await?.trim().to_string();
@@ -387,6 +457,7 @@ pub async fn wait_status(client: &Client, name: &str, want: &[&str], timeout: Du
 }
 
 pub async fn remove(cfg: &mut CliConfig, cluster: Option<&str>, name: &str, force: bool, destroy: bool) -> Result<()> {
+    validate_name("machine", name)?;
     let (cname, profile) = cfg.profile(cluster)?;
     let client = Client::connect(&profile).await?;
     let st: StatusView = client.get("/v1/status").await?;
@@ -396,6 +467,9 @@ pub async fn remove(cfg: &mut CliConfig, cluster: Option<&str>, name: &str, forc
         .find(|m| m.machine.name == name)
         .ok_or_else(|| anyhow!("machine '{name}' not found"))?
         .clone();
+    if st.machines.len() <= 1 && !force {
+        bail!("'{name}' is the only machine in the cluster; pass --force to remove it anyway");
+    }
     if !force && mv.instances > 0 && mv.alive {
         println!("==> draining {name}");
         if !matches!(mv.machine.status, crate::state::MachineStatus::Draining | crate::state::MachineStatus::Cordoned) {
@@ -416,12 +490,20 @@ pub async fn remove(cfg: &mut CliConfig, cluster: Option<&str>, name: &str, forc
         .delete(&format!("/v1/machines/{name}?force={}", force || !mv.alive || mv.instances == 0))
         .await?;
     println!("==> removed {name} from the cluster");
+    // Persist the updated local config immediately so best-effort SSH/provider cleanup errors
+    // cannot leave a stale machine entry behind.
+    if let Some(p) = cfg.clusters.get_mut(&cname) {
+        p.machines.retain(|m| m.name != name);
+    }
+    cfg.save()?;
     if let Some(m) = profile.machines.iter().find(|m| m.name == name) {
         let ssh = Ssh::new(&m.ssh, m.port, m.key.clone());
         let cleanup = "systemctl disable --now latrix >/dev/null 2>&1; \
             ids=$(docker ps -aq --filter label=latrix.instance); [ -n \"$ids\" ] && docker rm -f $ids >/dev/null; \
             docker rm -f latrix-registry >/dev/null 2>&1; ip link del latrix0 2>/dev/null; ip link del latrix-vip 2>/dev/null; \
-            rm -f /var/lib/latrix/node.json /var/lib/latrix/state.json; true";
+            rm -rf /var/lib/latrix/node.json /var/lib/latrix/state.json /var/lib/latrix/wg.key \
+                   /var/lib/latrix/rsyncd.secrets /var/lib/latrix/rsyncd.conf /var/lib/latrix/ssh \
+                   /etc/wireguard/latrix0.conf; true";
         match ssh.run(cleanup).await {
             Ok(_) => println!("==> stopped the agent and containers on {name} (volume data left in /var/lib/latrix/volumes)"),
             Err(e) => println!("    (could not clean up {name} over ssh: {e})"),
@@ -437,10 +519,6 @@ pub async fn remove(cfg: &mut CliConfig, cluster: Option<&str>, name: &str, forc
             None => println!("    --destroy: {name} was not created by latrix, so it was left running"),
         }
     }
-    if let Some(p) = cfg.clusters.get_mut(&cname) {
-        p.machines.retain(|m| m.name != name);
-    }
-    cfg.save()?;
     Ok(())
 }
 
@@ -469,8 +547,20 @@ pub async fn upgrade_agents(cfg: &CliConfig, cluster: Option<&str>, only: Option
     let st: StatusView = c.get("/v1/status").await?;
     drop(c);
     let profile = CliConfig::load()?.clusters.get(&cname).cloned().unwrap_or(profile);
+    let mut targets: Vec<&MachineView> = st
+        .machines
+        .iter()
+        .filter(|m| only.map(|o| o == m.machine.name).unwrap_or(true))
+        .collect();
+    if let Some(o) = only {
+        if targets.is_empty() {
+            bail!("machine '{o}' not found in cluster '{cname}'");
+        }
+    }
+    // Upgrade followers first and the leader last to minimize leadership churn.
+    targets.sort_by_key(|m| (m.leader, m.machine.id));
     let mut problems = vec![];
-    for mv in st.machines.iter().filter(|m| only.map(|o| o == m.machine.name).unwrap_or(true)) {
+    for mv in targets {
         let name = &mv.machine.name;
         println!("==> {name}");
         if !mv.alive {
@@ -478,7 +568,7 @@ pub async fn upgrade_agents(cfg: &CliConfig, cluster: Option<&str>, only: Option
             problems.push(name.clone());
             continue;
         }
-        if mv.agent_version == util::VERSION {
+        if binary.is_none() && mv.agent_version == util::VERSION {
             println!("    already runs latrix {}", util::VERSION);
             continue;
         }
@@ -497,9 +587,11 @@ pub async fn upgrade_agents(cfg: &CliConfig, cluster: Option<&str>, only: Option
                 let ok = async {
                     let c = Client::connect(&profile).await?;
                     let st: StatusView = c.get("/v1/status").await?;
-                    Ok::<bool, anyhow::Error>(
-                        st.machines.iter().any(|x| &x.machine.name == name && x.alive && x.agent_version == util::VERSION),
-                    )
+                    Ok::<bool, anyhow::Error>(st.machines.iter().any(|x| {
+                        &x.machine.name == name
+                            && x.alive
+                            && (binary.is_some() || x.agent_version == util::VERSION)
+                    }))
                 }
                 .await
                 .unwrap_or(false);
@@ -513,7 +605,7 @@ pub async fn upgrade_agents(cfg: &CliConfig, cluster: Option<&str>, only: Option
         }
         .await;
         match res {
-            Ok(()) => println!("    {name} runs latrix {}", util::VERSION),
+            Ok(()) => println!("    {name} upgraded"),
             Err(e) => {
                 println!("    failed: {e:#}");
                 problems.push(name.clone());

@@ -10,11 +10,14 @@
 //!
 //! Everything else has a sensible default.
 
-use crate::util::{parse_duration, parse_size_mb, validate_name};
+use crate::util::{
+    parse_duration, parse_size_mb, validate_git_branch, validate_git_url, validate_image_ref,
+    validate_name,
+};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Component, Path};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
@@ -170,6 +173,36 @@ pub struct DnsRecordConfig {
 /// Normalize a DNS hostname (trim, lowercase, strip trailing dot).
 pub fn normalize_dns_name(name: &str) -> String {
     name.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Validate an HTTP domain hostname strictly.
+pub fn validate_domain(raw: &str) -> Result<String> {
+    let d = normalize_dns_name(raw);
+    if d.is_empty()
+        || d.len() > 253
+        || !d.contains('.')
+        || d.starts_with('.')
+        || d.contains("..")
+        || d.contains('/')
+        || d.contains(':')
+        || d.contains('*')
+        || d.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        bail!("invalid domain '{raw}'");
+    }
+    for label in d.split('.') {
+        if label.is_empty()
+            || label.len() > 63
+            || label.starts_with('-')
+            || label.ends_with('-')
+            || !label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            bail!("invalid domain '{raw}'");
+        }
+    }
+    Ok(d)
 }
 
 /// Validate a DNS record configuration (used by `latrix.toml` and `latrix dns add`).
@@ -422,25 +455,57 @@ impl AppConfig {
             validate_name("alias", a)?;
         }
         if let Some(shm) = &self.shm_size {
-            parse_size_mb(shm).context("shm_size")?;
+            if parse_size_mb(shm).context("shm_size")? == 0 {
+                bail!("shm_size must be at least 1MB");
+            }
         }
         if self.build.image.is_some() && self.build.git.is_some() {
             bail!("[build] set either `image` or `git`, not both");
+        }
+        if let Some(img) = &self.build.image {
+            validate_image_ref(img).context("[build] image")?;
+        }
+        if let Some(git) = &self.build.git {
+            validate_git_url(git).context("[build] git")?;
+        }
+        if let Some(branch) = &self.build.branch {
+            validate_git_branch(branch).context("[build] branch")?;
+        }
+        for (k, v) in &self.env {
+            if k.is_empty() || k.contains(['=', '\0', '\r', '\n']) {
+                bail!("[env] invalid variable name '{k}'");
+            }
+            if v.contains('\0') {
+                bail!("[env] variable '{k}' cannot contain NUL bytes");
+            }
+        }
+        if let (Some(min), Some(max)) = (self.scale.min, self.scale.max) {
+            if min > max {
+                bail!("[scale] min ({min}) cannot exceed max ({max})");
+            }
         }
         let (min, max) = self.scale.bounds();
         if max == 0 && min == 0 && self.scale.count != Some(0) {
             bail!("[scale] max must be at least 1");
         }
-        if self.scale.cpu < 0.0 {
-            bail!("[scale] cpu must be positive");
+        if !self.scale.cpu.is_finite() || self.scale.cpu < 0.0 {
+            bail!("[scale] cpu must be a finite non-negative number");
         }
-        parse_size_mb(&self.scale.memory).context("[scale] memory")?;
-        parse_duration(&self.deploy.health_timeout).context("[deploy] health_timeout")?;
-        parse_duration(&self.deploy.stop_timeout).context("[deploy] stop_timeout")?;
+        if parse_size_mb(&self.scale.memory).context("[scale] memory")? == 0 {
+            bail!("[scale] memory must be at least 1MB");
+        }
+        let ht = parse_duration(&self.deploy.health_timeout).context("[deploy] health_timeout")?;
+        if ht.as_secs() == 0 || ht.as_secs() > 86_400 {
+            bail!("[deploy] health_timeout must be between 1s and 24h");
+        }
+        let st = parse_duration(&self.deploy.stop_timeout).context("[deploy] stop_timeout")?;
+        if st.as_secs() > 3_600 {
+            bail!("[deploy] stop_timeout must be at most 1h");
+        }
         if !["rolling", "immediate"].contains(&self.deploy.strategy.as_str()) {
             bail!("[deploy] strategy must be \"rolling\" or \"immediate\"");
         }
-        let mut seen = std::collections::BTreeSet::new();
+        let mut seen = BTreeSet::new();
         for v in &self.volumes {
             validate_name("volume", &v.name)?;
             if !seen.insert(v.name.clone()) {
@@ -449,12 +514,27 @@ impl AppConfig {
             if !v.path.starts_with('/') {
                 bail!("volume '{}' path must be absolute", v.name);
             }
+            if v.path == "/"
+                || v.path == "/__latrix_vol"
+                || v.path.contains(':')
+                || v.path.chars().any(|c| c.is_control())
+                || Path::new(&v.path)
+                    .components()
+                    .any(|c| matches!(c, Component::ParentDir))
+            {
+                bail!("volume '{}' has an invalid mount path '{}'", v.name, v.path);
+            }
             if v.copies == 0 {
                 bail!("volume '{}' copies must be at least 1", v.name);
             }
-            parse_duration(&v.sync).with_context(|| format!("volume '{}' sync", v.name))?;
+            let sync = parse_duration(&v.sync).with_context(|| format!("volume '{}' sync", v.name))?;
+            if sync.as_secs() == 0 {
+                bail!("volume '{}' sync interval must be at least 1s", v.name);
+            }
             if let Some(sz) = &v.size {
-                parse_size_mb(sz).with_context(|| format!("volume '{}' size", v.name))?;
+                if parse_size_mb(sz).with_context(|| format!("volume '{}' size", v.name))? == 0 {
+                    bail!("volume '{}' size must be at least 1MB", v.name);
+                }
             }
         }
         if !self.volumes.is_empty() && max > 1 {
@@ -464,17 +544,41 @@ impl AppConfig {
                  machines and fails over automatically."
             );
         }
+        if let Some(h) = &self.http {
+            if h.port == 0 {
+                bail!("[http] port must be 1-65535");
+            }
+            if let Some(path) = &h.health {
+                if !path.starts_with('/')
+                    || path.starts_with("//")
+                    || path.chars().any(|c| c.is_whitespace() || c.is_control())
+                {
+                    bail!("[http] invalid health path '{path}' (must start with '/' and contain no whitespace)");
+                }
+            }
+            for d in &h.domains {
+                validate_domain(d)?;
+            }
+        }
+        let mut seen_public = BTreeSet::new();
         for p in &self.ports {
+            if p.port == 0 {
+                bail!("port must be 1-65535");
+            }
+            if p.public_port == Some(0) {
+                bail!("port {}: public_port must be 1-65535", p.port);
+            }
             if !["tcp", "udp"].contains(&p.protocol.as_str()) {
                 bail!("port {}: protocol must be \"tcp\" or \"udp\"", p.port);
             }
             if p.protocol == "udp" && !p.public {
                 bail!("port {}: UDP ports must be public = true (they are published on the machine's IP)", p.port);
             }
-        }
-        for d in self.http.iter().flat_map(|h| h.domains.iter()) {
-            if d.contains('/') || d.contains(':') || !d.contains('.') {
-                bail!("invalid domain '{d}'");
+            if p.public {
+                let pub_p = p.public_port.unwrap_or(p.port);
+                if !seen_public.insert((p.protocol.clone(), pub_p)) {
+                    bail!("duplicate public {} port {pub_p}", p.protocol);
+                }
             }
         }
         for r in &self.dns {
@@ -520,11 +624,15 @@ impl AppConfig {
 
 /// A starter config written by `latrix launch`.
 pub fn template(app: &str, port: Option<u16>, image: Option<&str>) -> String {
+    let app_q = serde_json::to_string(app).unwrap_or_else(|_| format!("\"{app}\""));
     let mut s = format!(
-        "# latrix app config — https://github.com/jreoka/latrix\napp = \"{app}\"\n\n[build]\n"
+        "# latrix app config — https://github.com/jreoka/latrix\napp = {app_q}\n\n[build]\n"
     );
     match image {
-        Some(img) => s.push_str(&format!("image = \"{img}\"\n")),
+        Some(img) => {
+            let img_q = serde_json::to_string(img).unwrap_or_else(|_| format!("\"{img}\""));
+            s.push_str(&format!("image = {img_q}\n"));
+        }
         None => s.push_str("# Builds the Dockerfile in this directory on the cluster.\n# dockerfile = \"Dockerfile\"\n# image = \"nginx:1.27\"   # or deploy a prebuilt image\n"),
     }
     if let Some(p) = port {
@@ -673,5 +781,46 @@ ttl = 300
 
         let bad_shm: AppConfig = toml::from_str("app = \"x\"\nshm_size = \"bogus\"\n").unwrap();
         assert!(bad_shm.validate().is_err());
+    }
+
+    #[test]
+    fn validation_catches_edge_cases_and_injections() {
+        assert!(validate_domain("sub-1.example.com").is_ok());
+        assert!(validate_domain("*.example.com").is_err());
+        assert!(validate_domain("https://example.com").is_err());
+        assert!(validate_domain("bad host.com").is_err());
+        assert!(validate_domain("example.com/path").is_err());
+        assert!(validate_domain("-bad.example.com").is_err());
+
+        // Non-finite / negative CPU
+        let mut c: AppConfig = toml::from_str("app = \"x\"\n").unwrap();
+        c.scale.cpu = f64::NAN;
+        assert!(c.validate().is_err());
+        c.scale.cpu = -1.0;
+        assert!(c.validate().is_err());
+
+        // Zero port, zero memory, min > max, duplicate public ports
+        assert!(toml::from_str::<AppConfig>("app = \"x\"\n[http]\nport = 0\n").unwrap().validate().is_err());
+        assert!(toml::from_str::<AppConfig>("app = \"x\"\n[scale]\nmemory = \"0MB\"\n").unwrap().validate().is_err());
+        assert!(toml::from_str::<AppConfig>("app = \"x\"\n[scale]\nmin = 5\nmax = 2\n").unwrap().validate().is_err());
+        assert!(toml::from_str::<AppConfig>(
+            "app = \"x\"\n[[ports]]\nport = 8080\npublic = true\n[[ports]]\nport = 9090\npublic = true\npublic_port = 8080\n"
+        )
+        .unwrap()
+        .validate()
+        .is_err());
+
+        // Volume path traversal or root mount
+        assert!(toml::from_str::<AppConfig>("app = \"x\"\n[[volumes]]\nname = \"v\"\npath = \"/\"\n").unwrap().validate().is_err());
+        assert!(toml::from_str::<AppConfig>("app = \"x\"\n[[volumes]]\nname = \"v\"\npath = \"/data/../etc\"\n").unwrap().validate().is_err());
+
+        // Invalid git URL / branch
+        assert!(toml::from_str::<AppConfig>("app = \"x\"\n[build]\ngit = \"--upload-pack=id\"\n").unwrap().validate().is_err());
+        assert!(toml::from_str::<AppConfig>("app = \"x\"\n[build]\ngit = \"https://github.com/a/b.git\"\nbranch = \"-bad\"\n").unwrap().validate().is_err());
+
+        // Template escapes quotes in image string cleanly
+        let t = template("demo", Some(8080), Some("my\"img"));
+        let parsed: AppConfig = toml::from_str(&t).unwrap();
+        assert_eq!(parsed.build.image.as_deref(), Some("my\"img"));
     }
 }
