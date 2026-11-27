@@ -298,19 +298,20 @@ pub async fn run(cli: Cli) -> Result<()> {
     let mut cfg = CliConfig::load()?;
     if let Ok((name, p)) = cfg.profile(cl) {
         if let Some(t) = p.kubernetes {
-            return k8s::dispatch(&cfg, &name, t, cli.cmd).await;
+            return Box::pin(k8s::dispatch(&cfg, &name, t, cli.cmd)).await;
         }
     }
     match cli.cmd {
-        Cmd::Deploy(args) => deploy_cmd(&cfg, cl, args).await,
-        Cmd::Status => status(&cfg, cl).await,
-        Cmd::Apps { action } => match action {
-            None | Some(AppsCmd::List) => apps(&cfg, cl).await,
-            Some(AppsCmd::Show { app }) => ps(&cfg, cl, &app).await,
-            Some(AppsCmd::Destroy(a)) => destroy(&cfg, cl, a).await,
+        Cmd::Deploy(args) => Box::pin(deploy_cmd(&cfg, cl, args)).await,
+        Cmd::Status => Box::pin(status(&cfg, cl)).await,
+        Cmd::Apps { all, action } => match action {
+            None => Box::pin(apps(&cfg, cl, all)).await,
+            Some(AppsCmd::List { all: list_all }) => Box::pin(apps(&cfg, cl, all || list_all)).await,
+            Some(AppsCmd::Show { app }) => Box::pin(ps(&cfg, cl, &app)).await,
+            Some(AppsCmd::Destroy(a)) => Box::pin(destroy(&cfg, cl, a)).await,
         },
-        Cmd::Ps { app } => ps(&cfg, cl, &app).await,
-        Cmd::Logs { app, follow, tail, instance } => logs(&cfg, cl, &app, follow, tail, instance).await,
+        Cmd::Ps { app } => Box::pin(ps(&cfg, cl, &app)).await,
+        Cmd::Logs { app, follow, tail, instance } => Box::pin(logs(&cfg, cl, &app, follow, tail, instance)).await,
         Cmd::Scale { app, count, min, max, cpu, memory } => {
             let (_, _, c) = connect(&cfg, cl).await?;
             if count.is_none() && min.is_none() && max.is_none() && cpu.is_none() && memory.is_none() {
@@ -345,7 +346,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Destroy(a) => destroy(&cfg, cl, a).await,
         Cmd::Secrets(s) => secrets(&cfg, cl, s).await,
         Cmd::Console { app, cmd } => console(&cfg, cl, &app, cmd).await,
-        Cmd::Machine(m) => machine_cmd(&mut cfg, cl, m).await,
+        Cmd::Machine(m) => Box::pin(machine_cmd(&mut cfg, cl, m)).await,
         Cmd::Volumes { action } => match action {
             None | Some(VolumesCmd::List) => volumes(&cfg, cl).await,
             Some(VolumesCmd::Prune { yes }) => prune_volumes(&cfg, cl, yes).await,
@@ -355,13 +356,13 @@ pub async fn run(cli: Cli) -> Result<()> {
                 snapshot_rollback(&cfg, cl, &app, &snapshot, volume.as_deref(), yes).await
             }
         },
-        Cmd::Doctor { machine } => doctor::doctor(&cfg, cl, machine.as_deref()).await,
-        Cmd::Backup { apps, all, out, no_image, stop } => backup::backup(&cfg, cl, apps, all, out, no_image, stop).await,
-        Cmd::Restore { file, as_name } => backup::restore(&cfg, cl, &file, as_name).await,
+        Cmd::Doctor { machine } => Box::pin(doctor::doctor(&cfg, cl, machine.as_deref())).await,
+        Cmd::Backup { apps, all, out, no_image, stop } => Box::pin(backup::backup(&cfg, cl, apps, all, out, no_image, stop)).await,
+        Cmd::Restore { file, as_name } => Box::pin(backup::restore(&cfg, cl, &file, as_name)).await,
         Cmd::Import(ImportCmd::Fly { app, as_name, no_data, no_secrets, from_source }) => {
-            fly::import(&cfg, cl, fly::ImportOptions { fly_app: app, name: as_name, no_data, no_secrets, from_source }).await
+            Box::pin(fly::import(&cfg, cl, fly::ImportOptions { fly_app: app, name: as_name, no_data, no_secrets, from_source })).await
         }
-        Cmd::Rexctl { action } => rexctl::run_cmd(&cfg, cl, action).await,
+        Cmd::Rexctl { action } => Box::pin(rexctl::run_cmd(&cfg, cl, action)).await,
         Cmd::Certs { .. } => {
             let (_, _, c) = connect(&cfg, cl).await?;
             let st: StatusView = c.get("/v1/status").await?;
@@ -983,6 +984,74 @@ fn bar(frac: f64) -> String {
     format!("{}{}", "█".repeat(n), "░".repeat(10 - n))
 }
 
+fn partition_fluxer_apps<'a>(
+    st: &'a StatusView,
+) -> (Vec<&'a AppView>, Vec<&'a AppView>, Option<&'a FluxerSummary>) {
+    let Some(fx) = st.fluxer.as_ref() else {
+        return (st.apps.iter().collect(), vec![], None);
+    };
+    let mut regular = vec![];
+    let mut fluxer = vec![];
+    for a in &st.apps {
+        if a.group.as_deref() == Some(fx.project.as_str()) {
+            fluxer.push(a);
+        } else {
+            regular.push(a);
+        }
+    }
+    (regular, fluxer, Some(fx))
+}
+
+fn format_mem_mb(mb: u64) -> String {
+    if mb >= 1024 && mb.is_multiple_of(1024) {
+        format!("{}GB", mb / 1024)
+    } else if mb >= 1024 {
+        format!("{:.1}GB", mb as f64 / 1024.0)
+    } else {
+        format!("{mb}MB")
+    }
+}
+
+fn fluxer_rollup(fx: &FluxerSummary, apps: &[&AppView]) -> (usize, usize, String, f64, u64, String) {
+    let total = apps.len();
+    let mut healthy_svcs = 0usize;
+    let mut deploying = false;
+    let mut failed = false;
+    let mut cpu_sum = 0.0f64;
+    let mut mem_mb = 0u64;
+    for a in apps {
+        let h = a
+            .instances
+            .iter()
+            .filter(|i| !i.instance.stopping && i.report.as_ref().map(|r| r.healthy).unwrap_or(false))
+            .count();
+        if a.count > 0 && h >= a.count as usize {
+            healthy_svcs += 1;
+        }
+        match a.release_status {
+            Some(crate::state::ReleaseStatus::Deploying) => deploying = true,
+            Some(crate::state::ReleaseStatus::Failed) => failed = true,
+            _ => {}
+        }
+        cpu_sum += a.cpu * a.count.max(1) as f64;
+        mem_mb += util::parse_size_mb(&a.memory).unwrap_or(0) * a.count.max(1) as u64;
+    }
+    let state = if failed {
+        "failed"
+    } else if deploying {
+        "deploying"
+    } else if healthy_svcs == total && total > 0 {
+        "active"
+    } else {
+        "degraded"
+    };
+    let url = apps
+        .iter()
+        .find_map(|a| a.urls.first().cloned())
+        .unwrap_or_else(|| format!("https://{}", fx.domain));
+    (healthy_svcs, total, state.into(), cpu_sum, mem_mb, url)
+}
+
 async fn status(cfg: &CliConfig, cl: Option<&str>) -> Result<()> {
     let (name, _, c) = connect(cfg, cl).await?;
     let st: StatusView = c.get("/v1/status").await?;
@@ -991,10 +1060,12 @@ async fn status(cfg: &CliConfig, cl: Option<&str>) -> Result<()> {
         .and_then(|l| st.machines.iter().find(|m| m.machine.id == l))
         .map(|m| m.machine.name.clone())
         .unwrap_or_else(|| "?".into());
+    let (regular_apps, fluxer_apps, fx_meta) = partition_fluxer_apps(&st);
+    let visible_apps = regular_apps.len() + usize::from(!fluxer_apps.is_empty());
     let mut head = format!(
         "Cluster '{name}' · leader {leader} · {} machine(s) · {} app(s)",
         st.machines.len(),
-        st.apps.len()
+        visible_apps
     );
     if st.monthly_cost > 0.0 {
         head.push_str(&format!(" · est. {:.2}/month", st.monthly_cost));
@@ -1037,11 +1108,10 @@ async fn status(cfg: &CliConfig, cl: Option<&str>) -> Result<()> {
         .collect();
     print_table(&["NAME", "STATUS", "CPU", "MEMORY", "INSTANCES", "UPDATES"], rows);
     println!("\nAPPS");
-    if st.apps.is_empty() {
+    if visible_apps == 0 {
         println!("  (none yet — `latrix launch` then `latrix deploy`)");
     } else {
-        let rows = st
-            .apps
+        let mut rows: Vec<Vec<String>> = regular_apps
             .iter()
             .map(|a| {
                 let healthy = a
@@ -1063,6 +1133,22 @@ async fn status(cfg: &CliConfig, cl: Option<&str>) -> Result<()> {
                 ]
             })
             .collect();
+        if let (Some(fx), false) = (fx_meta, fluxer_apps.is_empty()) {
+            let (h, total, state, _, _, url) = fluxer_rollup(fx, &fluxer_apps);
+            let rel = if fx.release.is_empty() {
+                state
+            } else {
+                format!("{} {state}", fx.release)
+            };
+            rows.push(vec![
+                fx.project.clone(),
+                rel,
+                format!("{h}/{total} svc"),
+                "fluxer".into(),
+                url,
+            ]);
+            rows.sort_by(|a, b| a[0].cmp(&b[0]));
+        }
         print_table(&["NAME", "RELEASE", "HEALTHY", "KIND", "URL"], rows);
     }
     if !st.events.is_empty() {
@@ -1074,22 +1160,54 @@ async fn status(cfg: &CliConfig, cl: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-async fn apps(cfg: &CliConfig, cl: Option<&str>) -> Result<()> {
+async fn apps(cfg: &CliConfig, cl: Option<&str>, show_all: bool) -> Result<()> {
     let (_, _, c) = connect(cfg, cl).await?;
     let st: StatusView = c.get("/v1/status").await?;
-    let rows = st
-        .apps
-        .iter()
-        .map(|a| {
-            vec![
-                a.name.clone(),
-                format!("v{}", a.current),
-                a.count.to_string(),
-                format!("{} / {}", a.cpu, a.memory),
-                a.image.clone(),
-            ]
-        })
-        .collect();
+    let rows: Vec<Vec<String>> = if show_all {
+        st.apps
+            .iter()
+            .map(|a| {
+                vec![
+                    a.name.clone(),
+                    format!("v{}", a.current),
+                    a.count.to_string(),
+                    format!("{} / {}", a.cpu, a.memory),
+                    a.image.clone(),
+                ]
+            })
+            .collect()
+    } else {
+        let (regular_apps, fluxer_apps, fx_meta) = partition_fluxer_apps(&st);
+        let mut r: Vec<Vec<String>> = regular_apps
+            .iter()
+            .map(|a| {
+                vec![
+                    a.name.clone(),
+                    format!("v{}", a.current),
+                    a.count.to_string(),
+                    format!("{} / {}", a.cpu, a.memory),
+                    a.image.clone(),
+                ]
+            })
+            .collect();
+        if let (Some(fx), false) = (fx_meta, fluxer_apps.is_empty()) {
+            let (h, total, _, cpu, mem_mb, url) = fluxer_rollup(fx, &fluxer_apps);
+            let rel = if fx.release.is_empty() { "fluxer".into() } else { fx.release.clone() };
+            r.push(vec![
+                fx.project.clone(),
+                rel,
+                format!("{h}/{total} svc"),
+                format!("{cpu:.2} / {}", format_mem_mb(mem_mb)),
+                format!("fluxer stack ({url})"),
+            ]);
+            r.sort_by(|a, b| a[0].cmp(&b[0]));
+        }
+        r
+    };
+    if rows.is_empty() {
+        println!("(no apps yet — `latrix launch` then `latrix deploy`)");
+        return Ok(());
+    }
     print_table(&["NAME", "RELEASE", "COUNT", "CPU / MEM", "IMAGE"], rows);
     Ok(())
 }
@@ -1113,7 +1231,17 @@ fn print_releases(v: &AppView) {
 
 async fn ps(cfg: &CliConfig, cl: Option<&str>, app: &str) -> Result<()> {
     let (_, _, c) = connect(cfg, cl).await?;
-    let v: AppView = c.get(&format!("/v1/apps/{app}")).await?;
+    let v: AppView = match c.get(&format!("/v1/apps/{app}")).await {
+        Ok(v) => v,
+        Err(e) => {
+            if let Ok(fx) = c.get::<RexctlStatusView>("/v1/rexctl").await {
+                if fx.installed && (app == fx.project || app == "fluxer") {
+                    return rexctl::status(cfg, cl).await;
+                }
+            }
+            return Err(e);
+        }
+    };
     println!(
         "{} · v{} ({}) · {}{} instance(s) · {} CPU · {}",
         v.name,
@@ -1591,4 +1719,94 @@ async fn dashboard(cfg: &CliConfig, cl: Option<&str>, port: u16, no_open: bool) 
         }
     }
     Err(last.unwrap_or_else(|| anyhow!("no machines"))).context("could not open a tunnel to any machine")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn mk_app(name: &str, group: Option<&str>, cpu: f64, mem: &str, healthy: bool, url: Option<&str>) -> AppView {
+        AppView {
+            name: name.into(),
+            group: group.map(String::from),
+            current: 1,
+            release_status: Some(crate::state::ReleaseStatus::Active),
+            image: "img:1".into(),
+            count: 1,
+            min: 1,
+            max: 1,
+            autoscale: false,
+            stateful: false,
+            cpu,
+            memory: mem.into(),
+            urls: url.map(|u| vec![u.into()]).unwrap_or_default(),
+            internal: vec![],
+            instances: vec![InstanceView {
+                instance: crate::state::Instance {
+                    id: "i1".into(),
+                    app: name.into(),
+                    release: 1,
+                    machine: 1,
+                    created_at: 1,
+                    stopping: false,
+                    stopping_since: 0,
+                    replaces: None,
+                },
+                machine_name: "m1".into(),
+                report: Some(crate::state::InstanceReport {
+                    id: "i1".into(),
+                    status: "running".into(),
+                    healthy,
+                    ..Default::default()
+                }),
+            }],
+            releases: vec![],
+            volumes: vec![],
+            secret_names: vec![],
+            config: None,
+            dns_records: vec![],
+        }
+    }
+
+    #[test]
+    fn fluxer_services_collapse_into_one_entry() {
+        let st = StatusView {
+            cluster: "c".into(),
+            version: 1,
+            leader: Some(1),
+            dev: false,
+            settings: Default::default(),
+            machines: vec![],
+            apps: vec![
+                mk_app("blog", None, 0.5, "256MB", true, Some("https://blog.example.com")),
+                mk_app("fluxer-api", Some("fluxer"), 0.5, "1536MB", true, None),
+                mk_app("fluxer-edge", Some("fluxer"), 0.25, "384MB", true, Some("https://chat.example.com")),
+                mk_app("fluxer-postgres", Some("fluxer"), 1.0, "2GB", false, None),
+            ],
+            certs: vec![],
+            events: vec![],
+            monthly_cost: 0.0,
+            autopilot: None,
+            certs_pending: vec![],
+            dns: None,
+            fluxer: Some(FluxerSummary {
+                project: "fluxer".into(),
+                domain: "chat.example.com".into(),
+                release: "2026.1124.80040".into(),
+                auto_upgrade: true,
+                services: vec!["api".into(), "edge".into(), "postgres".into()],
+            }),
+        };
+        let (regular, fluxer, fx) = partition_fluxer_apps(&st);
+        assert_eq!(regular.len(), 1);
+        assert_eq!(regular[0].name, "blog");
+        assert_eq!(fluxer.len(), 3);
+        let (h, total, state, cpu, mem_mb, url) = fluxer_rollup(fx.unwrap(), &fluxer);
+        assert_eq!((h, total), (2, 3));
+        assert_eq!(state, "degraded");
+        assert!((cpu - 1.75).abs() < 0.001);
+        assert_eq!(mem_mb, 1536 + 384 + 2048);
+        assert_eq!(url, "https://chat.example.com");
+        assert_eq!(format_mem_mb(mem_mb), "3.9GB");
+    }
 }

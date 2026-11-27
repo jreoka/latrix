@@ -130,7 +130,11 @@ function render(st) {
     </div>`;
   }).join("") || '<div class="empty">No machines.</div>';
 
-  const rows = st.apps.map((a) => {
+  const fx = st.fluxer || null;
+  const regularApps = fx ? st.apps.filter((a) => a.group !== fx.project) : st.apps;
+  const fluxerApps = fx ? st.apps.filter((a) => a.group === fx.project) : [];
+
+  const appRows = regularApps.map((a) => {
     const live = a.instances.filter((i) => !i.instance.stopping);
     const healthy = live.filter((i) => i.report && i.report.healthy).length;
     const dots = live.map((i) => {
@@ -142,14 +146,53 @@ function render(st) {
     const rc = rs === "active" ? "ok" : rs === "failed" ? "bad" : "warn";
     const urls = a.urls.map((u) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u.replace(/^https?:\/\//, ""))}</a>`).join("<br>");
     const machines = [...new Set(live.map((i) => i.machine_name))].join(", ");
-    return `<tr>
-      <td><b>${esc(a.name)}</b>${a.group ? `<div class="sub">${esc(a.group)}</div>` : ""}</td>
-      <td>v${a.current} <span class="badge ${rc}">${esc(rs)}</span></td>
-      <td><div class="dots">${dots}</div><div class="sub">${healthy}/${a.count} healthy${a.autoscale ? ` · autoscale ${a.min}–${a.max}` : ""}</div></td>
-      <td class="sub">${a.cpu} cpu · ${esc(a.memory)}${a.stateful ? " · volume" : ""}<br>${esc(machines)}</td>
-      <td>${urls || `<code>${esc(a.internal[0] || "")}</code>`}</td>
-    </tr>`;
-  }).join("");
+    return {
+      name: a.name,
+      html: `<tr>
+        <td><b>${esc(a.name)}</b>${a.group ? `<div class="sub">${esc(a.group)}</div>` : ""}</td>
+        <td>v${a.current} <span class="badge ${rc}">${esc(rs)}</span></td>
+        <td><div class="dots">${dots}</div><div class="sub">${healthy}/${a.count} healthy${a.autoscale ? ` · autoscale ${a.min}–${a.max}` : ""}</div></td>
+        <td class="sub">${a.cpu} cpu · ${esc(a.memory)}${a.stateful ? " · volume" : ""}<br>${esc(machines)}</td>
+        <td>${urls || `<code>${esc(a.internal[0] || "")}</code>`}</td>
+      </tr>`
+    };
+  });
+
+  if (fx && fluxerApps.length) {
+    let healthySvcs = 0, deploying = false, failed = false, cpuSum = 0, memMb = 0;
+    const machineSet = new Set();
+    const dots = fluxerApps.map((a) => {
+      const live = a.instances.filter((i) => !i.instance.stopping);
+      const h = live.filter((i) => i.report && i.report.healthy).length;
+      const ok = a.count > 0 && h >= a.count;
+      if (ok) healthySvcs++;
+      if (a.release_status === "deploying") deploying = true;
+      if (a.release_status === "failed") failed = true;
+      cpuSum += (a.cpu || 0) * Math.max(a.count || 1, 1);
+      const m = String(a.memory || "").trim().toUpperCase();
+      const num = parseFloat(m) || 0;
+      memMb += m.endsWith("GB") || m.endsWith("G") ? num * 1024 : num;
+      live.forEach((i) => machineSet.add(i.machine_name));
+      const c = ok ? "ok" : a.release_status === "failed" ? "bad" : "warn";
+      return `<span class="dot ${c}" title="${esc(a.name)} · ${h}/${a.count} healthy"></span>`;
+    }).join("");
+    const rs = failed ? "failed" : deploying ? "deploying" : healthySvcs === fluxerApps.length ? "active" : "degraded";
+    const rc = rs === "active" ? "ok" : rs === "failed" ? "bad" : "warn";
+    const memStr = memMb >= 1024 ? `${(memMb / 1024).toFixed(1)}GB` : `${Math.round(memMb)}MB`;
+    const url = (fluxerApps.find((a) => a.urls && a.urls.length)?.urls[0]) || `https://${fx.domain}`;
+    appRows.push({
+      name: fx.project,
+      html: `<tr>
+        <td><b>${esc(fx.project)}</b><div class="sub">${fluxerApps.length} services · rexctl${fx.auto_upgrade ? " · auto-upgrade" : ""}</div></td>
+        <td>${esc(fx.release || "fluxer")} <span class="badge ${rc}">${esc(rs)}</span></td>
+        <td><div class="dots">${dots}</div><div class="sub">${healthySvcs}/${fluxerApps.length} services healthy</div></td>
+        <td class="sub">${cpuSum.toFixed(1)} cpu · ${memStr}<br>${esc([...machineSet].join(", "))}</td>
+        <td><a href="${esc(url)}" target="_blank" rel="noopener">${esc(url.replace(/^https?:\/\//, ""))}</a></td>
+      </tr>`
+    });
+  }
+  appRows.sort((a, b) => a.name.localeCompare(b.name));
+  const rows = appRows.map((r) => r.html).join("");
   $("apps").innerHTML = `<tr><th>App</th><th>Release</th><th>Instances</th><th>Resources</th><th>Address</th></tr>` +
     (rows || `<tr><td colspan="5" class="empty">No apps yet — run <code>latrix launch</code> and <code>latrix deploy</code>.</td></tr>`);
 

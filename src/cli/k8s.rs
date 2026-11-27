@@ -803,9 +803,9 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
             deploy(&t, &app, &base, args.message).await
         }
         Cmd::Status => status(name, &t).await,
-        Cmd::Apps { action: None | Some(AppsCmd::List) } => status(name, &t).await,
-        Cmd::Apps { action: Some(AppsCmd::Show { app }) } => ps(&k, &app).await,
-        Cmd::Apps { action: Some(AppsCmd::Destroy(a)) } => destroy(&k, &t, a).await,
+        Cmd::Apps { action: None | Some(AppsCmd::List { .. }), .. } => status(name, &t).await,
+        Cmd::Apps { action: Some(AppsCmd::Show { app }), .. } => ps(&k, &app).await,
+        Cmd::Apps { action: Some(AppsCmd::Destroy(a)), .. } => destroy(&k, &t, a).await,
         Cmd::Ps { app } => ps(&k, &app).await,
         Cmd::Releases { app } => {
             print_history(&load_history(&k, &app).await?);

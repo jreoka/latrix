@@ -429,6 +429,13 @@ async fn status(State(agent): AgentState) -> ApiResult<StatusView> {
         autopilot: Some(agent.autopilot.status.lock().unwrap().clone()),
         certs_pending,
         dns: Some(super::cloudflare::summary(&agent)),
+        fluxer: s.fluxer.as_ref().map(|fx| FluxerSummary {
+            project: fx.project.clone(),
+            domain: fx.domain.clone(),
+            release: fx.release.clone(),
+            auto_upgrade: fx.auto_upgrade,
+            services: fx.services.clone(),
+        }),
     }))
 }
 

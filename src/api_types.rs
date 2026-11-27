@@ -219,6 +219,17 @@ pub struct StatusView {
     pub certs_pending: Vec<PendingCert>,
     #[serde(default)]
     pub dns: Option<DnsSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fluxer: Option<FluxerSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct FluxerSummary {
+    pub project: String,
+    pub domain: String,
+    pub release: String,
+    pub auto_upgrade: bool,
+    pub services: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

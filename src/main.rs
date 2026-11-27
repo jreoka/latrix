@@ -30,7 +30,7 @@ async fn main() {
         )
         .with_target(false)
         .init();
-    if let Err(e) = cli::commands::run(cli).await {
+    if let Err(e) = Box::pin(cli::commands::run(cli)).await {
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }

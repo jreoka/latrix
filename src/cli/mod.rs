@@ -78,6 +78,9 @@ pub enum Cmd {
     /// List apps (also: apps list, apps show <app>, apps destroy <app>)
     #[command(visible_alias = "app")]
     Apps {
+        /// Show individual services of managed stacks (e.g. Fluxer)
+        #[arg(short, long)]
+        all: bool,
         #[command(subcommand)]
         action: Option<AppsCmd>,
     },
@@ -287,7 +290,11 @@ pub struct DestroyArgs {
 pub enum AppsCmd {
     /// List apps
     #[command(alias = "ls")]
-    List,
+    List {
+        /// Show individual services of managed stacks (e.g. Fluxer)
+        #[arg(short, long)]
+        all: bool,
+    },
     /// Show an app's instances, URLs, volumes and releases
     #[command(alias = "ps", alias = "info")]
     Show { app: String },
