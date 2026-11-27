@@ -29,17 +29,19 @@ async fn connect(cfg: &CliConfig, cluster: Option<&str>) -> Result<(String, Clus
 
 /// The autopilot adds and removes servers on its own; keep the local list of
 /// machines (used to reach the cluster over SSH) in step with the cluster.
-async fn sync_machines(cluster: &str, c: &Client) -> Result<()> {
+/// Returns the names of machines forgotten because the cluster no longer has them.
+pub async fn sync_machines(cluster: &str, c: &Client) -> Result<Vec<String>> {
     let st: StatusView = c.get("/v1/status").await?;
     let mut cfg = CliConfig::load()?;
-    let Some(p) = cfg.clusters.get_mut(cluster) else { return Ok(()) };
-    let before = p.machines.len();
+    let Some(p) = cfg.clusters.get_mut(cluster) else { return Ok(vec![]) };
     let names: Vec<String> = st.machines.iter().map(|m| m.machine.name.clone()).collect();
     let mut changed = false;
+    let mut forgotten = vec![];
     // Only forget machines the cluster removed when we still know some others.
     if names.iter().any(|n| p.machines.iter().any(|m| &m.name == n)) {
+        forgotten = p.machines.iter().filter(|m| !names.contains(&m.name)).map(|m| m.name.clone()).collect();
         p.machines.retain(|m| names.contains(&m.name));
-        changed |= p.machines.len() != before;
+        changed |= !forgotten.is_empty();
     }
     for m in &st.machines {
         if m.machine.provider.is_some() && !p.machines.iter().any(|x| x.name == m.machine.name) {
@@ -55,7 +57,7 @@ async fn sync_machines(cluster: &str, c: &Client) -> Result<()> {
     if changed {
         cfg.save()?;
     }
-    Ok(())
+    Ok(forgotten)
 }
 
 pub struct CreateOptions {

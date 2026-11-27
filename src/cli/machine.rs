@@ -457,37 +457,71 @@ pub fn find_ssh(cfg: &CliConfig, cluster: Option<&str>, name: &str) -> Result<Ss
 /// Upload this latrix build to every machine (one at a time) and restart agents.
 /// Containers keep running while agents restart.
 pub async fn upgrade_agents(cfg: &CliConfig, cluster: Option<&str>, only: Option<&str>, binary: Option<&Path>) -> Result<()> {
-    let (_, profile) = cfg.profile(cluster)?;
+    let (cname, profile) = cfg.profile(cluster)?;
     if profile.local {
         bail!("the local cluster runs this binary directly; just restart `latrix dev`");
     }
-    for m in profile.machines.iter().filter(|m| only.map(|o| o == m.name).unwrap_or(true)) {
-        println!("==> {}", m.name);
+    // Work from the cluster's own list of machines, not just the local one.
+    let c = Client::connect(&profile).await?;
+    for name in super::commands::sync_machines(&cname, &c).await.unwrap_or_default() {
+        println!("(forgot {name}: it is no longer part of the cluster)");
+    }
+    let st: StatusView = c.get("/v1/status").await?;
+    drop(c);
+    let profile = CliConfig::load()?.clusters.get(&cname).cloned().unwrap_or(profile);
+    let mut problems = vec![];
+    for mv in st.machines.iter().filter(|m| only.map(|o| o == m.machine.name).unwrap_or(true)) {
+        let name = &mv.machine.name;
+        println!("==> {name}");
+        if !mv.alive {
+            println!("    skipped: the cluster can't reach it either (is it down? try `latrix doctor {name}`)");
+            problems.push(name.clone());
+            continue;
+        }
+        if mv.agent_version == util::VERSION {
+            println!("    already runs latrix {}", util::VERSION);
+            continue;
+        }
+        let Some(m) = profile.machines.iter().find(|m| &m.name == name) else {
+            println!("    skipped: no SSH details for it on this computer");
+            problems.push(name.clone());
+            continue;
+        };
         let ssh = Ssh::new(&m.ssh, m.port, m.key.clone());
-        install_binary(&ssh, binary).await?;
-        ssh.run("systemctl restart latrix").await?;
-        let start = Instant::now();
-        loop {
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            let ok = async {
-                let c = Client::connect(&profile).await?;
-                let st: StatusView = c.get("/v1/status").await?;
-                Ok::<bool, anyhow::Error>(
-                    st.machines
-                        .iter()
-                        .any(|x| x.machine.name == m.name && x.alive && x.agent_version == util::VERSION),
-                )
-            }
-            .await
-            .unwrap_or(false);
-            if ok {
-                println!("    {} runs latrix {}", m.name, util::VERSION);
-                break;
-            }
-            if start.elapsed() > Duration::from_secs(90) {
-                bail!("{} did not come back after the upgrade", m.name);
+        let res: Result<()> = async {
+            install_binary(&ssh, binary).await?;
+            ssh.run("systemctl restart latrix").await?;
+            let start = Instant::now();
+            loop {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                let ok = async {
+                    let c = Client::connect(&profile).await?;
+                    let st: StatusView = c.get("/v1/status").await?;
+                    Ok::<bool, anyhow::Error>(
+                        st.machines.iter().any(|x| &x.machine.name == name && x.alive && x.agent_version == util::VERSION),
+                    )
+                }
+                .await
+                .unwrap_or(false);
+                if ok {
+                    return Ok(());
+                }
+                if start.elapsed() > Duration::from_secs(90) {
+                    bail!("it did not come back after the upgrade (see `latrix doctor {name}`)");
+                }
             }
         }
+        .await;
+        match res {
+            Ok(()) => println!("    {name} runs latrix {}", util::VERSION),
+            Err(e) => {
+                println!("    failed: {e:#}");
+                problems.push(name.clone());
+            }
+        }
+    }
+    if !problems.is_empty() {
+        bail!("not upgraded: {}", problems.join(", "));
     }
     Ok(())
 }
