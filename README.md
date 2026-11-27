@@ -288,6 +288,41 @@ Besides deploys, failover, OS updates and the autopilot, every cluster:
   and warnings (machine down, failed deploy, disk full, certificate problems)
   are posted there, at most once an hour each.
 
+## If you lose your computer
+
+Nothing important lives on your computer: apps, secrets, volumes, settings
+and the autopilot's provider token are all on the cluster. What your
+computer has is a list of the machines and the **SSH key** that logs in to
+them. With a key that still works, on any computer:
+
+```bash
+latrix cluster connect root@<any server ip> [-i ~/.ssh/key]
+```
+
+That reads the cluster's identity from the server, finds every machine and
+sets this computer up again. If the autopilot was off, also run
+`latrix provider set hetzner <token>` again for `latrix machine create`.
+
+**The SSH key is the one thing to keep safe.** Add a second one now (another
+computer, or a key you keep in a password manager), and every machine
+accepts it, including servers bought later:
+
+```bash
+latrix keys add ~/backup-key.pub
+latrix keys                 # list
+latrix keys rm backup-key   # remove one from every machine
+```
+
+If no key works any more, use your provider's web console (Hetzner: the
+server's *Console* or *Rescue* tab) to add a public key to
+`/root/.ssh/authorized_keys` on one server, then run `latrix cluster connect`
+and `latrix keys add` for the new key. Without an SSH key of your own, latrix
+uses `id_ed25519` next to its config file (`~/.config/latrix`, or
+`%APPDATA%\latrix` on Windows); back that file up.
+
+Backups made with `latrix backup` are files on your computer, so keep a copy
+somewhere else too.
+
 ## Moving from Fly.io
 
 ```bash
@@ -380,6 +415,8 @@ latrix --cluster prod status
 | `latrix upgrade` | roll this CLI's latrix version out to every machine (apps keep running) |
 | `latrix volumes snapshots\|snapshot\|rollback <app>` | daily volume snapshots |
 | `latrix cluster list\|use\|forget` | switch between clusters |
+| `latrix cluster connect root@<ip>` | set up this computer for an existing cluster (new or reinstalled computer) |
+| `latrix keys [add\|rm]` | SSH keys every machine accepts (add a backup key) |
 | `latrix k8s add\|export\|setup-tls` | use a Kubernetes cluster as a target |
 
 Every command has `--help`. Common spellings work too: `apps list`,

@@ -284,6 +284,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Launch { name, image, port, force } => return deploy::launch(name, image, port, force),
         Cmd::Dev { data } => return dev(data).await,
         Cmd::Compose(ComposeCmd::Convert { file, write }) => return compose_convert(&file, write),
+        Cmd::Cluster(ClusterCmd::Connect { target, port, key }) => return cluster_connect(&target, port, key).await,
         Cmd::Cluster(c) => return cluster_cmd(c),
         Cmd::Provider(p) => return provider_cmd(p).await,
         Cmd::K8s(k) => return k8s::k8s_cmd(cl, k).await,
@@ -414,6 +415,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Keys { action } => keys_cmd(&cfg, cl, action.unwrap_or(KeysCmd::List)).await,
         Cmd::Settings { pairs } => {
             let (_, _, c) = connect(&cfg, cl).await?;
             let s: crate::state::Settings = if pairs.is_empty() {
@@ -593,7 +595,128 @@ fn cluster_cmd(c: ClusterCmd) -> Result<()> {
             cfg.save()?;
             println!("forgot cluster '{name}' (machines untouched)");
         }
+        ClusterCmd::Connect { .. } => unreachable!(),
     }
+    Ok(())
+}
+
+/// Rebuild the local profile of a cluster from one of its machines.
+async fn cluster_connect(target: &str, port: u16, key: Option<String>) -> Result<()> {
+    let ssh = super::ssh::Ssh::new(target, port, key.clone());
+    println!("==> reading the cluster identity from {}", ssh.host());
+    let raw = ssh
+        .run(&ssh.root_cmd("cat /var/lib/latrix/node.json"))
+        .await
+        .with_context(|| format!("could not read latrix's identity on {target} (is it a latrix machine, and does this key log in?)"))?;
+    let id: crate::agent::NodeIdentity =
+        serde_json::from_str(raw.trim()).context("unexpected content in /var/lib/latrix/node.json")?;
+    let host = ssh.host().to_string();
+    let user = target.split_once('@').map(|(u, _)| u).unwrap_or("root").to_string();
+    let first = super::profile::MachineSsh { name: host.clone(), ssh: target.to_string(), port, key: key.clone() };
+    let mut profile = ClusterProfile {
+        token: id.token.clone(),
+        machines: vec![first],
+        default_key: key.clone(),
+        ..Default::default()
+    };
+    let c = Client::connect(&profile).await?;
+    let st: StatusView = c.get("/v1/status").await?;
+    // Every machine, reached the same way (the one we came through first).
+    let mut machines = vec![];
+    for m in &st.machines {
+        let this = m.machine.public_ip == host || m.machine.name == host;
+        machines.push(super::profile::MachineSsh {
+            name: m.machine.name.clone(),
+            ssh: if this { target.to_string() } else { format!("{user}@{}", m.machine.public_ip) },
+            port: if this { port } else { 22 },
+            key: key.clone(),
+        });
+    }
+    machines.sort_by_key(|m| m.ssh != target);
+    profile.machines = machines;
+    let mut cfg = CliConfig::load()?;
+    if let Some(old) = cfg.clusters.get(&id.cluster) {
+        if old.token != id.token {
+            println!("    note: replacing a different cluster that was also called '{}'", id.cluster);
+        }
+    }
+    let n = profile.machines.len();
+    cfg.clusters.insert(id.cluster.clone(), profile);
+    cfg.current = Some(id.cluster.clone());
+    cfg.save()?;
+    println!("\n✓ connected to cluster '{}' ({n} machine{}, {} app{})", id.cluster, if n == 1 { "" } else { "s" }, st.apps.len(), if st.apps.len() == 1 { "" } else { "s" });
+    for m in &st.machines {
+        println!("    {}  {}", m.machine.name, m.machine.public_ip);
+    }
+    if !st.settings.autopilot {
+        println!("\n  `latrix machine create` needs your provider token on this computer again:\n    latrix provider set hetzner <token>");
+    }
+    println!("\n  Everything else (apps, secrets, volumes, autopilot) lives on the cluster and is unchanged.");
+    println!("  Tip: add a backup key so losing this computer's key can't lock you out:\n    latrix keys add <other-key.pub>");
+    Ok(())
+}
+
+async fn keys_cmd(cfg: &CliConfig, cl: Option<&str>, action: KeysCmd) -> Result<()> {
+    use crate::agent::keys::{key_id, short};
+    use crate::api_types::{SshKeysRequest, SshKeysView};
+    let (_, p, c) = connect(cfg, cl).await?;
+    let read_key = |k: &str| -> Result<String> {
+        let path = std::path::Path::new(k);
+        if path.exists() {
+            let text = std::fs::read_to_string(path)?;
+            if text.contains("PRIVATE KEY") {
+                bail!("{k} is a private key; pass the .pub file");
+            }
+            Ok(text.trim().to_string())
+        } else {
+            Ok(k.trim().to_string())
+        }
+    };
+    let v: SshKeysView = match action {
+        KeysCmd::List => c.get("/v1/ssh-keys").await?,
+        KeysCmd::Add { key } => {
+            let k = match key {
+                Some(k) => read_key(&k)?,
+                None => providers::ssh_key(p.default_key.as_deref())?.0,
+            };
+            let v: SshKeysView = c.post("/v1/ssh-keys", &SshKeysRequest { add: vec![k.clone()], remove: vec![] }).await?;
+            println!("✓ {} can now log in to every machine (new ones too)\n", short(&k));
+            v
+        }
+        KeysCmd::Remove { key } => {
+            let current: SshKeysView = c.get("/v1/ssh-keys").await?;
+            let k = read_key(&key)?;
+            let found: Vec<String> = if key_id(&k).is_some() {
+                vec![k]
+            } else {
+                // By comment or the end of the key.
+                current
+                    .keys
+                    .iter()
+                    .filter(|x| x.split_whitespace().skip(2).collect::<Vec<_>>().join(" ") == key || x.split_whitespace().nth(1).map(|b| b.ends_with(&key)).unwrap_or(false))
+                    .cloned()
+                    .collect()
+            };
+            match found.len() {
+                0 => bail!("no key matches '{key}' (see `latrix keys`)"),
+                1 => {}
+                _ => bail!("'{key}' matches {} keys; pass the whole key or its .pub file", found.len()),
+            }
+            if let Ok((mine, _)) = providers::ssh_key(p.default_key.as_deref()) {
+                if key_id(&mine) == key_id(&found[0]) {
+                    println!("    note: that's the key this computer uses; make sure another key works first");
+                }
+            }
+            let v: SshKeysView = c.post("/v1/ssh-keys", &SshKeysRequest { add: vec![], remove: found.clone() }).await?;
+            println!("✓ removed {} from every machine\n", short(&found[0]));
+            v
+        }
+    };
+    println!("Keys that can log in to every machine:");
+    for k in &v.keys {
+        println!("  {}", short(k));
+    }
+    println!("  {}  (the cluster's own key, for servers it sets up)", short(&v.cluster_key));
     Ok(())
 }
 

@@ -213,9 +213,15 @@ pub enum Cmd {
     /// Docker Compose helpers
     #[command(subcommand)]
     Compose(ComposeCmd),
-    /// Switch between clusters
+    /// Switch between clusters, or reconnect to one (`cluster connect root@<ip>`)
     #[command(subcommand)]
     Cluster(ClusterCmd),
+    /// SSH keys that can manage the cluster (add a backup key!)
+    #[command(alias = "key")]
+    Keys {
+        #[command(subcommand)]
+        action: Option<KeysCmd>,
+    },
     /// Use a Kubernetes cluster as a deploy target
     #[command(subcommand)]
     K8s(K8sCmd),
@@ -551,6 +557,36 @@ pub enum ClusterCmd {
     Use { name: String },
     /// Forget a cluster locally (does not touch the machines)
     Forget { name: String },
+    /// Reconnect to an existing cluster through any of its machines (new
+    /// computer, lost config): latrix cluster connect root@<ip>
+    Connect {
+        /// user@host of any machine in the cluster
+        target: String,
+        /// SSH port
+        #[arg(short, long, default_value_t = 22)]
+        port: u16,
+        /// SSH private key
+        #[arg(short = 'i', long)]
+        key: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum KeysCmd {
+    /// SSH keys every machine accepts
+    #[command(alias = "ls")]
+    List,
+    /// Let a key log in to every machine (default: this computer's key)
+    Add {
+        /// Public key, or a .pub file
+        key: Option<String>,
+    },
+    /// Remove a key from every machine
+    #[command(alias = "rm")]
+    Remove {
+        /// Public key, a .pub file, or the key's comment (e.g. me@laptop)
+        key: String,
+    },
 }
 
 #[derive(Subcommand)]

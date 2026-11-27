@@ -43,6 +43,9 @@ pub struct ClusterState {
     /// (yours, so `latrix` on your computer can reach them).
     #[serde(default)]
     pub ssh_keys: Vec<String>,
+    /// Keys removed with `latrix keys remove`: deleted from every machine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub revoked_ssh_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Copy)]

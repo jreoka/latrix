@@ -77,6 +77,7 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/v1/apps/{app}/export", get(export_app))
         .route("/v1/settings", get(get_settings).post(set_settings))
         .route("/v1/autopilot", get(get_autopilot).post(set_autopilot))
+        .route("/v1/ssh-keys", get(get_ssh_keys).post(set_ssh_keys))
         .route("/v1/upgrade-now", post(super::selfupdate::handle_now))
         .route("/v1/machines/provision", post(provision_machine))
         .route_layer(middleware::from_fn_with_state(agent.clone(), leader_forward));
@@ -1122,4 +1123,41 @@ async fn export_app(State(agent): AgentState, Path(app): Path<String>) -> ApiRes
         count: a.count,
         volumes: s.volumes_of(&app).cloned().collect(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// ssh keys
+
+async fn get_ssh_keys(State(agent): AgentState) -> ApiResult<SshKeysView> {
+    let (_, cluster_key) = super::autopilot::leader_key(&agent).await?;
+    Ok(Json(SshKeysView { keys: agent.snapshot().ssh_keys.clone(), cluster_key }))
+}
+
+async fn set_ssh_keys(State(agent): AgentState, Json(req): Json<SshKeysRequest>) -> ApiResult<SshKeysView> {
+    use super::keys::{key_id, validate};
+    let (_, cluster_key) = super::autopilot::leader_key(&agent).await?;
+    let add: Vec<String> = req.add.iter().map(|k| validate(k)).collect::<anyhow::Result<_>>()?;
+    let remove: Vec<String> = req.remove.iter().filter_map(|k| key_id(k)).collect();
+    if remove.iter().any(|r| key_id(&cluster_key).as_ref() == Some(r)) {
+        return Err(anyhow!("that is the cluster's own key; it can't be removed").into());
+    }
+    let keys = agent
+        .mutate(move |s| {
+            for k in &add {
+                let id = key_id(k);
+                s.revoked_ssh_keys.retain(|r| key_id(r) != id);
+                if !s.ssh_keys.iter().any(|x| key_id(x) == id) {
+                    s.ssh_keys.push(k.clone());
+                }
+            }
+            for id in &remove {
+                s.ssh_keys.retain(|x| key_id(x).as_ref() != Some(id));
+                if !s.revoked_ssh_keys.iter().any(|r| key_id(r).as_ref() == Some(id)) {
+                    s.revoked_ssh_keys.push(id.clone());
+                }
+            }
+            Ok(s.ssh_keys.clone())
+        })
+        .await?;
+    Ok(Json(SshKeysView { keys, cluster_key }))
 }

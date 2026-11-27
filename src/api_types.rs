@@ -244,6 +244,22 @@ pub struct AutopilotView {
     pub status: crate::agent::autopilot::Status,
 }
 
+/// `latrix keys`: SSH keys every machine accepts.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SshKeysRequest {
+    #[serde(default)]
+    pub add: Vec<String>,
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SshKeysView {
+    pub keys: Vec<String>,
+    /// The cluster's own key (used to set up servers); always accepted.
+    pub cluster_key: String,
+}
+
 /// Ask the leader to set up a server over SSH (it must accept the leader's key).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProvisionRequest {

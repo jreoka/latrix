@@ -11,6 +11,7 @@ pub mod autopilot;
 pub mod api;
 pub mod builder;
 pub mod dns;
+pub mod keys;
 pub mod maintenance;
 pub mod mesh;
 pub mod metrics;
@@ -336,6 +337,7 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
     tokio::spawn(acme::run(agent.clone()));
     tokio::spawn(alerts::run(agent.clone()));
     tokio::spawn(selfupdate::run(agent.clone()));
+    tokio::spawn(keys::run(agent.clone()));
     if !dev {
         tokio::spawn(mesh::sync_loop(agent.clone()));
         tokio::spawn(dns::run(agent.clone()));
