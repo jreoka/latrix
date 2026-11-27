@@ -187,13 +187,14 @@ pub fn convert(path: &Path) -> Result<Vec<Converted>> {
                     port: *container,
                     public: published.is_some(),
                     public_port: published.filter(|p| p != container),
+                    protocol: "tcp".into(),
                 });
             }
         }
         for e in str_list(&svc["expose"]) {
             if let Ok(p) = e.split('/').next().unwrap_or("").parse::<u16>() {
                 if !cfg.container_ports().contains(&p) {
-                    cfg.ports.push(PortConfig { port: p, public: false, public_port: None });
+                    cfg.ports.push(PortConfig { port: p, public: false, public_port: None, protocol: "tcp".into() });
                 }
             }
         }

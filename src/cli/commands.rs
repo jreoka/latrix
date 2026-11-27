@@ -287,8 +287,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Cluster(c) => return cluster_cmd(c),
         Cmd::Provider(p) => return provider_cmd(p).await,
         Cmd::K8s(k) => return k8s::k8s_cmd(cl, k).await,
+        Cmd::SelfUpdate => return update::self_update(&CliConfig::load()?, cl).await,
         _ => {}
     }
+    update::notice().await;
     let mut cfg = CliConfig::load()?;
     if let Ok((name, p)) = cfg.profile(cl) {
         if let Some(t) = p.kubernetes {
@@ -343,6 +345,11 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Volumes { action } => match action {
             None | Some(VolumesCmd::List) => volumes(&cfg, cl).await,
             Some(VolumesCmd::Prune { yes }) => prune_volumes(&cfg, cl, yes).await,
+            Some(VolumesCmd::Snapshots { app }) => snapshots_list(&cfg, cl, &app).await,
+            Some(VolumesCmd::Snapshot { app }) => snapshot_now(&cfg, cl, &app).await,
+            Some(VolumesCmd::Rollback { app, snapshot, volume, yes }) => {
+                snapshot_rollback(&cfg, cl, &app, &snapshot, volume.as_deref(), yes).await
+            }
         },
         Cmd::Doctor { machine } => doctor::doctor(&cfg, cl, machine.as_deref()).await,
         Cmd::Backup { apps, all, out, no_image, stop } => backup::backup(&cfg, cl, apps, all, out, no_image, stop).await,
@@ -956,6 +963,103 @@ async fn prune_volumes(cfg: &CliConfig, cl: Option<&str>, yes: bool) -> Result<(
         }
     }
     println!("deleted {total} MB of unused volume data");
+    Ok(())
+}
+
+async fn app_volumes(c: &Client, app: &str) -> Result<Vec<VolumeView>> {
+    let v: AppView = c.get(&format!("/v1/apps/{app}")).await?;
+    if v.volumes.is_empty() {
+        bail!("{app} has no volumes");
+    }
+    Ok(v.volumes)
+}
+
+async fn snapshots_list(cfg: &CliConfig, cl: Option<&str>, app: &str) -> Result<()> {
+    let (_, _, c) = connect(cfg, cl).await?;
+    for v in app_volumes(&c, app).await? {
+        let list: Vec<crate::agent::volumes::SnapshotInfo> = c
+            .get(&format!("/v1/m/{}/snapshots?volume={}", v.volume.primary, v.volume.id))
+            .await
+            .unwrap_or_default();
+        println!("{app}/{} (on {}):", v.volume.name, v.primary_name);
+        if list.is_empty() {
+            println!("  no snapshots yet (one is taken every day; `latrix volumes snapshot {app}` takes one now)");
+        }
+        for s in list.iter().rev() {
+            println!("  {}   +{} MB", s.name, s.size_mb);
+        }
+    }
+    println!("\nroll back with: latrix volumes rollback {app} <snapshot>");
+    Ok(())
+}
+
+async fn snapshot_now(cfg: &CliConfig, cl: Option<&str>, app: &str) -> Result<()> {
+    let (_, _, c) = connect(cfg, cl).await?;
+    for v in app_volumes(&c, app).await? {
+        let r: serde_json::Value = c
+            .post(&format!("/v1/m/{}/snapshots?volume={}&action=take", v.volume.primary, v.volume.id), &serde_json::json!({}))
+            .await?;
+        println!("{app}/{}: snapshot {}", v.volume.name, r["snapshot"].as_str().unwrap_or("?"));
+    }
+    Ok(())
+}
+
+async fn snapshot_rollback(cfg: &CliConfig, cl: Option<&str>, app: &str, snap: &str, only: Option<&str>, yes: bool) -> Result<()> {
+    let (_, _, c) = connect(cfg, cl).await?;
+    let vols: Vec<VolumeView> = app_volumes(&c, app)
+        .await?
+        .into_iter()
+        .filter(|v| only.map(|o| o == v.volume.name).unwrap_or(true))
+        .collect();
+    if vols.is_empty() {
+        bail!("no such volume");
+    }
+    if !yes {
+        print!(
+            "Put {} back to snapshot {snap}? Changes made since then are lost (`latrix volumes snapshot {app}` first keeps them). [y/N] ",
+            vols.iter().map(|v| format!("{app}/{}", v.volume.name)).collect::<Vec<_>>().join(", ")
+        );
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        if !matches!(line.trim(), "y" | "Y" | "yes") {
+            bail!("aborted");
+        }
+    }
+    let v: AppView = c.get(&format!("/v1/apps/{app}")).await?;
+    let count = v.count;
+    println!("==> stopping {app}");
+    let _: AppView = c.post(&format!("/v1/apps/{app}/scale"), &ScaleRequest { count: Some(0), ..Default::default() }).await?;
+    let start = std::time::Instant::now();
+    loop {
+        let v: AppView = c.get(&format!("/v1/apps/{app}")).await?;
+        if v.instances.is_empty() {
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(180) {
+            bail!("{app} did not stop; it was left scaled to 0 — `latrix scale {app} {count}` restarts it");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let mut result = Ok(());
+    for vol in &vols {
+        println!("==> restoring {app}/{} from {snap}", vol.volume.name);
+        let r = c
+            .request(
+                reqwest::Method::POST,
+                &format!("/v1/m/{}/snapshots?volume={}&action=restore&snapshot={snap}", vol.volume.primary, vol.volume.id),
+            )
+            .send()
+            .await?;
+        if !r.status().is_success() {
+            result = Err(anyhow!("{}: {}", vol.volume.name, r.text().await.unwrap_or_default()));
+            break;
+        }
+    }
+    println!("==> starting {app}");
+    let _: AppView = c.post(&format!("/v1/apps/{app}/scale"), &ScaleRequest { count: Some(count), ..Default::default() }).await?;
+    result?;
+    println!("✓ {app} is back on snapshot {snap}");
     Ok(())
 }
 

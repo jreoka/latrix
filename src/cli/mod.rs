@@ -12,6 +12,7 @@ pub mod machine;
 pub mod profile;
 pub mod providers;
 pub mod ssh;
+pub mod update;
 
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
@@ -234,6 +235,8 @@ pub enum Cmd {
     /// Automatic server management: buy, resize and delete servers as needed
     #[command(subcommand)]
     Autopilot(AutopilotCmd),
+    /// Update this latrix to the newest release (your machines follow)
+    SelfUpdate,
     /// Upgrade the latrix agent on every machine to this version
     Upgrade {
         /// Only this machine
@@ -283,6 +286,22 @@ pub enum VolumesCmd {
     /// Delete volume data that no app uses any more
     #[command(alias = "clean")]
     Prune {
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
+    },
+    /// List an app's daily volume snapshots
+    Snapshots { app: String },
+    /// Take a snapshot of an app's volumes now
+    Snapshot { app: String },
+    /// Put an app's volume back to a snapshot (stops the app briefly)
+    Rollback {
+        app: String,
+        /// Snapshot name from `latrix volumes snapshots <app>`
+        snapshot: String,
+        /// Only this volume (default: every volume of the app)
+        #[arg(long)]
+        volume: Option<String>,
         /// Don't ask for confirmation
         #[arg(short, long)]
         yes: bool,

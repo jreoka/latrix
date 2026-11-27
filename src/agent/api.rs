@@ -57,6 +57,8 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/v1/local/logs", get(runtime::handle_logs))
         .route("/v1/local/volume-data", get(super::transfer::get_volume).post(super::transfer::put_volume))
         .route("/v1/local/unused-volumes", get(super::volumes::handle_unused).delete(super::volumes::handle_unused))
+        .route("/v1/local/snapshots", get(super::volumes::handle_snapshots).post(super::volumes::handle_snapshots))
+        .route("/v1/local/self-update", post(super::selfupdate::handle))
         .route("/v1/local/image", get(super::transfer::get_image).post(super::transfer::put_image));
 
     let cluster = Router::new()
@@ -75,6 +77,7 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/v1/apps/{app}/export", get(export_app))
         .route("/v1/settings", get(get_settings).post(set_settings))
         .route("/v1/autopilot", get(get_autopilot).post(set_autopilot))
+        .route("/v1/upgrade-now", post(super::selfupdate::handle_now))
         .route("/v1/machines/provision", post(provision_machine))
         .route_layer(middleware::from_fn_with_state(agent.clone(), leader_forward));
 
@@ -210,6 +213,9 @@ async fn report(State(agent): AgentState, Json(mut r): Json<NodeReport>) -> Json
         let mut ev = agent.events.lock().unwrap();
         for mut e in std::mem::take(&mut r.events) {
             e.message = format!("{name}: {}", e.message);
+            if e.level == "warn" {
+                super::alerts::queue(&agent, &e.message);
+            }
             ev.push_back(e);
         }
         while ev.len() > 200 {
@@ -278,8 +284,21 @@ fn app_view(agent: &Agent, s: &ClusterState, live: &LiveView, app: &App) -> AppV
                 }
             }
         }
-        for p in c.ports.iter().filter(|p| p.public) {
+        for p in c.ports.iter().filter(|p| p.public && p.protocol == "tcp") {
             internal.push(format!("<any machine ip>:{}  (public tcp)", p.public_port.unwrap_or(p.port)));
+        }
+        // UDP is served only by the machines running the app, on their own IPs.
+        let mut hosts: Vec<&str> = s
+            .instances_of(&app.name)
+            .filter(|i| !i.stopping)
+            .filter_map(|i| s.machines.get(&i.machine).map(|m| m.public_ip.as_str()))
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        for (public, _) in c.udp_ports() {
+            for h in &hosts {
+                urls.push(format!("udp://{h}:{public}"));
+            }
         }
     }
     let instances = s
@@ -685,13 +704,18 @@ async fn deploy(
             // Public port conflicts.
             for p in cfg.ports.iter().filter(|p| p.public) {
                 let pp = p.public_port.unwrap_or(p.port);
-                if [80u16, 443, API_PORT, util::REGISTRY_PORT, util::RSYNC_PORT, 22].contains(&pp) {
-                    bail!("public port {pp} is reserved");
+                let reserved: &[u16] = if p.protocol == "udp" {
+                    &[53, util::WG_PORT]
+                } else {
+                    &[80, 443, API_PORT, util::REGISTRY_PORT, util::RSYNC_PORT, 22]
+                };
+                if reserved.contains(&pp) {
+                    bail!("public {} port {pp} is reserved", p.protocol);
                 }
                 for other in s.apps.values().filter(|a| a.name != app) {
                     if let Some(oc) = other.config() {
-                        if oc.ports.iter().any(|o| o.public && o.public_port.unwrap_or(o.port) == pp) {
-                            bail!("public port {pp} is already used by app '{}'", other.name);
+                        if oc.ports.iter().any(|o| o.public && o.protocol == p.protocol && o.public_port.unwrap_or(o.port) == pp) {
+                            bail!("public {} port {pp} is already used by app '{}'", p.protocol, other.name);
                         }
                     }
                 }
@@ -964,9 +988,14 @@ async fn set_settings(
                         "false" | "no" | "off" | "0" => false,
                         _ => bail!("{k} must be true or false"),
                     }),
-                    serde_json::Value::Number(_) => serde_json::json!(val
-                        .parse::<f64>()
-                        .map_err(|_| anyhow!("{k} must be a number"))?),
+                    // Whole numbers stay integers (counts like volume_snapshots).
+                    serde_json::Value::Number(n) => match (n.is_f64(), val.parse::<u64>()) {
+                        (false, Ok(i)) => serde_json::json!(i),
+                        (false, Err(_)) => bail!("{k} must be a whole number"),
+                        (true, _) => serde_json::json!(val
+                            .parse::<f64>()
+                            .map_err(|_| anyhow!("{k} must be a number"))?),
+                    },
                     _ => serde_json::Value::String(val.clone()),
                 };
                 obj.insert(k.clone(), new);
@@ -979,6 +1008,12 @@ async fn set_settings(
             Ok(new)
         })
         .await?;
+    if req.contains_key("alert_webhook") && !settings.alert_webhook.is_empty() {
+        let lines = vec!["alerts are connected: you'll hear about machines going down, failed deploys, certificate problems, full disks and crash loops".to_string()];
+        if let Err(e) = super::alerts::send(&agent, &settings.alert_webhook, &lines).await {
+            return Err(anyhow!("saved, but the test message failed: {e:#}").into());
+        }
+    }
     Ok(Json(settings))
 }
 

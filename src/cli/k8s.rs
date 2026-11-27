@@ -173,7 +173,11 @@ pub fn render(cfg: &AppConfig, image: &str, version: u64, t: &K8sTarget) -> Vec<
         "image": image,
         "env": env,
         "envFrom": [{"secretRef": {"name": format!("{app}-secrets"), "optional": true}}],
-        "ports": ports.iter().map(|p| json!({"containerPort": p, "name": format!("p{p}")})).collect::<Vec<_>>(),
+        "ports": ports
+            .iter()
+            .map(|p| json!({"containerPort": p, "name": format!("p{p}")}))
+            .chain(cfg.udp_ports().iter().map(|(_, p)| json!({"containerPort": p, "name": format!("u{p}"), "protocol": "UDP"})))
+            .collect::<Vec<_>>(),
         "resources": {
             "requests": {"cpu": cpu_quantity(cfg.scale.cpu.max(0.01)), "memory": format!("{}Mi", cfg.scale.memory_mb())},
             "limits": {"memory": format!("{}Mi", cfg.scale.memory_mb())},
@@ -194,7 +198,7 @@ pub fn render(cfg: &AppConfig, image: &str, version: u64, t: &K8sTarget) -> Vec<
             Some(path) => Some(json!({"httpGet": {"path": path, "port": h.port}})),
             None => Some(json!({"tcpSocket": {"port": h.port}})),
         },
-        None => cfg.ports.first().map(|p| json!({"tcpSocket": {"port": p.port}})),
+        None => cfg.ports.iter().find(|p| p.protocol == "tcp").map(|p| json!({"tcpSocket": {"port": p.port}})),
     };
     if let Some(mut p) = probe {
         p["periodSeconds"] = json!(5);
@@ -307,7 +311,15 @@ pub fn render(cfg: &AppConfig, image: &str, version: u64, t: &K8sTarget) -> Vec<
         .ports
         .iter()
         .filter(|p| p.public)
-        .map(|p| json!({"name": format!("p{}", p.port), "port": p.public_port.unwrap_or(p.port), "targetPort": p.port}))
+        .map(|p| {
+            let udp = p.protocol == "udp";
+            json!({
+                "name": format!("{}{}", if udp { "u" } else { "p" }, p.port),
+                "port": p.public_port.unwrap_or(p.port),
+                "targetPort": p.port,
+                "protocol": if udp { "UDP" } else { "TCP" },
+            })
+        })
         .collect();
     if !public.is_empty() {
         docs.push(json!({
@@ -545,7 +557,7 @@ async fn print_urls(k: &Kube, cfg: &AppConfig) {
             let ing = &v["status"]["loadBalancer"]["ingress"][0];
             let addr = ing["ip"].as_str().or(ing["hostname"].as_str()).unwrap_or("<pending>");
             for p in cfg.ports.iter().filter(|p| p.public) {
-                println!("  tcp://{addr}:{}", p.public_port.unwrap_or(p.port));
+                println!("  {}://{addr}:{}", p.protocol, p.public_port.unwrap_or(p.port));
             }
         }
     }

@@ -136,6 +136,8 @@ health = "/healthz"                 # optional; otherwise a TCP check
 port = 9000                         # reachable as shop.internal:9000 from other apps
 public = true                       # ...and on every machine's public IP
 
+regions = ["ash"]                   # only run in these locations (default: anywhere)
+
 [scale]
 min = 2                             # autoscale between min and max on CPU/memory
 max = 6                             # (or `count = 3` for a fixed number)
@@ -153,6 +155,29 @@ sync = "30s"                        # replication interval
 strategy = "rolling"                # or "immediate"
 health_timeout = "90s"              # roll back automatically after this
 ```
+
+### Game servers, UDP and regions
+
+```toml
+app = "gameserver"
+region = "ash"                      # Hetzner Ashburn, Virginia (or ["ash", "hil"])
+
+[[ports]]
+port = 7777
+protocol = "udp"                    # published straight on the machine's IP
+public = true
+```
+
+- **`region`** pins the app to machines in those locations (a machine's
+  region is its provider location, or `--region` on `machine add`). Change
+  it and redeploy: the app moves. Volumes get a copy in the new region
+  first, then move with a final sync. With the autopilot on, latrix buys a
+  server there if there isn't one, and never removes the last one.
+- **UDP ports** skip the proxy: players connect to the IP of the machine
+  running the app (`latrix ps <app>` shows `udp://ip:port`). At most one
+  instance runs per machine, and redeploys restart it on the same machine,
+  so the address stays the same. Point a DNS name at that machine for a
+  stable name. Open the port in your provider's firewall if you use one.
 
 ### Talking between apps
 
@@ -205,6 +230,8 @@ servers by itself once a minute. It compares what your apps ask for
 - **Heals:** a server it bought that stops responding for 15 minutes is
   rebooted through the provider API. If it's still dead 30 minutes later,
   it's replaced.
+- **Follows regions:** when an app is pinned to a region with no machine,
+  it buys the cheapest server there.
 - **Never touches** servers you added with `latrix machine add`, and never
   removes the current leader.
 
@@ -235,6 +262,31 @@ app's config, secrets, image and a snapshot of every volume. Restoring
 recreates the app with its data on this or any other latrix cluster, without
 needing the source code. Backup files contain your secrets, so they're
 written readable only by you; keep them somewhere safe.
+
+## What runs by itself
+
+Besides deploys, failover, OS updates and the autopilot, every cluster:
+
+- **Restarts stuck instances:** one that passed health checks and then fails
+  them for 2 minutes is replaced (the container is running but hung).
+- **Snapshots volumes daily** on the machine that holds them (hard-linked, so
+  unchanged files take no space) and keeps the last 7
+  (`volume_snapshots=7`). `latrix volumes snapshots <app>` lists them;
+  `latrix volumes rollback <app> <snapshot>` puts one back.
+- **Frees disk space** when a disk passes 90%: unused images, build cache
+  and stopped containers go first, and you get a warning.
+- **Cleans up after itself:** data of deleted apps (after
+  `volume_retention_days`), old images and build cache, and certificates no
+  app uses (after 7 days).
+- **Upgrades latrix:** the leader checks for a new release every 6 hours and
+  upgrades the machines one at a time, itself last. Containers keep running.
+  Turn it off with `latrix settings auto_upgrade=false`. The CLI tells you
+  when it's out of date; `latrix self-update` updates it and the cluster
+  right away.
+- **Tells you when something's wrong:** set
+  `latrix settings alert_webhook=<url>` (Discord, Slack or any JSON webhook)
+  and warnings (machine down, failed deploy, disk full, certificate problems)
+  are posted there, at most once an hour each.
 
 ## Moving from Fly.io
 
@@ -324,7 +376,9 @@ latrix --cluster prod status
 | `latrix certs` | certificates, plus domains still waiting for one (with the reason and next retry) |
 | `latrix volumes`, `latrix certs`, `latrix events` | the rest of the state |
 | `latrix settings [key=value ...]` | cluster settings (see below) |
-| `latrix upgrade` | roll a new latrix version out to every machine (apps keep running) |
+| `latrix self-update` | update this CLI and the cluster to the newest release |
+| `latrix upgrade` | roll this CLI's latrix version out to every machine (apps keep running) |
+| `latrix volumes snapshots\|snapshot\|rollback <app>` | daily volume snapshots |
 | `latrix cluster list\|use\|forget` | switch between clusters |
 | `latrix k8s add\|export\|setup-tls` | use a Kubernetes cluster as a target |
 
@@ -341,6 +395,9 @@ latrix settings base_domain=apps.example.com  # every app gets <app>.apps.exampl
 latrix settings monthly_budget=40           # shown next to the cost estimate; warns when over
 latrix settings rebalance=false autoscale=false
 latrix settings volume_retention_days=0      # delete volume data no app uses right away (default: after 3 days)
+latrix settings volume_snapshots=14          # daily snapshots to keep per volume (0 = off)
+latrix settings alert_webhook=https://discord.com/api/webhooks/...  # warnings go here
+latrix settings auto_upgrade=false           # don't upgrade latrix automatically
 ```
 
 ## How it works

@@ -43,6 +43,7 @@ struct Health {
     healthy: bool,
     fails: u32,
     healthy_since: u64,
+    unhealthy_since: u64,
 }
 
 impl Runtime {
@@ -347,11 +348,15 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
                     }
                     h.healthy = true;
                     h.fails = 0;
+                    h.unhealthy_since = 0;
                 }
                 Some(false) => {
                     h.fails += 1;
                     // Need 3 consecutive failures to mark a healthy instance unhealthy.
                     if h.fails >= 3 || !h.healthy {
+                        if h.healthy {
+                            h.unhealthy_since = util::now();
+                        }
                         h.healthy = false;
                     }
                 }
@@ -389,6 +394,7 @@ async fn reconcile_once(agent: &Arc<Agent>) -> Result<()> {
                     mem_mb: mem,
                     error,
                     healthy_since: h.healthy_since,
+                    unhealthy_since: h.unhealthy_since,
                 },
             );
         }
@@ -447,12 +453,13 @@ async fn check_health(cfg: &AppConfig, c: &Ctr, bind: &str) -> bool {
         }
         return tcp_ok(&addr).await;
     }
-    if let Some(p) = cfg.ports.first() {
+    if let Some(p) = cfg.ports.iter().find(|p| p.protocol == "tcp") {
         if let Some(addr) = target(p.port) {
             return tcp_ok(&addr).await;
         }
         return false;
     }
+    // UDP only: running counts as healthy.
     true
 }
 
@@ -639,6 +646,12 @@ async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
             args.push(format!("{ip}:{hp}:{p}"));
         }
     }
+    // UDP (game servers, voice, ...): straight on the machine's own IP, no
+    // proxy hop. The scheduler runs at most one instance per machine.
+    for (public, p) in cfg.udp_ports() {
+        args.push("-p".into());
+        args.push(format!("0.0.0.0:{public}:{p}/udp"));
+    }
     for v in &cfg.volumes {
         let dir = agent.data.join("volumes").join(Volume::dir_name(&inst.app, &v.name));
         let fresh = std::fs::read_dir(&dir).map(|mut d| d.next().is_none()).unwrap_or(true);
@@ -824,6 +837,8 @@ pub async fn registry_loop(agent: Arc<Agent>) {
 pub async fn gc_loop(agent: Arc<Agent>) {
     tokio::time::sleep(Duration::from_secs(120)).await;
     let mut last_full = Instant::now() - Duration::from_secs(7200);
+    let mut last_emergency: Option<Instant> = None;
+    let mut last_disk_warn: Option<Instant> = None;
     let mut known: HashSet<String> = agent.snapshot().apps.keys().cloned().collect();
     loop {
         // Hourly, and soon after an app is destroyed (its images go right away).
@@ -836,8 +851,49 @@ pub async fn gc_loop(agent: Arc<Agent>) {
                 warn!("cache cleanup: {e:#}");
             }
         }
+        // Disk nearly full: clean harder, then shout if that wasn't enough.
+        let used = disk_used_fraction(&agent);
+        if used > 0.90 && last_emergency.map(|t| t.elapsed() > Duration::from_secs(1800)).unwrap_or(true) {
+            last_emergency = Some(Instant::now());
+            let before = used;
+            emergency_cleanup(&agent).await;
+            super::metrics::sample_disk(&agent).await;
+            let after = disk_used_fraction(&agent);
+            agent.event(
+                "info",
+                format!("disk was {:.0}% full: removed all build cache and unused images, now {:.0}%", before * 100.0, after * 100.0),
+            );
+            if after > 0.90 && last_disk_warn.map(|t| t.elapsed() > Duration::from_secs(3600)).unwrap_or(true) {
+                last_disk_warn = Some(Instant::now());
+                agent.event(
+                    "warn",
+                    format!(
+                        "disk is {:.0}% full even after cleaning up; give this machine more disk, or move apps/volumes off it",
+                        after * 100.0
+                    ),
+                );
+            }
+        }
         tokio::time::sleep(Duration::from_secs(60)).await;
     }
+}
+
+fn disk_used_fraction(agent: &Agent) -> f64 {
+    let m = agent.sampler.latest();
+    if m.disk_total_gb > 0.0 {
+        m.disk_used_gb / m.disk_total_gb
+    } else {
+        0.0
+    }
+}
+
+/// Everything that can be rebuilt or re-pulled goes: all build cache, all
+/// images not used by a container, and all but the newest volume snapshot.
+async fn emergency_cleanup(agent: &Agent) {
+    let _ = cmd("docker", &["builder", "prune", "-af"]).await;
+    let _ = cmd("docker", &["image", "prune", "-af"]).await;
+    super::volumes::trim_snapshots(agent, 1);
+    refresh_build_cache_size(agent).await;
 }
 
 pub fn build_cache_budget_gb(agent: &Agent) -> u64 {

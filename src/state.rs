@@ -279,6 +279,15 @@ pub struct Settings {
     /// after this many days. 0 = on the next scan.
     #[serde(default = "three")]
     pub volume_retention_days: f64,
+    /// Machines upgrade themselves to new latrix releases (one at a time).
+    #[serde(default = "yes")]
+    pub auto_upgrade: bool,
+    /// Webhook for alerts (Discord, Slack or any URL accepting JSON).
+    #[serde(default)]
+    pub alert_webhook: String,
+    /// Daily snapshots kept per volume (0 = off).
+    #[serde(default = "seven")]
+    pub volume_snapshots: u32,
     /// Let latrix buy, resize and delete servers by itself (needs a provider token).
     #[serde(default)]
     pub autopilot: bool,
@@ -290,6 +299,9 @@ pub struct Settings {
     pub max_machines: u32,
 }
 
+fn seven() -> u32 {
+    7
+}
 fn three() -> f64 {
     3.0
 }
@@ -319,6 +331,9 @@ impl Default for Settings {
             base_domain: String::new(),
             monthly_budget: 0.0,
             volume_retention_days: 3.0,
+            auto_upgrade: true,
+            alert_webhook: String::new(),
+            volume_snapshots: 7,
             autopilot: false,
             min_machines: 1,
             max_machines: 5,
@@ -399,6 +414,9 @@ pub struct InstanceReport {
     pub error: Option<String>,
     #[serde(default)]
     pub healthy_since: u64,
+    /// When a previously healthy instance started failing its checks (0 = healthy / never was).
+    #[serde(default)]
+    pub unhealthy_since: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

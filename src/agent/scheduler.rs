@@ -82,6 +82,11 @@ pub struct SchedMemory {
     pub up_streak: HashMap<String, u32>,
     pub down_streak: HashMap<String, u32>,
     pub warned: HashMap<String, u64>,
+    /// instance -> (restart count, when first seen at that count)
+    pub restarts: HashMap<String, (u32, u64)>,
+    /// Apps with UDP ports: the machines they last ran on (players know that
+    /// IP, so a restart or redeploy goes back to the same machine).
+    pub homes: HashMap<String, Vec<u32>>,
 }
 
 pub struct Ctx<'a, 'b> {
@@ -122,6 +127,7 @@ pub fn reconcile(s: &mut ClusterState, live: &LiveView, mem: &mut SchedMemory) -
         mem,
     };
     cleanup_stopping(s, &mut cx);
+    restart_stuck(s, &mut cx);
     let apps: Vec<String> = s.apps.keys().cloned().collect();
     for app in &apps {
         let stateful = s
@@ -153,6 +159,56 @@ pub fn reconcile(s: &mut ClusterState, live: &LiveView, mem: &mut SchedMemory) -
     cx.events
 }
 
+/// An instance that was healthy but has failed its health checks for 2
+/// minutes is replaced (the container is running but stuck). Containers that
+/// keep crashing are reported.
+fn restart_stuck(s: &mut ClusterState, cx: &mut Ctx) {
+    let live = cx.live;
+    let now = live.now;
+    let mut stuck = vec![];
+    let mut seen = vec![];
+    for i in s.instances.values().filter(|i| !i.stopping) {
+        let Some(r) = live.inst(i) else { continue };
+        seen.push(i.id.clone());
+        let active = s
+            .apps
+            .get(&i.app)
+            .and_then(|a| a.release(i.release))
+            .map(|r| r.status == ReleaseStatus::Active)
+            .unwrap_or(false);
+        if active && !r.healthy && r.unhealthy_since > 0 && now.saturating_sub(r.unhealthy_since) >= 120 {
+            stuck.push((i.id.clone(), i.app.clone(), i.machine));
+        }
+        // crash loop: 5+ restarts within 10 minutes
+        let entry = cx.mem.restarts.entry(i.id.clone()).or_insert((r.restarts, now));
+        if r.restarts < entry.0 || now.saturating_sub(entry.1) > 600 {
+            *entry = (r.restarts, now);
+        } else if r.restarts >= entry.0 + 5 {
+            let n = r.restarts - entry.0;
+            *entry = (r.restarts, now);
+            let app = i.app.clone();
+            cx.warn_once(
+                &format!("crash-{app}"),
+                format!("{app}: instance {} restarted {n} times in the last few minutes (crash loop) — see `latrix logs {app}`", i.id),
+            );
+        }
+    }
+    cx.mem.restarts.retain(|k, _| seen.contains(k));
+    for (id, app, m) in stuck {
+        // At most one restart per app every 5 minutes.
+        let key = format!("restart-{app}");
+        if now.saturating_sub(cx.mem.warned.get(&key).copied().unwrap_or(0)) < 300 {
+            continue;
+        }
+        cx.mem.warned.insert(key, now);
+        stop(s, &id, now);
+        cx.warn(format!(
+            "{app}: instance {id} on {} failed its health checks for 2 minutes; restarting it",
+            machine_name(s, m)
+        ));
+    }
+}
+
 fn machine_name(s: &ClusterState, m: u32) -> String {
     s.machines
         .get(&m)
@@ -180,6 +236,36 @@ fn evacuating(s: &ClusterState, live: &LiveView, m: u32) -> bool {
                 || !live.docker_ok(m)
         }
     }
+}
+
+/// Is machine `m` in one of the app's regions (any machine when unpinned)?
+pub fn region_ok(s: &ClusterState, cfg: &AppConfig, m: u32) -> bool {
+    cfg.regions.is_empty() || cfg.allows_region(s.machines.get(&m).and_then(|x| x.region.as_deref()))
+}
+
+/// Apps with UDP ports are published straight on the machine's IP: one
+/// instance per machine, and moving them changes the address players use.
+pub fn direct(cfg: &AppConfig) -> bool {
+    !cfg.udp_ports().is_empty()
+}
+
+/// Another app already publishes one of these UDP ports on `m`.
+fn udp_conflict(s: &ClusterState, app: &str, cfg: &AppConfig, m: u32) -> bool {
+    let mine: Vec<u16> = cfg.udp_ports().iter().map(|(p, _)| *p).collect();
+    if mine.is_empty() {
+        return false;
+    }
+    s.instances_on(m).filter(|i| i.app != app).any(|i| {
+        s.apps
+            .get(&i.app)
+            .and_then(|a| a.release(i.release))
+            .map(|r| r.config.udp_ports().iter().any(|(p, _)| mine.contains(p)))
+            .unwrap_or(false)
+    })
+}
+
+fn regions_text(cfg: &AppConfig) -> String {
+    cfg.regions.join(", ")
 }
 
 fn stop(s: &mut ClusterState, id: &str, now: u64) {
@@ -242,7 +328,10 @@ pub fn place(
     let need_mb = cfg.scale.memory_mb() as f64;
     let mut best: Option<(f64, u32)> = None;
     for m in s.machines.values() {
-        if exclude.contains(&m.id) || !schedulable(s, live, m.id) {
+        if exclude.contains(&m.id) || !schedulable(s, live, m.id) || !region_ok(s, cfg, m.id) {
+            continue;
+        }
+        if direct(cfg) && (s.instances_of(app).any(|i| i.machine == m.id) || udp_conflict(s, app, cfg, m.id)) {
             continue;
         }
         let met = live.metrics(m.id);
@@ -424,19 +513,35 @@ fn reconcile_stateless(s: &mut ClusterState, app: &str, cx: &mut Ctx) {
         .collect();
     let (cur, old): (Vec<&Instance>, Vec<&Instance>) =
         active.iter().partition(|i| i.release == version);
+    // Wrong region counts like a draining machine: replaced, then stopped.
+    let misplaced = |i: &Instance| evacuating(s, live, i.machine) || !region_ok(s, &cfg, i.machine);
     let base: Vec<&Instance> = cur
         .iter()
         .copied()
-        .filter(|i| !evacuating(s, live, i.machine) && i.replaces.is_none())
+        .filter(|i| !misplaced(i) && i.replaces.is_none())
         .collect();
-    let evac: Vec<&Instance> = cur
-        .iter()
-        .copied()
-        .filter(|i| evacuating(s, live, i.machine))
-        .collect();
+    let evac: Vec<&Instance> = cur.iter().copied().filter(|i| misplaced(i)).collect();
     let base_healthy = base.iter().filter(|i| live.healthy(i)).count();
     let base_pending = base.len() - base_healthy;
-    let rolling = cfg.deploy.rolling() && (!old.is_empty() || !evac.is_empty());
+    // UDP apps hold their port on the machine: the old instance stops before
+    // the new one starts in its place.
+    let is_direct = direct(&cfg);
+    let rolling_cfg = cfg.deploy.rolling() && !is_direct;
+    let rolling = rolling_cfg && (!old.is_empty() || !evac.is_empty());
+    if is_direct {
+        // Remember where it runs (before stopping anything).
+        let homes: Vec<u32> = active
+            .iter()
+            .filter(|i| region_ok(s, &cfg, i.machine) && !evacuating(s, live, i.machine))
+            .map(|i| i.machine)
+            .collect();
+        if !homes.is_empty() {
+            cx.mem.homes.insert(app.to_string(), homes);
+        }
+        for i in &old {
+            stop(s, &i.id, now);
+        }
+    }
 
     // Scale up / replace.
     if base.len() < target {
@@ -447,16 +552,48 @@ fn reconcile_stateless(s: &mut ClusterState, app: &str, cx: &mut Ctx) {
         } else {
             need
         };
+        let homes = cx.mem.homes.get(app).cloned().unwrap_or_default();
+        let mut taken: Vec<u32> = vec![];
         for _ in 0..n {
-            match place(s, live, app, &cfg, &[]) {
+            // UDP apps go back to the machine they ran on (same IP for
+            // players); wait while the old instance there is still stopping.
+            if is_direct {
+                let home = homes.iter().copied().find(|h| {
+                    !taken.contains(h)
+                        && schedulable(s, live, *h)
+                        && region_ok(s, &cfg, *h)
+                        && !s.instances_of(app).any(|i| i.machine == *h && !i.stopping)
+                        && !udp_conflict(s, app, &cfg, *h)
+                });
+                if let Some(h) = home {
+                    taken.push(h);
+                    if s.instances_of(app).any(|i| i.machine == h) {
+                        continue; // still stopping: next pass
+                    }
+                    create(s, app, version, h, now);
+                    continue;
+                }
+            }
+            match place(s, live, app, &cfg, &taken) {
                 Some(m) => {
+                    taken.push(m);
                     create(s, app, version, m, now);
                 }
                 None => {
-                    cx.warn_once(
-                        &format!("cap-{app}"),
-                        format!("{app}: no machine available to run another instance"),
-                    );
+                    let why = if !cfg.regions.is_empty()
+                        && !s.machines.keys().any(|m| schedulable(s, live, *m) && region_ok(s, &cfg, *m))
+                    {
+                        format!(
+                            "{app}: no ready machine in region {} (add one with `latrix machine create --region {}`, or the autopilot buys one)",
+                            regions_text(&cfg),
+                            cfg.regions[0]
+                        )
+                    } else if is_direct {
+                        format!("{app}: every machine that could run it already runs it (UDP apps run one instance per machine)")
+                    } else {
+                        format!("{app}: no machine available to run another instance")
+                    };
+                    cx.warn_once(&format!("cap-{app}-{version}"), why);
                     break;
                 }
             }
@@ -483,7 +620,7 @@ fn reconcile_stateless(s: &mut ClusterState, app: &str, cx: &mut Ctx) {
 
     // Retire old releases as new instances become healthy.
     if !old.is_empty() {
-        let keep_old = if cfg.deploy.rolling() {
+        let keep_old = if rolling_cfg {
             target.saturating_sub(base_healthy)
         } else {
             0
@@ -596,8 +733,13 @@ fn reconcile_stateful(s: &mut ClusterState, app: &str, cx: &mut Ctx) {
 
     // --- planned evacuation (drain / maintenance) -----------------------------
     let primary_status = s.machines.get(&primary).map(|m| m.status);
-    if matches!(primary_status, Some(MachineStatus::Draining) | Some(MachineStatus::Maintenance)) {
-        if let Some(t) = best_replica(s, live, &vols, primary, true) {
+    let cfg = s.apps.get(app).and_then(|a| a.config()).cloned();
+    let wrong_region = cfg.as_ref().map(|c| !region_ok(s, c, primary)).unwrap_or(false);
+    let leaving = matches!(primary_status, Some(MachineStatus::Draining) | Some(MachineStatus::Maintenance));
+    if leaving || wrong_region {
+        let t = best_replica(s, live, &vols, primary, true)
+            .filter(|t| leaving || cfg.as_ref().map(|c| region_ok(s, c, *t)).unwrap_or(true));
+        if let Some(t) = t {
             for v in &vol_ids {
                 let vol = s.volumes.get_mut(v).unwrap();
                 vol.moving_to = Some(t);
@@ -659,10 +801,28 @@ fn best_replica(
     primary: u32,
     planned: bool,
 ) -> Option<u32> {
+    // Machines in the app's regions first.
+    let cfg = s.apps.get(&vols[0].app).and_then(|a| a.config());
+    if let Some(c) = cfg.filter(|c| !c.regions.is_empty()) {
+        if let Some(r) = best_replica_where(s, live, vols, primary, planned, &|m| region_ok(s, c, m)) {
+            return Some(r);
+        }
+    }
+    best_replica_where(s, live, vols, primary, planned, &|_| true)
+}
+
+fn best_replica_where(
+    s: &ClusterState,
+    live: &LiveView,
+    vols: &[Volume],
+    primary: u32,
+    planned: bool,
+    ok: &dyn Fn(u32) -> bool,
+) -> Option<u32> {
     let replicas = &vols[0].replicas;
     let mut best: Option<(u64, u32)> = None;
     for r in replicas {
-        if !schedulable(s, live, *r) {
+        if !schedulable(s, live, *r) || !ok(*r) {
             continue;
         }
         // Oldest sync across all of the app's volumes for this replica.
@@ -695,7 +855,13 @@ fn maintain_replicas(s: &mut ClusterState, cx: &mut Ctx) {
         if vol.moving_to.is_some() {
             continue;
         }
-        let want = vol.copies.saturating_sub(1) as usize;
+        let cfg = s.apps.get(&vol.app).and_then(|a| a.config()).cloned();
+        let allowed = |m: u32| cfg.as_ref().map(|c| region_ok(s, c, m)).unwrap_or(true);
+        // Pinned to a region but stored elsewhere: keep (at least) one copy
+        // in the region so the app can move there.
+        let need_home = !allowed(vol.primary);
+        let base_want = vol.copies.saturating_sub(1) as usize;
+        let want = if need_home { base_want.max(1) } else { base_want };
         let mut replicas: Vec<u32> = vol
             .replicas
             .iter()
@@ -711,6 +877,16 @@ fn maintain_replicas(s: &mut ClusterState, cx: &mut Ctx) {
                 }
             }
         }
+        let has_home = replicas.iter().any(|r| allowed(*r) && schedulable(s, live, *r));
+        if need_home && !has_home && replicas.len() >= want {
+            let free_home = s
+                .machines
+                .values()
+                .any(|m| m.id != vol.primary && !replicas.contains(&m.id) && allowed(m.id) && schedulable(s, live, m.id));
+            if free_home {
+                replicas.pop(); // make room for a copy in the app's region
+            }
+        }
         while replicas.len() < want {
             let cand = s
                 .machines
@@ -718,8 +894,8 @@ fn maintain_replicas(s: &mut ClusterState, cx: &mut Ctx) {
                 .filter(|m| m.id != vol.primary && !replicas.contains(&m.id))
                 .filter(|m| schedulable(s, live, m.id))
                 .max_by(|a, b| {
-                    let fa = free_disk(live, a.id);
-                    let fb = free_disk(live, b.id);
+                    let fa = (allowed(a.id), free_disk(live, a.id));
+                    let fb = (allowed(b.id), free_disk(live, b.id));
                     fa.partial_cmp(&fb).unwrap_or(std::cmp::Ordering::Equal)
                 })
                 .map(|m| m.id);
@@ -762,9 +938,12 @@ pub fn drained(s: &ClusterState, live: &LiveView, m: u32) -> bool {
             let vols: Vec<Volume> = s.volumes_of(&i.app).cloned().collect();
             !vols.is_empty() && best_replica(s, live, &vols, m, true).is_some()
         } else {
-            s.machines
-                .keys()
-                .any(|o| *o != m && schedulable(s, live, *o))
+            s.machines.keys().any(|o| {
+                *o != m
+                    && schedulable(s, live, *o)
+                    && region_ok(s, cfg, *o)
+                    && !(direct(cfg) && s.instances_of(&i.app).any(|x| x.machine == *o && !x.stopping))
+            })
         };
         if movable {
             return false;
@@ -942,6 +1121,19 @@ pub fn can_absorb(s: &ClusterState, live: &LiveView, m: u32) -> bool {
     if others.is_empty() {
         return false;
     }
+    // Apps pinned to a region need another machine there.
+    for i in s.instances_on(m).filter(|i| !i.stopping) {
+        let Some(cfg) = s.apps.get(&i.app).and_then(|a| a.config()) else { continue };
+        if cfg.stateful() {
+            continue; // they wait for / move to their replica
+        }
+        let fits = others.iter().any(|o| {
+            region_ok(s, cfg, o.id) && !(direct(cfg) && s.instances_of(&i.app).any(|x| x.machine == o.id && !x.stopping))
+        });
+        if !fits {
+            return false;
+        }
+    }
     let free: f64 = others
         .iter()
         .map(|o| {
@@ -1060,7 +1252,7 @@ fn rebalance(s: &mut ClusterState, cx: &mut Ctx) {
     //    ready machine runs none of it.
     for (name, app) in s.apps.clone() {
         let Some(cfg) = app.config() else { continue };
-        if cfg.stateful() {
+        if cfg.stateful() || direct(cfg) {
             continue;
         }
         let insts: Vec<Instance> = s.instances_of(&name).filter(|i| !i.stopping).cloned().collect();
@@ -1069,7 +1261,7 @@ fn rebalance(s: &mut ClusterState, cx: &mut Ctx) {
             per.entry(i.machine).or_default().push(i);
         }
         let crowded = per.iter().filter(|(_, v)| v.len() >= 2).max_by_key(|(_, v)| v.len());
-        let has_empty = ready.iter().any(|m| !per.contains_key(&m.id));
+        let has_empty = ready.iter().any(|m| !per.contains_key(&m.id) && region_ok(s, cfg, m.id));
         if let (Some((_, v)), true) = (crowded, has_empty) {
             let Some(victim) = v.iter().find(|i| live.healthy(i)).map(|i| (*i).clone()) else { continue };
             let exclude: Vec<u32> = per.keys().copied().collect();
@@ -1100,7 +1292,7 @@ fn rebalance(s: &mut ClusterState, cx: &mut Ctx) {
             s.apps
                 .get(&i.app)
                 .and_then(|a| a.config())
-                .map(|c| !c.stateful())
+                .map(|c| !c.stateful() && !direct(c) && region_ok(s, c, lo_id))
                 .unwrap_or(false)
         })
         .filter(|i| !i.stopping && i.replaces.is_none() && live.healthy(i))
@@ -1267,7 +1459,7 @@ pub fn compute_routes(s: &ClusterState, live: &LiveView) -> Routes {
                 public_ports: cfg
                     .ports
                     .iter()
-                    .filter(|p| p.public)
+                    .filter(|p| p.public && p.protocol == "tcp")
                     .map(|p| (p.public_port.unwrap_or(p.port), p.port))
                     .collect(),
                 backends,
@@ -1584,6 +1776,122 @@ mod tests {
         assert_eq!(w.s.machines[&1].status, MachineStatus::Cordoned);
     }
 
+    fn cfg_mut<'a>(w: &'a mut World, app: &str) -> &'a mut AppConfig {
+        &mut w.s.apps.get_mut(app).unwrap().releases.last_mut().unwrap().config
+    }
+
+    fn regions(w: &mut World, list: &[(u32, &str)]) {
+        for (m, r) in list {
+            w.s.machines.get_mut(m).unwrap().region = Some(r.to_string());
+        }
+    }
+
+    fn redeploy(w: &mut World, app: &str) {
+        let a = w.s.apps.get_mut(app).unwrap();
+        let mut rel = a.releases.last().unwrap().clone();
+        rel.version += 1;
+        rel.created_at = w.now;
+        rel.status = ReleaseStatus::Deploying;
+        a.current = rel.version;
+        a.releases.push(rel);
+    }
+
+    #[test]
+    fn region_pinned_app_runs_and_moves_there() {
+        let mut w = World::new(3);
+        regions(&mut w, &[(1, "fsn1"), (2, "fsn1"), (3, "ash")]);
+        app(&mut w.s, "web", 2, false);
+        w.run(3);
+        // Pin it to ash: both instances end up on the one machine there.
+        cfg_mut(&mut w, "web").regions = vec!["ash".into()];
+        w.run(10);
+        let act = w.active("web");
+        assert_eq!(act.len(), 2);
+        assert!(act.iter().all(|i| i.machine == 3), "{act:?}");
+        // and the rebalancer doesn't spread it out again
+        w.now += 100;
+        w.run(20);
+        assert!(w.active("web").iter().all(|i| i.machine == 3));
+    }
+
+    #[test]
+    fn region_with_no_machine_warns_and_keeps_running() {
+        let mut w = World::new(1);
+        regions(&mut w, &[(1, "fsn1")]);
+        app(&mut w.s, "web", 1, false);
+        w.run(3);
+        cfg_mut(&mut w, "web").regions = vec!["ash".into()];
+        let mut warned = false;
+        for _ in 0..5 {
+            warned |= w.tick().iter().any(|e| e.message.contains("no ready machine in region ash"));
+        }
+        assert!(warned);
+        assert_eq!(w.active("web").len(), 1, "keeps running until there is somewhere to go");
+    }
+
+    #[test]
+    fn udp_app_one_per_machine_and_back_to_the_same_machine() {
+        let mut w = World::new(3);
+        app(&mut w.s, "game", 1, false);
+        let c = cfg_mut(&mut w, "game");
+        c.http = None;
+        c.ports = vec![crate::config::PortConfig { port: 7777, public: true, public_port: None, protocol: "udp".into() }];
+        w.run(3);
+        let home = w.active("game")[0].machine;
+        // Redeploys: the old one stops first, the new one starts on the same machine.
+        for _ in 0..3 {
+            redeploy(&mut w, "game");
+            for _ in 0..8 {
+                w.tick();
+                let act = w.active("game");
+                assert!(act.len() <= 1, "never two at once");
+                assert!(
+                    !w.s.instances.values().any(|i| i.app == "game" && i.machine != home),
+                    "stays on its machine"
+                );
+            }
+            assert_eq!(w.active("game").len(), 1);
+            assert_eq!(w.active("game")[0].release, w.s.apps["game"].current);
+        }
+        // Scaling up: one per machine, never two on one.
+        w.s.apps.get_mut("game").unwrap().count = 5;
+        w.run(5);
+        let machines: HashSet<u32> = w.active("game").iter().map(|i| i.machine).collect();
+        assert_eq!(w.active("game").len(), 3);
+        assert_eq!(machines.len(), 3);
+    }
+
+    #[test]
+    fn udp_ports_do_not_collide_between_apps() {
+        let mut w = World::new(2);
+        for name in ["a", "b"] {
+            app(&mut w.s, name, 1, false);
+            let c = cfg_mut(&mut w, name);
+            c.http = None;
+            c.ports = vec![crate::config::PortConfig { port: 7777, public: true, public_port: None, protocol: "udp".into() }];
+        }
+        w.run(3);
+        assert_ne!(w.active("a")[0].machine, w.active("b")[0].machine);
+    }
+
+    #[test]
+    fn stateful_app_moves_to_its_region() {
+        let mut w = World::new(2);
+        regions(&mut w, &[(1, "fsn1"), (2, "ash")]);
+        app(&mut w.s, "db", 1, true);
+        w.s.volumes.get_mut("db__data").unwrap().copies = 1;
+        w.run(3);
+        assert_eq!(w.active("db")[0].machine, 1);
+        assert!(w.s.volumes["db__data"].replicas.is_empty());
+        cfg_mut(&mut w, "db").regions = vec!["ash".into()];
+        w.run(15);
+        assert_eq!(w.s.volumes["db__data"].primary, 2, "data moved to ash");
+        assert_eq!(w.active("db").len(), 1);
+        assert_eq!(w.active("db")[0].machine, 2);
+        w.run(3);
+        assert!(w.s.volumes["db__data"].replicas.is_empty(), "back to one copy");
+    }
+
     #[test]
     fn stateful_failover() {
         let mut w = World::new(2);
@@ -1656,6 +1964,32 @@ mod tests {
         step(&mut w, Some(&task));
         assert!(w.s.surge.is_none());
         assert_eq!(w.active("web").len(), 2);
+    }
+
+    #[test]
+    fn stuck_instance_is_replaced() {
+        let mut w = World::new(2);
+        app(&mut w.s, "web", 2, false);
+        w.run(3);
+        let victim = w.active("web")[0].id.clone();
+        let since = w.now;
+        let mut events = vec![];
+        for _ in 0..30 {
+            w.agents();
+            for r in w.reports.values_mut() {
+                for ir in r.instances.iter_mut().filter(|ir| ir.id == victim) {
+                    ir.healthy = false;
+                    ir.unhealthy_since = since;
+                }
+            }
+            let live = LiveView { now: w.now, alive: &w.alive, dead_since: &w.dead_since, reports: &w.reports, leader_for: 1000 };
+            events.extend(reconcile(&mut w.s, &live, &mut w.mem));
+            w.s.version += 1;
+            w.now += 5;
+        }
+        assert!(!w.active("web").iter().any(|i| i.id == victim), "stuck instance replaced");
+        assert_eq!(w.active("web").len(), 2);
+        assert!(events.iter().any(|e| e.message.contains("failed its health checks")));
     }
 
     #[test]

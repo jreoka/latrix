@@ -167,6 +167,38 @@ fn managed(m: &Machine) -> bool {
     m.provider.is_some()
 }
 
+/// An app pinned to a region with no ready machine there:
+/// (app, its regions, memory one instance needs).
+pub fn missing_region(s: &ClusterState, live: &LiveView) -> Option<(String, Vec<String>, u64)> {
+    s.apps.values().find_map(|a| {
+        let c = a.config()?;
+        if a.count == 0 || c.regions.is_empty() {
+            return None;
+        }
+        let has = s
+            .machines
+            .values()
+            .any(|m| m.status == MachineStatus::Ready && live.is_alive(m.id) && c.allows_region(m.region.as_deref()));
+        (!has).then(|| (a.name.clone(), c.regions.clone(), c.scale.memory_mb()))
+    })
+}
+
+/// The region of `m` when an app is pinned to it (a replacement or temporary
+/// server must then be bought in the same place).
+fn pinned_region(s: &ClusterState, m: &Machine) -> Option<String> {
+    let r = m.region.clone()?;
+    s.apps
+        .values()
+        .filter(|a| a.count > 0)
+        .filter_map(|a| a.config())
+        .any(|c| !c.regions.is_empty() && c.regions.contains(&r))
+        .then_some(r)
+}
+
+fn offers_in(offers: &[Offer], region: Option<&str>) -> Vec<Offer> {
+    offers.iter().filter(|o| region.map(|r| o.location == r).unwrap_or(true)).cloned().collect()
+}
+
 /// The decision for this minute. Pure: easy to test, no side effects.
 pub fn decide(
     s: &ClusterState,
@@ -212,7 +244,8 @@ fn decide_with(
 
     // --- scale up --------------------------------------------------------------
     let too_few = (c.machines as u32) < c.wanted_machines;
-    let need_up = c.utilization > UP_UTIL || !c.overloaded.is_empty() || too_few;
+    let missing = missing_region(s, live);
+    let need_up = c.utilization > UP_UTIL || !c.overloaded.is_empty() || too_few || missing.is_some();
     mem.high = if need_up { mem.high + 1 } else { 0 };
     if need_up && mem.high >= UP_STREAK {
         if now < mem.cooldown_until {
@@ -225,6 +258,20 @@ fn decide_with(
             .max(c.largest_mb as f64 * 1.2)
             .max(MIN_SERVER_MB as f64);
         let shortfall_cpu = (c.req_cpu / 0.7 - c.cap_cpu).clamp(1.0, 16.0);
+        if let Some((app, regions, mb)) = missing {
+            // A server where the app must run (cheapest there that fits it).
+            let here: Vec<Offer> = offers.iter().filter(|o| regions.contains(&o.location)).cloned().collect();
+            let need = (mb as f64 * 1.2 + OVERHEAD_MB).max(MIN_SERVER_MB as f64) as u64;
+            let reason = format!("{app} runs in {} and no machine is there", regions.join(", "));
+            return match providers::cheapest(&here, need, 1.0, arch, &prefer, room) {
+                Some(o) => Decision::ScaleUp { offer: o.clone(), reason, replaces: None },
+                None if here.is_empty() => nothing(&format!(
+                    "{reason}, but no provider offers servers in {} (check the location name, e.g. hetzner: ash, hil, fsn1, nbg1, hel1, sin)",
+                    regions.join(", ")
+                )),
+                None => nothing(&format!("{reason}, but no server there fits the monthly budget")),
+            };
+        }
         let reason = if too_few {
             format!("apps want {} machines for redundancy, have {}", c.wanted_machines, c.machines)
         } else if !c.overloaded.is_empty() {
@@ -254,6 +301,15 @@ fn decide_with(
         .machines
         .values()
         .filter(|m| managed(m) && !m.temporary && m.id != leader && m.status == MachineStatus::Ready && live.alive.contains(&m.id))
+        .filter(|m| {
+            // Never the last machine in a region an app is pinned to.
+            match pinned_region(s, m) {
+                None => true,
+                Some(r) => s.machines.values().any(|o| {
+                    o.id != m.id && o.region.as_deref() == Some(r.as_str()) && o.status == MachineStatus::Ready && live.alive.contains(&o.id)
+                }),
+            }
+        })
         .collect();
     candidates.sort_by(|a, b| {
         b.monthly_cost
@@ -289,7 +345,8 @@ fn decide_with(
             let load_mem = s.reserved_mb(m.id) as f64;
             let load_cpu = s.reserved_cpu(m.id);
             let need = (load_mem * 1.5).max(c.largest_mb as f64 * 1.2).max(MIN_SERVER_MB as f64) + OVERHEAD_MB;
-            if let Some(o) = providers::cheapest(offers, need as u64, (load_cpu * 1.5).max(1.0), arch, &prefer, None) {
+            let local = offers_in(offers, pinned_region(s, m).as_deref());
+            if let Some(o) = providers::cheapest(&local, need as u64, (load_cpu * 1.5).max(1.0), arch, &prefer, None) {
                 if o.price < price * 0.7 && o.memory_mb < m.memory_mb {
                     return Decision::ScaleUp {
                             offer: o.clone(),
@@ -581,7 +638,8 @@ fn buy_temporary(agent: &Arc<Agent>, s: &ClusterState, offers: &[Offer], for_mac
     let need_cpu = s.reserved_cpu(for_machine).max(1.0);
     let arch = s.machines.get(&agent.me.machine_id).map(|m| providers::provider_arch(&m.arch)).unwrap_or("x86");
     let prefer: Vec<String> = s.machines.get(&for_machine).and_then(|m| m.region.clone()).into_iter().collect();
-    let Some(offer) = providers::cheapest(offers, need_mem, need_cpu, arch, &prefer, None).cloned() else {
+    let local = offers_in(offers, s.machines.get(&for_machine).and_then(|m| pinned_region(s, m)).as_deref());
+    let Some(offer) = providers::cheapest(&local, need_mem, need_cpu, arch, &prefer, None).cloned() else {
         let a = agent.clone();
         tokio::spawn(async move { set_surge(&a, None, "failed").await });
         agent.event("warn", "autopilot: no server type fits the work to hold during maintenance; updating in place");
@@ -821,7 +879,9 @@ mod tests {
             arch: "x86".into(),
             price,
         };
-        vec![o("small", 4096, 2.0, 4.0), o("medium", 8192, 4.0, 8.0), o("large", 16384, 8.0, 16.0)]
+        let mut v = vec![o("small", 4096, 2.0, 4.0), o("medium", 8192, 4.0, 8.0), o("large", 16384, 8.0, 16.0)];
+        v.push(Offer { location: "ash".into(), price: 5.0, ..v[0].clone() });
+        v
     }
 
     fn run(s: &ClusterState, mem: &mut Memory, checks: u32) -> Decision {
@@ -834,6 +894,31 @@ mod tests {
             last = decide(s, &live, &offers(), 1, mem, 10_000).1;
         }
         last
+    }
+
+    #[test]
+    fn buys_a_machine_in_a_pinned_region_and_keeps_it() {
+        let mut s = ClusterState::default();
+        s.settings.autopilot = true;
+        s.settings.max_machines = 5;
+        s.machines.insert(1, machine(1, 8192, true, 8.0));
+        app(&mut s, "game", 1, "512MB");
+        s.apps.get_mut("game").unwrap().releases[0].config.regions = vec!["ash".into()];
+        let mut mem = Memory::default();
+        match run(&s, &mut mem, 2) {
+            Decision::ScaleUp { offer, replaces: None, .. } => assert_eq!(offer.location, "ash"),
+            d => panic!("{d:?}"),
+        }
+        // Once there, the ash machine is never the one removed.
+        let mut ash = machine(2, 4096, true, 5.0);
+        ash.region = Some("ash".into());
+        s.machines.insert(2, ash);
+        let mut mem = Memory::default();
+        match run(&s, &mut mem, 70) {
+            Decision::ScaleDown { machine, .. } => panic!("removed {machine}"),
+            Decision::ScaleUp { replaces: Some(m), offer, .. } => assert!(m != 2 || offer.location == "ash"),
+            _ => {}
+        }
     }
 
     #[test]

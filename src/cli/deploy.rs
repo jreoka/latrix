@@ -282,8 +282,23 @@ pub async fn watch(client: &Client, app: &str, version: u64, health_timeout: u64
     let start = Instant::now();
     let mut last = String::new();
     let limit = Duration::from_secs(health_timeout * 2 + 120);
+    // Warnings about this app (e.g. "no machine in region ...") are shown as they happen.
+    let event_key = |e: &crate::state::Event| format!("{}|{}", e.ts, e.message);
+    let mut seen: std::collections::HashSet<String> = client
+        .get::<Vec<crate::state::Event>>("/v1/events")
+        .await
+        .map(|v| v.iter().map(event_key).collect())
+        .unwrap_or_default();
+    let prefix = format!("{app}: ");
     loop {
         tokio::time::sleep(Duration::from_secs(2)).await;
+        if let Ok(evs) = client.get::<Vec<crate::state::Event>>("/v1/events").await {
+            for e in evs {
+                if seen.insert(event_key(&e)) && e.level == "warn" && e.message.starts_with(&prefix) {
+                    println!("    ! {}", &e.message[prefix.len()..]);
+                }
+            }
+        }
         let v: AppView = client.get(&format!("/v1/apps/{app}")).await?;
         let status = v.releases.iter().find(|r| r.version == version).map(|r| r.status.clone());
         let mine: Vec<&InstanceView> = v

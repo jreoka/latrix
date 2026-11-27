@@ -28,6 +28,10 @@ pub struct AppConfig {
     /// Short name inside the group (defaults to the app name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
+    /// Only run on machines in these regions/locations (e.g. "ash" or
+    /// ["ash", "hil"]). Empty = anywhere.
+    #[serde(default, alias = "region", deserialize_with = "one_or_many", skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<String>,
     #[serde(default)]
     pub build: BuildConfig,
     /// Override the image's command.
@@ -117,6 +121,31 @@ pub struct PortConfig {
     /// Public port if different from the container port.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub public_port: Option<u16>,
+    /// "tcp" (default) or "udp". UDP ports must be public and are published
+    /// directly on the IP of the machine running the app (game servers,
+    /// voice, ...): no proxy hop, at most one instance per machine.
+    #[serde(default = "tcp", skip_serializing_if = "is_tcp")]
+    pub protocol: String,
+}
+
+fn tcp() -> String {
+    "tcp".into()
+}
+fn is_tcp(p: &String) -> bool {
+    p == "tcp"
+}
+
+fn one_or_many<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<String>, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum OneOrMany {
+        One(String),
+        Many(Vec<String>),
+    }
+    Ok(match OneOrMany::deserialize(d)? {
+        OneOrMany::One(s) => vec![s],
+        OneOrMany::Many(v) => v,
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -322,6 +351,14 @@ impl AppConfig {
                  machines and fails over automatically."
             );
         }
+        for p in &self.ports {
+            if !["tcp", "udp"].contains(&p.protocol.as_str()) {
+                bail!("port {}: protocol must be \"tcp\" or \"udp\"", p.port);
+            }
+            if p.protocol == "udp" && !p.public {
+                bail!("port {}: UDP ports must be public = true (they are published on the machine's IP)", p.port);
+            }
+        }
         for d in self.http.iter().flat_map(|h| h.domains.iter()) {
             if d.contains('/') || d.contains(':') || !d.contains('.') {
                 bail!("invalid domain '{d}'");
@@ -331,14 +368,29 @@ impl AppConfig {
     }
 
     /// All container ports that should be reachable (http + extra).
+    /// TCP ports (http + extra) the proxy and health checks use.
     pub fn container_ports(&self) -> Vec<u16> {
         let mut ports: Vec<u16> = self.http.iter().map(|h| h.port).collect();
-        for p in &self.ports {
+        for p in self.ports.iter().filter(|p| p.protocol == "tcp") {
             if !ports.contains(&p.port) {
                 ports.push(p.port);
             }
         }
         ports
+    }
+
+    /// UDP ports, published directly on the machine: (public port, container port).
+    pub fn udp_ports(&self) -> Vec<(u16, u16)> {
+        self.ports
+            .iter()
+            .filter(|p| p.protocol == "udp")
+            .map(|p| (p.public_port.unwrap_or(p.port), p.port))
+            .collect()
+    }
+
+    /// Is machine `region` allowed for this app?
+    pub fn allows_region(&self, region: Option<&str>) -> bool {
+        self.regions.is_empty() || region.map(|r| self.regions.iter().any(|x| x == r)).unwrap_or(false)
     }
 
     pub fn service_name(&self) -> &str {
@@ -420,6 +472,23 @@ mod tests {
             let c: AppConfig = toml::from_str(text).unwrap();
             c.validate().unwrap();
         }
+    }
+
+    #[test]
+    fn regions_and_udp() {
+        let c: AppConfig = toml::from_str(
+            "app = \"game\"\nregion = \"ash\"\n[[ports]]\nport = 7777\nprotocol = \"udp\"\npublic = true\n[[ports]]\nport = 8080\n",
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.regions, vec!["ash"]);
+        assert_eq!(c.udp_ports(), vec![(7777, 7777)]);
+        assert_eq!(c.container_ports(), vec![8080]);
+        assert!(c.allows_region(Some("ash")) && !c.allows_region(Some("fsn1")) && !c.allows_region(None));
+        let many: AppConfig = toml::from_str("app = \"x\"\nregions = [\"ash\", \"hil\"]\n").unwrap();
+        assert_eq!(many.regions.len(), 2);
+        let bad: AppConfig = toml::from_str("app = \"x\"\n[[ports]]\nport = 1\nprotocol = \"udp\"\n").unwrap();
+        assert!(bad.validate().is_err(), "udp must be public");
     }
 
     #[test]

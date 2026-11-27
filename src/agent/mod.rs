@@ -6,6 +6,7 @@
 //! over within seconds, with a full copy of the state.
 
 pub mod acme;
+pub mod alerts;
 pub mod autopilot;
 pub mod api;
 pub mod builder;
@@ -16,6 +17,7 @@ pub mod metrics;
 pub mod proxy;
 pub mod runtime;
 pub mod scheduler;
+pub mod selfupdate;
 pub mod store;
 pub mod transfer;
 pub mod volumes;
@@ -69,6 +71,8 @@ pub struct Agent {
     pub autopilot: autopilot::Shared,
     pub mesh_up: std::sync::atomic::AtomicBool,
     pub outbox: Mutex<Vec<Event>>,
+    pub alert_queue: Mutex<Vec<String>>,
+    pub upgrade_now: tokio::sync::Notify,
     /// Domains waiting for a certificate: domain -> (reason, next attempt).
     pub acme_pending: Mutex<std::collections::BTreeMap<String, (String, u64)>>,
 }
@@ -114,6 +118,9 @@ impl Agent {
             if out.len() > 50 {
                 out.remove(0);
             }
+        }
+        if e.level == "warn" && self.is_leader() {
+            alerts::queue(self, &e.message);
         }
         let mut ev = self.events.lock().unwrap();
         ev.push_back(e);
@@ -296,6 +303,8 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
         mesh_up: std::sync::atomic::AtomicBool::new(false),
         outbox: Mutex::new(vec![]),
         acme_pending: Mutex::new(Default::default()),
+        alert_queue: Mutex::new(vec![]),
+        upgrade_now: tokio::sync::Notify::new(),
     });
 
     if !dev {
@@ -325,6 +334,8 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
     tokio::spawn(proxy::run(agent.clone()));
     tokio::spawn(volumes::run(agent.clone()));
     tokio::spawn(acme::run(agent.clone()));
+    tokio::spawn(alerts::run(agent.clone()));
+    tokio::spawn(selfupdate::run(agent.clone()));
     if !dev {
         tokio::spawn(mesh::sync_loop(agent.clone()));
         tokio::spawn(dns::run(agent.clone()));

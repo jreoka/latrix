@@ -82,6 +82,14 @@ async fn disk(path: &std::path::Path) -> (f64, f64) {
     (kb(1) / 1048576.0, kb(2) / 1048576.0)
 }
 
+/// Re-measure disk usage right away (after a cleanup).
+pub async fn sample_disk(agent: &Agent) {
+    let (dt, du) = disk(&agent.data).await;
+    let mut m = agent.sampler.latest.lock().unwrap();
+    m.disk_total_gb = dt;
+    m.disk_used_gb = du;
+}
+
 pub async fn run(agent: Arc<Agent>) {
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {

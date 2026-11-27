@@ -164,11 +164,18 @@ pub fn convert_fly(f: &Value, name: &str, instances: u32, domains: Vec<String>) 
             continue;
         }
         let public = ports.iter().find_map(|p| p["port"].as_u64()).map(|p| p as u16);
+        let udp = svc["protocol"].as_str() == Some("udp");
+        if udp {
+            warnings.push(format!(
+                "UDP port {internal}: on latrix the app should listen on 0.0.0.0 (not fly-global-services)"
+            ));
+        }
         if !cfg.ports.iter().any(|p| p.port == internal) {
             cfg.ports.push(PortConfig {
                 port: internal,
-                public: public.is_some(),
+                public: public.is_some() || udp,
                 public_port: public.filter(|p| *p != internal),
+                protocol: if udp { "udp".into() } else { "tcp".into() },
             });
         }
     }

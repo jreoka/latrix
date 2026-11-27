@@ -65,6 +65,18 @@ pub async fn run(agent: Arc<Agent>) {
     {
         let agent = agent.clone();
         tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(90)).await;
+            loop {
+                if let Err(e) = snapshot_due(&agent).await {
+                    warn!("volume snapshots: {e:#}");
+                }
+                tokio::time::sleep(Duration::from_secs(600)).await;
+            }
+        });
+    }
+    {
+        let agent = agent.clone();
+        tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(60)).await;
             loop {
                 if let Err(e) = scan_unused(&agent).await {
@@ -239,6 +251,10 @@ async fn sync_once(agent: &Arc<Agent>) -> Result<()> {
             info!("purging volume data {}", dir.display());
             let _ = std::fs::remove_dir_all(&dir);
         }
+        let snaps = snapshots_dir(agent).join(id);
+        if snaps.exists() && !s.volumes.contains_key(id) {
+            let _ = std::fs::remove_dir_all(&snaps);
+        }
     }
     Ok(())
 }
@@ -343,6 +359,7 @@ pub async fn scan_unused(agent: &Arc<Agent>) -> Result<()> {
             Some(since) if t.saturating_sub(since) >= retention => {
                 info!("deleting unused volume data {name}");
                 std::fs::remove_dir_all(entry.path())?;
+                let _ = std::fs::remove_dir_all(snapshots_dir(agent).join(&name));
                 let size = agent.vols.unused.lock().unwrap().remove(&name).map(|x| x.1).unwrap_or(0);
                 agent.event("info", format!("deleted unused volume data {name} ({size} MB)"));
             }
@@ -402,4 +419,178 @@ pub async fn handle_unused(
     // Refresh first so the list is current.
     let _ = scan_unused(&agent).await;
     axum::Json(unused_list(&agent)).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Daily snapshots: point-in-time copies of each volume, kept on the machine
+// holding the live copy. Unchanged files are hard links to the previous
+// snapshot, so a week of snapshots costs little more than one copy.
+
+fn snapshots_dir(agent: &Agent) -> PathBuf {
+    agent.data.join("snapshots")
+}
+
+/// Snapshot names (newest last) for a volume on this machine.
+fn list_snapshots(agent: &Agent, id: &str) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(snapshots_dir(agent).join(id))
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| e.path().is_dir())
+                .map(|e| e.file_name().to_string_lossy().to_string())
+                .filter(|n| !n.starts_with('.'))
+                .collect()
+        })
+        .unwrap_or_default();
+    v.sort();
+    v
+}
+
+/// Keep only the newest `keep` snapshots of every volume.
+pub fn trim_snapshots(agent: &Agent, keep: usize) {
+    let Ok(rd) = std::fs::read_dir(snapshots_dir(agent)) else { return };
+    for e in rd.flatten() {
+        let id = e.file_name().to_string_lossy().to_string();
+        let snaps = list_snapshots(agent, &id);
+        if snaps.len() > keep {
+            for old in &snaps[..snaps.len() - keep] {
+                let _ = std::fs::remove_dir_all(snapshots_dir(agent).join(&id).join(old));
+            }
+        }
+    }
+}
+
+/// Take a snapshot of one volume now (runs the app's pre_sync hook first).
+pub async fn take_snapshot(agent: &Agent, vol: &crate::state::Volume) -> Result<String> {
+    let s = agent.snapshot();
+    if let Some(ctr) = agent.rt.running_container(&vol.app) {
+        let pre = s
+            .apps
+            .get(&vol.app)
+            .and_then(|a| a.config())
+            .and_then(|c| c.volumes.iter().find(|v| v.name == vol.name))
+            .and_then(|v| v.pre_sync.clone());
+        if let Some(pre) = pre {
+            let _ = cmd("docker", &["exec", &ctr, "sh", "-c", &pre]).await;
+        }
+    }
+    let dir = snapshots_dir(agent).join(&vol.id);
+    std::fs::create_dir_all(&dir)?;
+    let name = crate::cli::backup::stamp(now());
+    let prev = list_snapshots(agent, &vol.id).into_iter().last();
+    let src = format!("{}/", volumes_dir(agent).join(&vol.id).display());
+    let tmp = dir.join(format!(".{name}"));
+    let mut args = vec!["-a".to_string(), "--delete".into()];
+    if let Some(p) = &prev {
+        if p != &name {
+            args.push(format!("--link-dest={}", dir.join(p).display()));
+        }
+    }
+    args.push(src);
+    args.push(format!("{}/", tmp.display()));
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    cmd("rsync", &refs).await?;
+    let final_dir = dir.join(&name);
+    let _ = std::fs::remove_dir_all(&final_dir);
+    std::fs::rename(&tmp, &final_dir)?;
+    let keep = s.settings.volume_snapshots.max(1) as usize;
+    let snaps = list_snapshots(agent, &vol.id);
+    if snaps.len() > keep {
+        for old in &snaps[..snaps.len() - keep] {
+            let _ = std::fs::remove_dir_all(dir.join(old));
+        }
+    }
+    info!("snapshot {name} of volume {}", vol.id);
+    Ok(name)
+}
+
+/// Daily snapshot of every volume whose live copy is here.
+async fn snapshot_due(agent: &Arc<Agent>) -> Result<()> {
+    let s = agent.snapshot();
+    if s.settings.volume_snapshots == 0 {
+        return Ok(());
+    }
+    for vol in s.volumes.values().filter(|v| v.primary == agent.me.machine_id && v.moving_to.is_none()) {
+        let newest = std::fs::read_dir(snapshots_dir(agent).join(&vol.id))
+            .ok()
+            .and_then(|rd| rd.flatten().filter_map(|e| e.metadata().ok()?.modified().ok()).max());
+        let due = newest.map(|t| t.elapsed().unwrap_or_default() > Duration::from_secs(86400 - 600)).unwrap_or(true);
+        if due {
+            take_snapshot(agent, vol).await?;
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SnapshotInfo {
+    pub name: String,
+    /// Space this snapshot adds on top of the previous ones.
+    pub size_mb: u64,
+}
+
+/// GET ?volume= lists snapshots; POST ?volume=&action=take|restore[&snapshot=]
+pub async fn handle_snapshots(
+    axum::extract::State(agent): axum::extract::State<Arc<Agent>>,
+    method: axum::http::Method,
+    axum::extract::Query(q): axum::extract::Query<HashMap<String, String>>,
+) -> axum::response::Response {
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
+    let bad = |m: &str| (StatusCode::BAD_REQUEST, axum::Json(crate::api_types::ApiErrorBody { error: m.into() })).into_response();
+    let Some(id) = q.get("volume").filter(|v| !v.is_empty() && !v.contains('/') && !v.contains("..")).cloned() else {
+        return bad("volume= required");
+    };
+    if method == axum::http::Method::GET {
+        let snaps = list_snapshots(&agent, &id);
+        // `du` counts hard-linked files once, so each line is that snapshot's own cost.
+        let dir = snapshots_dir(&agent).join(&id);
+        let mut sizes: HashMap<String, u64> = HashMap::new();
+        if !snaps.is_empty() {
+            let mut args = vec!["-sm".to_string()];
+            args.extend(snaps.iter().map(|n| dir.join(n).display().to_string()));
+            let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            if let Ok(out) = cmd("du", &refs).await {
+                for line in out.lines() {
+                    let mut it = line.split_whitespace();
+                    if let (Some(n), Some(p)) = (it.next(), it.next()) {
+                        let name = p.rsplit('/').next().unwrap_or("").to_string();
+                        sizes.insert(name, n.parse().unwrap_or(0));
+                    }
+                }
+            }
+        }
+        let list: Vec<SnapshotInfo> = snaps
+            .into_iter()
+            .map(|n| SnapshotInfo { size_mb: sizes.get(&n).copied().unwrap_or(0), name: n })
+            .collect();
+        return axum::Json(list).into_response();
+    }
+    let s = agent.snapshot();
+    let Some(vol) = s.volumes.get(&id).cloned() else { return bad("unknown volume") };
+    match q.get("action").map(|a| a.as_str()) {
+        Some("take") => match take_snapshot(&agent, &vol).await {
+            Ok(name) => axum::Json(serde_json::json!({ "snapshot": name })).into_response(),
+            Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+        },
+        Some("restore") => {
+            let Some(snap) = q.get("snapshot").filter(|n| list_snapshots(&agent, &id).contains(n)).cloned() else {
+                return bad("unknown snapshot");
+            };
+            if agent.rt.running_container(&vol.app).is_some() {
+                return (StatusCode::CONFLICT, format!("{} is running here; scale it to 0 first", vol.app)).into_response();
+            }
+            let src = format!("{}/", snapshots_dir(&agent).join(&id).join(&snap).display());
+            let dst = format!("{}/", volumes_dir(&agent).join(&id).display());
+            let _ = std::fs::create_dir_all(volumes_dir(&agent).join(&id));
+            match cmd("rsync", &["-a", "--delete", &src, &dst]).await {
+                Ok(_) => {
+                    agent.vols.kick();
+                    agent.event("info", format!("volume {id} rolled back to snapshot {snap}"));
+                    axum::Json(true).into_response()
+                }
+                Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")).into_response(),
+            }
+        }
+        _ => bad("action must be take or restore"),
+    }
 }
