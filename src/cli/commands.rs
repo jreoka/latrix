@@ -677,13 +677,16 @@ async fn machine_cmd(cfg: &mut CliConfig, cl: Option<&str>, m: MachineCmd) -> Re
         MachineCmd::Create { provider, size, region, image, name, key, agent_binary } => {
             let p = providers::canonical(&provider)?;
             let token = providers::token(cfg, p)?;
-            let (dsize, dregion, dimage) = providers::defaults(p);
+            let (dsize, dregion) = providers::defaults(p);
             let size = size.unwrap_or_else(|| dsize.into());
             let region = region.unwrap_or_else(|| dregion.into());
-            let image = image.unwrap_or_else(|| dimage.into());
+            let image = match image {
+                Some(i) => i,
+                None => providers::latest_ubuntu(p, &token, &size).await,
+            };
             let name = name.unwrap_or_else(|| format!("{}-{}", region, util::random_id(4)));
             util::validate_name("machine", &name)?;
-            let pubkey = providers::local_pubkey(key.as_deref())?;
+            let (pubkey, key) = providers::ssh_key(key.as_deref())?;
             println!("==> creating {p} server '{name}' ({size} in {region}, {image})");
             let created = providers::create(p, &token, &name, &size, &region, &image, &pubkey).await?;
             println!(

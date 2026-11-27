@@ -98,16 +98,23 @@ pub async fn install_binary(ssh: &Ssh, explicit: Option<&Path>) -> Result<()> {
         None => {
             let base = std::env::var("LATRIX_RELEASE_BASE")
                 .unwrap_or_else(|_| format!("https://github.com/jreoka/latrix/releases/download/v{}", util::VERSION));
-            let url = format!("{base}/latrix-{arch}-unknown-linux-musl");
+            let file = format!("latrix-{arch}-unknown-linux-musl");
+            let url = format!("{base}/{file}");
+            let latest = format!("https://github.com/jreoka/latrix/releases/latest/download/{file}");
             println!("      downloading {url}");
-            ssh.run(&format!("curl -fsSL {} -o {tmp}", shell_quote(&url)))
-                .await
-                .with_context(|| {
-                    format!(
-                        "could not download latrix for {arch}. Build it yourself \
-                         (cargo build --release --target {arch}-unknown-linux-musl) and pass --agent-binary"
-                    )
-                })?;
+            let exact = ssh.run(&format!("curl -fsSL {} -o {tmp}", shell_quote(&url))).await;
+            if exact.is_err() {
+                println!("      not published for this version, trying the latest release");
+                ssh.run(&format!("curl -fsSL {} -o {tmp}", shell_quote(&latest)))
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "could not download a Linux build of latrix for {arch} (no GitHub release found).\n  \
+                             Build one with `cargo build --release --target {arch}-unknown-linux-musl` on Linux/WSL \
+                             and pass --agent-binary <path>"
+                        )
+                    })?;
+            }
         }
     }
     ssh.run(&format!("install -m 0755 {tmp} /usr/local/bin/latrix && rm -f {tmp}"))

@@ -33,31 +33,138 @@ pub fn token(cfg: &CliConfig, provider: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("no API token for {p}: run `latrix provider set {p} <token>` or set {env}"))
 }
 
-pub fn defaults(provider: &str) -> (&'static str, &'static str, &'static str) {
-    // (size, region, image)
+pub fn defaults(provider: &str) -> (&'static str, &'static str) {
+    // (size, region)
     match provider {
-        "hetzner" => ("cx22", "fsn1", "ubuntu-24.04"),
-        _ => ("s-1vcpu-1gb", "fra1", "ubuntu-24-04-x64"),
+        "hetzner" => ("cx22", "fsn1"),
+        _ => ("s-1vcpu-1gb", "fra1"),
     }
 }
 
-pub fn local_pubkey(key: Option<&str>) -> Result<String> {
-    let candidates: Vec<PathBuf> = match key {
-        Some(k) => vec![PathBuf::from(format!("{k}.pub"))],
-        None => {
-            let home = dirs::home_dir().unwrap_or_default().join(".ssh");
-            ["id_ed25519.pub", "id_ecdsa.pub", "id_rsa.pub"]
-                .iter()
-                .map(|f| home.join(f))
-                .collect()
+/// Fallback when the provider's image list can't be read.
+fn fallback_image(provider: &str) -> &'static str {
+    match provider {
+        "hetzner" => "ubuntu-24.04",
+        _ => "ubuntu-24-04-x64",
+    }
+}
+
+/// Parse "26.04" into (26, 4).
+fn ubuntu_version(v: &str) -> Option<(u32, u32)> {
+    let (a, b) = v.split_once('.')?;
+    Some((a.parse().ok()?, b.parse().ok()?))
+}
+
+/// Prefer the newest LTS release (YY.04 with an even year), else the newest release.
+fn pick_newest(candidates: Vec<((u32, u32), String)>) -> Option<String> {
+    let lts = |(major, minor): (u32, u32)| minor == 4 && major % 2 == 0;
+    let best_lts = candidates.iter().filter(|(v, _)| lts(*v)).max_by_key(|(v, _)| *v);
+    best_lts
+        .or_else(|| candidates.iter().max_by_key(|(v, _)| *v))
+        .map(|(_, name)| name.clone())
+}
+
+/// Newest Ubuntu image on Hetzner for an architecture ("x86" or "arm").
+pub fn pick_hetzner_ubuntu(images: &Value, arch: &str) -> Option<String> {
+    let list = images["images"].as_array()?;
+    pick_newest(
+        list.iter()
+            .filter(|i| i["os_flavor"] == "ubuntu" && i["architecture"] == arch)
+            .filter(|i| i["deprecated"].is_null() && i["status"] != "unavailable")
+            .filter_map(|i| Some((ubuntu_version(i["os_version"].as_str()?)?, i["name"].as_str()?.to_string())))
+            .collect(),
+    )
+}
+
+/// Newest Ubuntu x64 image on DigitalOcean (slugs like "ubuntu-26-04-x64").
+pub fn pick_do_ubuntu(images: &Value) -> Option<String> {
+    let list = images["images"].as_array()?;
+    pick_newest(
+        list.iter()
+            .filter_map(|i| i["slug"].as_str())
+            .filter_map(|slug| {
+                let rest = slug.strip_prefix("ubuntu-")?.strip_suffix("-x64")?;
+                let (a, b) = rest.split_once('-')?;
+                Some(((a.parse().ok()?, b.parse().ok()?), slug.to_string()))
+            })
+            .collect(),
+    )
+}
+
+/// The newest Ubuntu LTS the provider offers for this server size, so new
+/// machines don't start on an old release.
+pub async fn latest_ubuntu(provider: &str, token: &str, size: &str) -> String {
+    let http = reqwest::Client::new();
+    use reqwest::Method as M;
+    let found = match provider {
+        "hetzner" => {
+            let base = "https://api.hetzner.cloud/v1";
+            let arch = api(&http, M::GET, &format!("{base}/server_types?name={size}"), token, None)
+                .await
+                .ok()
+                .and_then(|v| v["server_types"][0]["architecture"].as_str().map(String::from))
+                .unwrap_or_else(|| "x86".into());
+            api(&http, M::GET, &format!("{base}/images?type=system&per_page=50"), token, None)
+                .await
+                .ok()
+                .and_then(|v| pick_hetzner_ubuntu(&v, &arch))
         }
+        _ => api(&http, M::GET, "https://api.digitalocean.com/v2/images?type=distribution&per_page=200", token, None)
+            .await
+            .ok()
+            .and_then(|v| pick_do_ubuntu(&v)),
     };
-    for c in &candidates {
-        if let Ok(k) = std::fs::read_to_string(c) {
-            return Ok(k.trim().to_string());
+    found.unwrap_or_else(|| {
+        let f = fallback_image(provider);
+        println!("    (could not list {provider} images; using {f}, pass --image to choose)");
+        f.to_string()
+    })
+}
+
+/// The SSH key used for servers latrix creates: (public key, private key
+/// path to use, or None for ssh's defaults). Uses --key or your usual key
+/// (~/.ssh/id_ed25519 etc.); if you have none, latrix creates and manages
+/// its own key next to its config, so you don't need to set anything up.
+pub fn ssh_key(key: Option<&str>) -> Result<(String, Option<String>)> {
+    if let Some(k) = key {
+        let pub_path = format!("{k}.pub");
+        let pubkey = std::fs::read_to_string(&pub_path)
+            .with_context(|| format!("reading {pub_path} (the public half of --key)"))?;
+        return Ok((pubkey.trim().to_string(), Some(k.to_string())));
+    }
+    let home = dirs::home_dir().unwrap_or_default().join(".ssh");
+    for f in ["id_ed25519", "id_ecdsa", "id_rsa"] {
+        if let Ok(k) = std::fs::read_to_string(home.join(format!("{f}.pub"))) {
+            return Ok((k.trim().to_string(), None));
         }
     }
-    bail!("no SSH public key found (looked for {:?}); create one with ssh-keygen -t ed25519", candidates)
+    let own = managed_key_path();
+    let own_pub = PathBuf::from(format!("{}.pub", own.display()));
+    if !own_pub.exists() {
+        if let Some(dir) = own.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let st = std::process::Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-C", "latrix", "-f"])
+            .arg(&own)
+            .stdin(std::process::Stdio::null())
+            .status()
+            .context("could not run ssh-keygen (is OpenSSH installed?)")?;
+        if !st.success() {
+            bail!("ssh-keygen failed");
+        }
+        println!("==> created an SSH key for latrix at {}", own.display());
+    }
+    let pubkey = std::fs::read_to_string(&own_pub)?;
+    Ok((pubkey.trim().to_string(), Some(own.display().to_string())))
+}
+
+pub fn managed_key_path() -> PathBuf {
+    CliConfig::path()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("id_ed25519")
 }
 
 fn same_key(a: &str, b: &str) -> bool {
@@ -299,4 +406,47 @@ pub async fn sizes(provider: &str, token: &str) -> Result<()> {
         rows.into_iter().map(|r| r.1).take(40).collect(),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn picks_newest_lts_hetzner() {
+        let v = json!({"images": [
+            {"name": "ubuntu-24.04", "os_flavor": "ubuntu", "os_version": "24.04", "architecture": "x86", "deprecated": null, "status": "available"},
+            {"name": "ubuntu-26.04", "os_flavor": "ubuntu", "os_version": "26.04", "architecture": "x86", "deprecated": null, "status": "available"},
+            {"name": "ubuntu-26.10", "os_flavor": "ubuntu", "os_version": "26.10", "architecture": "x86", "deprecated": null, "status": "available"},
+            {"name": "ubuntu-28.04-arm", "os_flavor": "ubuntu", "os_version": "28.04", "architecture": "arm", "deprecated": null, "status": "available"},
+            {"name": "ubuntu-22.04", "os_flavor": "ubuntu", "os_version": "22.04", "architecture": "x86", "deprecated": "2027-01-01", "status": "available"},
+            {"name": "debian-13", "os_flavor": "debian", "os_version": "13", "architecture": "x86", "deprecated": null, "status": "available"}
+        ]});
+        assert_eq!(pick_hetzner_ubuntu(&v, "x86").as_deref(), Some("ubuntu-26.04"));
+        assert_eq!(pick_hetzner_ubuntu(&v, "arm").as_deref(), Some("ubuntu-28.04-arm"));
+    }
+
+    #[test]
+    fn generates_a_key_when_the_user_has_none() {
+        let dir = std::env::temp_dir().join(format!("latrix-keytest-{}", random_id(6)));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Only this test touches HOME / LATRIX_CONFIG.
+        std::env::set_var("HOME", &dir);
+        std::env::set_var("LATRIX_CONFIG", dir.join("cfg/config.toml"));
+        let (pubkey, path) = ssh_key(None).unwrap();
+        assert!(pubkey.starts_with("ssh-ed25519 "));
+        assert_eq!(path.as_deref(), Some(dir.join("cfg/id_ed25519").to_str().unwrap()));
+        // second call reuses it
+        assert_eq!(ssh_key(None).unwrap().0, pubkey);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn picks_newest_lts_digitalocean() {
+        let v = json!({"images": [
+            {"slug": "ubuntu-24-04-x64"}, {"slug": "ubuntu-26-04-x64"}, {"slug": "ubuntu-25-10-x64"},
+            {"slug": "debian-13-x64"}, {"slug": null}
+        ]});
+        assert_eq!(pick_do_ubuntu(&v).as_deref(), Some("ubuntu-26-04-x64"));
+    }
 }
