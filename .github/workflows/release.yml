@@ -1,21 +1,51 @@
-# Publishes binaries as a GitHub release. Run it from the Actions tab
-# ("release" → Run workflow, enter a version like v0.1.0), or push a tag
-# like v0.1.0. `latrix machine add` run from macOS/Windows downloads
+# Publishes binaries as a GitHub release, automatically: every push whose
+# Cargo.toml version has no release yet builds and publishes v<version>.
+# Also runnable by hand (Actions → release → Run workflow) or by pushing a
+# tag like v0.1.0. `latrix machine add` run from macOS/Windows downloads
 # latrix-<arch>-unknown-linux-musl from the release matching its version.
 name: release
 on:
   push:
+    branches: [main, claude/nice-albattani-9vihgt]
     tags: ["v*"]
   workflow_dispatch:
     inputs:
       version:
-        description: "Version tag to create, e.g. v0.1.0"
-        required: true
-        default: "v0.1.2"
+        description: "Version tag to create, e.g. v0.1.0 (default: Cargo.toml version)"
+        required: false
 permissions:
   contents: write
 jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            v="${{ github.ref_name }}"
+          elif [ -n "${{ inputs.version }}" ]; then
+            v="${{ inputs.version }}"
+          else
+            v="v$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          if gh release view "$v" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "$v is already released"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "will release $v"
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: check
+    if: needs.check.outputs.release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -55,9 +85,9 @@ jobs:
           path: dist/*
 
   publish:
-    needs: build
+    needs: [check, build]
     # Publish whatever built, even if one platform failed.
-    if: ${{ !cancelled() }}
+    if: ${{ !cancelled() && needs.check.outputs.release == 'true' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -67,8 +97,8 @@ jobs:
       - run: ls -l dist
       - uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.version || github.ref_name }}
+          tag_name: ${{ needs.check.outputs.version }}
           target_commitish: ${{ github.sha }}
-          name: latrix ${{ inputs.version || github.ref_name }}
+          name: latrix ${{ needs.check.outputs.version }}
           files: dist/*
           generate_release_notes: true
