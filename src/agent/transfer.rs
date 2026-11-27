@@ -228,3 +228,128 @@ pub async fn put_image(State(agent): State<Arc<Agent>>, Query(q): Query<LoadQuer
 pub fn volume_id(app: &str, name: &str) -> String {
     Volume::dir_name(app, name)
 }
+
+#[derive(Deserialize)]
+pub struct ExecQuery {
+    pub app: String,
+    /// Shell command (`sh -c`), base64-encoded (standard or URL-safe) or passed via X-Latrix-Exec header.
+    #[serde(default)]
+    pub cmd: Option<String>,
+}
+
+/// Run a non-interactive command inside a running app container on this
+/// machine, piping the HTTP request body to stdin and streaming stdout back.
+/// Used by `latrix rexctl` for `pg_restore`, `pg_dump`, and one-shot init jobs.
+pub async fn exec_container(
+    State(agent): State<Arc<Agent>>,
+    Query(q): Query<ExecQuery>,
+    req: Request,
+) -> Response {
+    use base64::Engine;
+    if crate::util::validate_name("app", &q.app).is_err() {
+        return err(StatusCode::BAD_REQUEST, "invalid app name");
+    }
+    let Some(ctr) = agent.rt.running_container(&q.app) else {
+        return err(StatusCode::NOT_FOUND, format!("{} is not running on this machine", q.app));
+    };
+    let encoded = req
+        .headers()
+        .get("x-latrix-exec")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .or(q.cmd);
+    let Some(encoded) = encoded else {
+        return err(StatusCode::BAD_REQUEST, "missing command (cmd query or x-latrix-exec header)");
+    };
+    let cmd_bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded.trim())
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded.trim()))
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(encoded.trim()));
+    let cmd_str = match cmd_bytes.ok().and_then(|b| String::from_utf8(b).ok()) {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return err(StatusCode::BAD_REQUEST, "invalid base64 command"),
+    };
+
+    // Spool request body (e.g. a postgres dump) to a temp file so we never deadlock
+    // on simultaneous stdin/stdout streaming and can report clean exit errors.
+    let tmp_in = agent.data.join(format!(".exec-in-{}", random_id(6)));
+    let in_size = match save_body(req, &tmp_in).await {
+        Ok(n) => n,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_in);
+            return err(StatusCode::BAD_REQUEST, e);
+        }
+    };
+
+    let tmp_out = agent.data.join(format!(".exec-out-{}", random_id(6)));
+    let stdin_stdio = if in_size > 0 {
+        match std::fs::File::open(&tmp_in) {
+            Ok(f) => std::process::Stdio::from(f),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp_in);
+                return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+            }
+        }
+    } else {
+        std::process::Stdio::null()
+    };
+    let stdout_file = match std::fs::File::create(&tmp_out) {
+        Ok(f) => f,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_in);
+            return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+        }
+    };
+
+    let res = tokio::process::Command::new("docker")
+        .args(["exec", "-i", &ctr, "sh", "-c", &cmd_str])
+        .stdin(stdin_stdio)
+        .stdout(std::process::Stdio::from(stdout_file))
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .await;
+    let _ = std::fs::remove_file(&tmp_in);
+
+    match res {
+        Ok(out) if out.status.success() => {
+            let f = match tokio::fs::File::open(&tmp_out).await {
+                Ok(f) => f,
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp_out);
+                    return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
+                }
+            };
+            // Stream output file and unlink once read completes.
+            let cleanup_path = tmp_out.clone();
+            let stream = tokio_util::io::ReaderStream::new(f);
+            let stream = futures::stream::unfold((stream, Some(cleanup_path)), |(mut s, p)| async move {
+                match s.next().await {
+                    Some(item) => Some((item, (s, p))),
+                    None => {
+                        if let Some(path) = p {
+                            let _ = std::fs::remove_file(path);
+                        }
+                        None
+                    }
+                }
+            });
+            Body::from_stream(stream).into_response()
+        }
+        Ok(out) => {
+            let _ = std::fs::remove_file(&tmp_out);
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            err(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!(
+                    "exec exited with {}: {}",
+                    out.status.code().map(|c| c.to_string()).unwrap_or_else(|| "signal".into()),
+                    if stderr.is_empty() { "(no stderr)".into() } else { stderr }
+                ),
+            )
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_out);
+            err(StatusCode::INTERNAL_SERVER_ERROR, format!("docker exec failed: {e}"))
+        }
+    }
+}

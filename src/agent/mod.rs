@@ -17,6 +17,7 @@ pub mod maintenance;
 pub mod mesh;
 pub mod metrics;
 pub mod proxy;
+pub mod rexctl;
 pub mod runtime;
 pub mod scheduler;
 pub mod selfupdate;
@@ -72,6 +73,7 @@ pub struct Agent {
     pub sampler: metrics::Sampler,
     pub autopilot: autopilot::Shared,
     pub cloudflare: cloudflare::Shared,
+    pub rexctl: rexctl::Shared,
     pub mesh_up: std::sync::atomic::AtomicBool,
     pub outbox: Mutex<Vec<Event>>,
     pub alert_queue: Mutex<Vec<String>>,
@@ -305,6 +307,7 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
         sampler: Default::default(),
         autopilot: Default::default(),
         cloudflare: Default::default(),
+        rexctl: Default::default(),
         mesh_up: std::sync::atomic::AtomicBool::new(false),
         outbox: Mutex::new(vec![]),
         acme_pending: Mutex::new(Default::default()),
@@ -342,6 +345,7 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
     tokio::spawn(acme::run(agent.clone()));
     tokio::spawn(alerts::run(agent.clone()));
     tokio::spawn(selfupdate::run(agent.clone()));
+    tokio::spawn(rexctl::run(agent.clone()));
     tokio::spawn(keys::run(agent.clone()));
     if !dev {
         tokio::spawn(mesh::sync_loop(agent.clone()));

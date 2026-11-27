@@ -53,6 +53,71 @@ pub struct ClusterState {
     /// knows what to update or clean up when apps/domains/machines change.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub managed_dns: Vec<ManagedDnsRecord>,
+    /// Optional managed Fluxer stack imported/deployed via `latrix rexctl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fluxer: Option<FluxerStack>,
+}
+
+/// Replicated state for a Fluxer stack managed via `latrix rexctl`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+pub struct FluxerStack {
+    pub project: String,
+    pub domain: String,
+    #[serde(default)]
+    pub release: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_release: Option<String>,
+    /// Automatically check for and roll out new Fluxer releases on the leader.
+    #[serde(default = "yes")]
+    pub auto_upgrade: bool,
+    /// Hours between automatic release checks (default 6).
+    #[serde(default = "default_fluxer_interval")]
+    pub upgrade_interval_hours: u64,
+    #[serde(default)]
+    pub last_check: u64,
+    #[serde(default)]
+    pub last_upgrade: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_available: Option<String>,
+    /// rexctl settings map (domain, storage.*, voice.*, kv.mode, raw FLUXER_* vars).
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
+    /// rexctl secrets map (POSTGRES_PASSWORD, LIVEKIT_API_SECRET, S3 keys, etc.).
+    #[serde(default)]
+    pub secrets: BTreeMap<String, String>,
+    #[serde(default)]
+    pub caddyfile: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub caddy_dropins: BTreeMap<String, String>,
+    #[serde(default)]
+    pub services: Vec<String>,
+    #[serde(default)]
+    pub external_object_store: bool,
+    #[serde(default = "yes")]
+    pub bundled_voice: bool,
+    #[serde(default)]
+    pub kv_postgres: bool,
+    #[serde(default)]
+    pub rust_single: bool,
+    #[serde(default = "default_fluxer_copies")]
+    pub copies: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub image_overrides: BTreeMap<String, String>,
+    #[serde(default)]
+    pub created_at: u64,
+    #[serde(default)]
+    pub updated_at: u64,
+}
+
+fn default_fluxer_interval() -> u64 {
+    6
+}
+fn default_fluxer_copies() -> u32 {
+    2
 }
 
 /// A DNS record currently managed by latrix in Cloudflare.

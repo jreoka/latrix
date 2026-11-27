@@ -11,6 +11,7 @@ pub mod k8s;
 pub mod machine;
 pub mod profile;
 pub mod providers;
+pub mod rexctl;
 pub mod ssh;
 pub mod update;
 
@@ -167,6 +168,12 @@ pub enum Cmd {
     /// Bring apps over from other platforms
     #[command(subcommand)]
     Import(ImportCmd),
+    /// Deploy, restore, upgrade and auto-manage a Fluxer stack from a rexctl backup
+    #[command(visible_alias = "fluxer")]
+    Rexctl {
+        #[command(subcommand)]
+        action: Option<RexctlCmd>,
+    },
     /// Check every machine (over SSH) and explain anything that's wrong
     Doctor {
         /// Only this machine
@@ -546,6 +553,126 @@ pub enum ImportCmd {
         #[arg(long)]
         from_source: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum RexctlCmd {
+    /// Show the managed Fluxer stack, release version, voice endpoints and service health (default)
+    #[command(alias = "ps")]
+    Status,
+    /// Load and deploy a Fluxer rexctl backup (.tar.zst) onto the cluster and auto-manage it
+    #[command(visible_alias = "restore", alias = "import")]
+    Deploy {
+        /// Path to the rexctl backup archive (.tar.zst)
+        file: PathBuf,
+        /// Stack/group name on latrix (default: from backup manifest, usually "fluxer")
+        #[arg(long)]
+        project: Option<String>,
+        /// Override the Fluxer domain (default: from backup)
+        #[arg(long)]
+        domain: Option<String>,
+        /// Override the Fluxer release version (e.g. 2026.1124.80040)
+        #[arg(long)]
+        release: Option<String>,
+        /// Disable automatic background Fluxer upgrades on the cluster leader
+        #[arg(long)]
+        no_auto_upgrade: bool,
+        /// Volume replica count across machines (default: 2)
+        #[arg(long, default_value_t = 2)]
+        copies: u32,
+        /// Optional region pin for Fluxer services (e.g. ash)
+        #[arg(long)]
+        region: Option<String>,
+        /// Skip SHA256SUMS verification when reading the backup
+        #[arg(long)]
+        skip_verify: bool,
+        /// Replace an existing managed Fluxer stack on this cluster
+        #[arg(long)]
+        replace: bool,
+        /// Inspect the backup and print the deployment plan without modifying the cluster
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Inspect and verify a rexctl backup file locally (no cluster required)
+    Inspect {
+        /// Path to the rexctl backup archive (.tar.zst)
+        file: PathBuf,
+        /// Skip SHA256SUMS verification
+        #[arg(long)]
+        skip_verify: bool,
+    },
+    /// Upgrade the managed Fluxer stack (snapshots volumes + automatic rollback on failure)
+    Upgrade {
+        /// Target Fluxer release version (default: latest from fluxer.dev)
+        version: Option<String>,
+        /// Force re-applying even if already on the target release
+        #[arg(long)]
+        force: bool,
+    },
+    /// Configure automatic background Fluxer upgrades on the cluster leader
+    AutoUpgrade {
+        /// `on` or `off` (omit to view current setting)
+        mode: Option<String>,
+        /// Hours between automatic release checks (1-168, default 6)
+        #[arg(long)]
+        interval: Option<u64>,
+        /// Trigger a release check immediately
+        #[arg(long)]
+        check_now: bool,
+    },
+    /// Create a rexctl-compatible .tar.zst backup from the running Fluxer stack
+    Backup {
+        /// Directory for the backup file (default: ~/latrix-backups)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Skip bundled SeaweedFS uploads volume
+        #[arg(long)]
+        no_uploads: bool,
+    },
+    /// View or follow logs for one Fluxer service (e.g. api, edge, livekit) or core services
+    #[command(alias = "log")]
+    Logs {
+        /// Service name (e.g. api, gateway, edge, livekit, postgres); omit for core services
+        service: Option<String>,
+        /// Keep streaming new lines
+        #[arg(short, long)]
+        follow: bool,
+        /// Lines of history per instance
+        #[arg(short = 'n', long, default_value_t = 100)]
+        tail: u32,
+    },
+    /// Rolling restart of one Fluxer service or the whole stack
+    Restart {
+        /// Service name (omit to restart every Fluxer service)
+        service: Option<String>,
+    },
+    /// View or change Fluxer settings (re-applies to affected services automatically)
+    Config {
+        #[command(subcommand)]
+        action: Option<RexctlConfigCmd>,
+    },
+    /// Destroy the managed Fluxer stack and all its services
+    #[command(alias = "rm", alias = "delete")]
+    Destroy {
+        /// Don't ask for confirmation
+        #[arg(short, long)]
+        yes: bool,
+        /// Keep volume data on the machines (deleted by default)
+        #[arg(long)]
+        keep_volumes: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum RexctlConfigCmd {
+    /// List current Fluxer settings (secrets masked)
+    #[command(alias = "ls")]
+    List,
+    /// Set one or more settings: latrix rexctl config set domain=chat.example.com storage.region=auto
+    Set { pairs: Vec<String> },
+    /// Remove one or more settings
+    #[command(alias = "rm", alias = "delete")]
+    Unset { keys: Vec<String> },
 }
 
 #[derive(Subcommand)]

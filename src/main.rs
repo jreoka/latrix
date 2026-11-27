@@ -4,6 +4,7 @@ mod agent;
 mod api_types;
 mod cli;
 mod config;
+mod fluxer;
 mod state;
 mod util;
 

@@ -28,6 +28,9 @@ pub struct AppConfig {
     /// Short name inside the group (defaults to the app name).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub service: Option<String>,
+    /// Extra DNS aliases inside the group (e.g. `app-proxy`, `admin`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<String>,
     /// Only run on machines in these regions/locations (e.g. "ash" or
     /// ["ash", "hil"]). Empty = anywhere.
     #[serde(default, alias = "region", deserialize_with = "one_or_many", skip_serializing_if = "Vec::is_empty")]
@@ -37,6 +40,12 @@ pub struct AppConfig {
     /// Override the image's command.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<Command>,
+    /// Optional `/dev/shm` size (e.g. "1GB" for Postgres).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size: Option<String>,
+    /// Optional `nofile` ulimit (e.g. 65536 for high-connection gateways).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub nofile: Option<u64>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     /// Public HTTP(S) service.
@@ -409,6 +418,12 @@ impl AppConfig {
         if let Some(s) = &self.service {
             validate_name("service", s)?;
         }
+        for a in &self.aliases {
+            validate_name("alias", a)?;
+        }
+        if let Some(shm) = &self.shm_size {
+            parse_size_mb(shm).context("shm_size")?;
+        }
         if self.build.image.is_some() && self.build.git.is_some() {
             bail!("[build] set either `image` or `git`, not both");
         }
@@ -643,5 +658,20 @@ ttl = 300
         )
         .unwrap();
         assert!(bad_ttl.validate().is_err());
+    }
+
+    #[test]
+    fn aliases_shm_and_nofile_validate() {
+        let c: AppConfig = toml::from_str(
+            "app = \"fluxer-rust\"\ngroup = \"fluxer\"\nservice = \"rust\"\naliases = [\"app-proxy\", \"admin\"]\nshm_size = \"1GB\"\nnofile = 65536\n",
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.aliases, vec!["app-proxy", "admin"]);
+        assert_eq!(c.shm_size.as_deref(), Some("1GB"));
+        assert_eq!(c.nofile, Some(65536));
+
+        let bad_shm: AppConfig = toml::from_str("app = \"x\"\nshm_size = \"bogus\"\n").unwrap();
+        assert!(bad_shm.validate().is_err());
     }
 }

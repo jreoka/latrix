@@ -377,3 +377,83 @@ pub struct DnsSummary {
 pub struct ApiErrorBody {
     pub error: String,
 }
+
+// ---------------------------------------------------------------------------
+// Fluxer (`latrix rexctl`) management
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RexctlServiceStatus {
+    pub service: String,
+    pub app: String,
+    pub image: String,
+    pub status: String,
+    pub healthy: usize,
+    pub desired: u32,
+    pub machines: Vec<String>,
+    pub memory: String,
+    pub release: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RexctlStatusView {
+    pub installed: bool,
+    pub project: String,
+    pub domain: String,
+    pub release: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_release: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_available: Option<String>,
+    pub auto_upgrade: bool,
+    pub upgrade_interval_hours: u64,
+    pub upgrading: Option<String>,
+    pub last_check: u64,
+    pub last_upgrade: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub storage: String,
+    pub bundled_voice: bool,
+    pub voice_endpoints: Vec<String>,
+    pub kv_mode: String,
+    pub rust_mode: String,
+    pub cert_ready: bool,
+    pub services: Vec<RexctlServiceStatus>,
+    /// Masked settings for safe display (secrets redacted).
+    #[serde(default)]
+    pub settings: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RexctlUpgradeRequest {
+    #[serde(default)]
+    pub version: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RexctlUpgradeResult {
+    pub upgraded: bool,
+    pub from_release: String,
+    pub to_release: String,
+    pub updated_services: Vec<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RexctlAutoUpgradeRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub interval_hours: Option<u64>,
+    #[serde(default)]
+    pub check_now: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct RexctlConfigRequest {
+    #[serde(default)]
+    pub set: BTreeMap<String, String>,
+    #[serde(default)]
+    pub unset: Vec<String>,
+}

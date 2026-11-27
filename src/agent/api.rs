@@ -59,7 +59,8 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/v1/local/unused-volumes", get(super::volumes::handle_unused).delete(super::volumes::handle_unused))
         .route("/v1/local/snapshots", get(super::volumes::handle_snapshots).post(super::volumes::handle_snapshots))
         .route("/v1/local/self-update", post(super::selfupdate::handle))
-        .route("/v1/local/image", get(super::transfer::get_image).post(super::transfer::put_image));
+        .route("/v1/local/image", get(super::transfer::get_image).post(super::transfer::put_image))
+        .route("/v1/local/exec", post(super::transfer::exec_container));
 
     let cluster = Router::new()
         .route("/v1/status", get(status))
@@ -79,6 +80,11 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/v1/dns", get(get_dns))
         .route("/v1/dns/cloudflare", post(setup_cloudflare))
         .route("/v1/dns/sync", post(sync_dns))
+        .route("/v1/rexctl", get(get_rexctl).post(set_rexctl).delete(delete_rexctl))
+        .route("/v1/rexctl/export", get(export_rexctl))
+        .route("/v1/rexctl/upgrade", post(upgrade_rexctl))
+        .route("/v1/rexctl/auto-upgrade", post(set_rexctl_auto_upgrade))
+        .route("/v1/rexctl/config", post(update_rexctl_config))
         .route("/v1/settings", get(get_settings).post(set_settings))
         .route("/v1/autopilot", get(get_autopilot).post(set_autopilot))
         .route("/v1/ssh-keys", get(get_ssh_keys).post(set_ssh_keys))
@@ -1401,4 +1407,106 @@ async fn set_ssh_keys(State(agent): AgentState, Json(req): Json<SshKeysRequest>)
         })
         .await?;
     Ok(Json(SshKeysView { keys, cluster_key }))
+}
+
+// ---------------------------------------------------------------------------
+// Fluxer (`latrix rexctl`)
+
+async fn get_rexctl(State(agent): AgentState) -> Json<RexctlStatusView> {
+    Json(super::rexctl::status_view(&agent))
+}
+
+async fn set_rexctl(State(agent): AgentState, Json(mut stack): Json<FluxerStack>) -> ApiResult<RexctlStatusView> {
+    validate_name("project", &stack.project)?;
+    if stack.domain.trim().is_empty() || !stack.domain.contains('.') {
+        return Err(anyhow!("invalid Fluxer domain '{}'", stack.domain).into());
+    }
+    stack.updated_at = now();
+    if stack.created_at == 0 {
+        stack.created_at = stack.updated_at;
+    }
+    let domain = stack.domain.clone();
+    let release = stack.release.clone();
+    let auto = stack.auto_upgrade;
+    agent
+        .mutate(|s| {
+            s.fluxer = Some(stack);
+            Ok(())
+        })
+        .await?;
+    agent.event(
+        "info",
+        format!(
+            "Fluxer stack registered for {domain} ({}, auto-upgrade {})",
+            if release.is_empty() { "unversioned" } else { &release },
+            if auto { "on" } else { "off" }
+        ),
+    );
+    agent.rexctl.wake.notify_one();
+    Ok(Json(super::rexctl::status_view(&agent)))
+}
+
+async fn delete_rexctl(State(agent): AgentState) -> ApiResult<bool> {
+    agent
+        .mutate(|s| {
+            s.fluxer = None;
+            Ok(())
+        })
+        .await?;
+    agent.event("info", "Fluxer stack unregistered");
+    Ok(Json(true))
+}
+
+async fn export_rexctl(State(agent): AgentState) -> ApiResult<FluxerStack> {
+    let fx = agent
+        .snapshot()
+        .fluxer
+        .clone()
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "no Fluxer stack is managed on this cluster".into()))?;
+    Ok(Json(fx))
+}
+
+async fn upgrade_rexctl(
+    State(agent): AgentState,
+    Json(req): Json<RexctlUpgradeRequest>,
+) -> ApiResult<RexctlUpgradeResult> {
+    let res = super::rexctl::upgrade_stack(&agent, req.version.as_deref(), req.force).await?;
+    Ok(Json(res))
+}
+
+async fn set_rexctl_auto_upgrade(
+    State(agent): AgentState,
+    Json(req): Json<RexctlAutoUpgradeRequest>,
+) -> ApiResult<RexctlStatusView> {
+    agent
+        .mutate(|s| {
+            let fx = s
+                .fluxer
+                .as_mut()
+                .ok_or_else(|| anyhow!("no Fluxer stack is managed on this cluster"))?;
+            if let Some(en) = req.enabled {
+                fx.auto_upgrade = en;
+            }
+            if let Some(h) = req.interval_hours {
+                if h == 0 || h > 168 {
+                    bail!("upgrade interval must be between 1 and 168 hours");
+                }
+                fx.upgrade_interval_hours = h;
+            }
+            fx.updated_at = now();
+            Ok(())
+        })
+        .await?;
+    if req.check_now {
+        agent.rexctl.wake.notify_one();
+    }
+    Ok(Json(super::rexctl::status_view(&agent)))
+}
+
+async fn update_rexctl_config(
+    State(agent): AgentState,
+    Json(req): Json<RexctlConfigRequest>,
+) -> ApiResult<RexctlStatusView> {
+    let v = super::rexctl::apply_config(&agent, req).await?;
+    Ok(Json(v))
 }

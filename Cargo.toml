@@ -1,6 +1,6 @@
 [package]
 name = "latrix"
-version = "0.1.13"
+version = "0.1.14"
 edition = "2021"
 description = "A tiny self-managing cluster: deploy apps across your servers as if they were one machine."
 license = "MIT"
@@ -30,6 +30,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rand = "0.8"
 tar = "0.4"
 flate2 = "1"
+zstd = "0.13"
+sha2 = "0.10"
 ignore = "0.4"
 dirs = "5"
 serde_yaml = "0.9"

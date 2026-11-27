@@ -374,6 +374,27 @@ The import is also saved as a normal backup file. latrix then prints the
 DNS change for the cut-over. Fly process groups other than `app`, and
 `release_command`, are reported rather than migrated.
 
+## Fluxer (`latrix rexctl`)
+
+Deploy, restore, upgrade and auto-manage a self-hosted **Fluxer** stack directly from a `rexctl` `.tar.zst` backup file:
+
+```bash
+latrix rexctl inspect fluxer-backup.tar.zst         # inspect & verify SHA256SUMS locally
+latrix rexctl deploy fluxer-backup.tar.zst          # deploy stack, restore Postgres + volumes, enable auto-upgrade
+latrix rexctl status                                # domain, release, storage, LiveKit voice IPs, service health
+latrix rexctl upgrade [version]                     # snapshot volumes + rolling upgrade with automatic rollback
+latrix rexctl auto-upgrade on --interval 6          # cluster leader checks fluxer.dev and rolls out new releases
+latrix rexctl backup                                # export a rexctl-compatible .tar.zst backup (pg_dump + volumes)
+latrix rexctl config set domain=chat.example.com    # update Fluxer settings and re-apply to affected services
+latrix rexctl logs [service] [-f]                   # stream logs for one Fluxer service or core services
+latrix rexctl restart [service]                     # rolling restart of one service or the whole stack
+latrix rexctl destroy [--keep-volumes]              # tear down the managed Fluxer stack
+```
+
+- **Storage & Voice:** Automatically respects your backup's settings — external S3 / **Cloudflare R2** skips SeaweedFS and wires your R2 credentials into latrix secrets; bundled **LiveKit** publishes TCP `7881` and UDP `7882` directly on the machine's IP; bundled SeaweedFS runs bucket/key initialization automatically.
+- **HTTPS & DNS:** Fluxer's `edge` (Caddy) runs in proxy mode behind latrix's ingress with automatic Let's Encrypt TLS and Cloudflare DNS (when enabled via `latrix dns cloudflare`).
+- **Auto-upgrades:** Enabled by default (`--no-auto-upgrade` to opt out). The cluster leader checks `https://fluxer.dev/rexctl/release.json`, takes pre-upgrade volume snapshots, guards against automatic Postgres major version jumps, rolls out services in tier order, and automatically rolls back if any service fails health checks.
+
 ## Kubernetes
 
 Already have a Kubernetes cluster (k3s, DOKS, GKE, EKS, AKS...)? Register it
@@ -433,6 +454,7 @@ latrix --cluster prod status
 | `latrix up [--budget 30]` | buy the cheapest server and turn on the autopilot |
 | `latrix backup [app] [--all] [--stop]` / `latrix restore <file>` | full app backups to your computer |
 | `latrix import fly <app>` | move a Fly.io app (config, secrets, image, data, domains) |
+| `latrix rexctl deploy\|status\|upgrade\|auto-upgrade\|backup\|logs\|config\|destroy` | deploy and auto-manage a Fluxer stack from a `rexctl` backup |
 | `latrix autopilot on\|off\|status` | automatic buying, resizing and deleting of servers |
 | `latrix machine list\|add\|create\|remove\|drain\|cordon\|uncordon\|update\|ssh` | machines |
 | `latrix doctor [machine]` | check every machine over SSH and explain what's wrong |

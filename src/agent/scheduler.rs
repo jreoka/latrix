@@ -1446,6 +1446,11 @@ pub fn compute_routes(s: &ClusterState, live: &LiveView) -> Routes {
             routes
                 .dns
                 .insert(format!("{}.{}.internal", cfg.service_name(), g), app.vip.clone());
+            for alias in &cfg.aliases {
+                routes
+                    .dns
+                    .insert(format!("{alias}.{g}.internal"), app.vip.clone());
+            }
         }
         routes.apps.insert(
             name.clone(),

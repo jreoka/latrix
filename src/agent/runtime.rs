@@ -625,6 +625,20 @@ async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
         args.push("--cpus".into());
         args.push(format!("{}", cfg.scale.cpu));
     }
+    if let Some(shm) = &cfg.shm_size {
+        if let Ok(mb) = util::parse_size_mb(shm) {
+            if mb > 0 {
+                args.push("--shm-size".into());
+                args.push(format!("{mb}m"));
+            }
+        }
+    }
+    if let Some(nofile) = cfg.nofile {
+        if nofile > 0 {
+            args.push("--ulimit".into());
+            args.push(format!("nofile={nofile}:{nofile}"));
+        }
+    }
     let mut env: BTreeMap<String, String> = BTreeMap::new();
     if let Some(h) = &cfg.http {
         env.insert("PORT".into(), h.port.to_string());
@@ -682,6 +696,10 @@ async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
         if cfg.service.is_some() {
             args.push("--network-alias".into());
             args.push(cfg.service_name().into());
+        }
+        for alias in &cfg.aliases {
+            args.push("--network-alias".into());
+            args.push(alias.clone());
         }
     } else {
         args.push("--dns".into());

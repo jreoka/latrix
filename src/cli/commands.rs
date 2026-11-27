@@ -288,6 +288,9 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Cluster(c) => return cluster_cmd(c),
         Cmd::Provider(p) => return provider_cmd(p).await,
         Cmd::K8s(k) => return k8s::k8s_cmd(cl, k).await,
+        Cmd::Rexctl { action: Some(RexctlCmd::Inspect { file, skip_verify }) } => {
+            return rexctl::inspect(&file, skip_verify);
+        }
         Cmd::SelfUpdate => return update::self_update(&CliConfig::load()?, cl).await,
         _ => {}
     }
@@ -358,6 +361,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Import(ImportCmd::Fly { app, as_name, no_data, no_secrets, from_source }) => {
             fly::import(&cfg, cl, fly::ImportOptions { fly_app: app, name: as_name, no_data, no_secrets, from_source }).await
         }
+        Cmd::Rexctl { action } => rexctl::run_cmd(&cfg, cl, action).await,
         Cmd::Certs { .. } => {
             let (_, _, c) = connect(&cfg, cl).await?;
             let st: StatusView = c.get("/v1/status").await?;
