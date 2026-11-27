@@ -301,13 +301,32 @@ pub async fn exec_container(
         }
     };
 
-    let res = tokio::process::Command::new("docker")
-        .args(["exec", "-i", &ctr, "sh", "-c", &cmd_str])
+    struct RemoveOnDrop(PathBuf);
+    impl Drop for RemoveOnDrop {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+        }
+    }
+
+    let mut docker_args = vec!["exec"];
+    if in_size > 0 {
+        docker_args.push("-i");
+    }
+    docker_args.extend([ctr.as_str(), "sh", "-c", cmd_str.as_str()]);
+
+    // Use `spawn()` + `wait_with_output()` rather than `Command::output()`,
+    // because `Command::output()` overrides `.stdout(...)` with `Stdio::piped()`
+    // and would leave `tmp_out` empty while buffering stdout in memory.
+    let child = tokio::process::Command::new("docker")
+        .args(&docker_args)
         .stdin(stdin_stdio)
         .stdout(std::process::Stdio::from(stdout_file))
         .stderr(std::process::Stdio::piped())
-        .output()
-        .await;
+        .spawn();
+    let res = match child {
+        Ok(c) => c.wait_with_output().await,
+        Err(e) => Err(e),
+    };
     let _ = std::fs::remove_file(&tmp_in);
 
     match res {
@@ -319,19 +338,11 @@ pub async fn exec_container(
                     return err(StatusCode::INTERNAL_SERVER_ERROR, e.to_string());
                 }
             };
-            // Stream output file and unlink once read completes.
-            let cleanup_path = tmp_out.clone();
+            // Stream output file and unlink when finished or dropped early.
+            let guard = RemoveOnDrop(tmp_out);
             let stream = tokio_util::io::ReaderStream::new(f);
-            let stream = futures::stream::unfold((stream, Some(cleanup_path)), |(mut s, p)| async move {
-                match s.next().await {
-                    Some(item) => Some((item, (s, p))),
-                    None => {
-                        if let Some(path) = p {
-                            let _ = std::fs::remove_file(path);
-                        }
-                        None
-                    }
-                }
+            let stream = futures::stream::unfold((stream, guard), |(mut s, g)| async move {
+                s.next().await.map(|item| (item, (s, g)))
             });
             Body::from_stream(stream).into_response()
         }

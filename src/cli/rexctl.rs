@@ -732,13 +732,26 @@ async fn backup_stack_inner(
             c,
             m,
             &pg_app,
-            r#"exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" --format=custom"#,
+            r#"PGPASSWORD="${POSTGRES_PASSWORD:-}" exec pg_dump -U "${POSTGRES_USER:-fluxer}" -d "${POSTGRES_DB:-fluxer}" --format=custom"#,
             None,
             Some(&dump_file),
         )
         .await
         .context("pg_dump failed")?;
         let sz = std::fs::metadata(&dump_file)?.len();
+        if sz == 0 {
+            bail!(
+                "pg_dump produced an empty file (if the cluster agent is older than this CLI, upgrade the cluster agents with `latrix update`)"
+            );
+        }
+        let mut magic = [0u8; 5];
+        use std::io::Read;
+        let n = std::fs::File::open(&dump_file)?.read(&mut magic)?;
+        if n < 5 || &magic != b"PGDMP" {
+            bail!(
+                "pg_dump output ({sz} bytes) is not a valid PostgreSQL custom-format dump (missing PGDMP header)"
+            );
+        }
         println!("    database dump: {}", mb(sz));
         Some(dump_file)
     } else {
