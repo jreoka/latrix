@@ -477,6 +477,17 @@ async fn image_exists(image: &str) -> bool {
     cmd("docker", &["image", "inspect", "--format", "{{.Id}}", image]).await.is_ok()
 }
 
+fn summarize_pull_error(err: &str) -> String {
+    let msg = err.split_once(" failed: ").map(|(_, rest)| rest).unwrap_or(err).trim();
+    let msg = msg.strip_prefix("Error response from daemon: ").unwrap_or(msg).trim();
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("not found") || lower.contains("manifest unknown") {
+        "not found".into()
+    } else {
+        msg.to_string()
+    }
+}
+
 /// Make sure the release's image is present, pulling it from whichever
 /// machine's registry has it.
 pub async fn ensure_image(agent: &Arc<Agent>, rel: &Release) -> Result<()> {
@@ -504,17 +515,18 @@ pub async fn ensure_image(agent: &Arc<Agent>, rel: &Release) -> Result<()> {
     if agent.dev {
         ips = vec!["127.0.0.1".into()];
     }
-    let mut last_err = None;
+    let mut errs: Vec<String> = vec![];
     for ip in ips {
-        let r = format!("{ip}:{REGISTRY_PORT}/{repo}");
+        let pull_host = if ip == agent.me.overlay_ip { "127.0.0.1" } else { ip.as_str() };
+        let r = format!("{pull_host}:{REGISTRY_PORT}/{repo}");
         match cmd("docker", &["pull", "-q", &r]).await {
             Ok(_) => {
                 if r != rel.image {
                     cmd("docker", &["tag", &r, &rel.image]).await?;
                 }
                 // Mirror into our own registry so this machine can serve it too.
-                let own = format!("{}/{repo}", agent.registry());
-                if own != r && own != rel.image {
+                if pull_host != "127.0.0.1" {
+                    let own = format!("127.0.0.1:{REGISTRY_PORT}/{repo}");
                     tokio::spawn(async move {
                         if cmd("docker", &["tag", &r, &own]).await.is_ok() {
                             let _ = cmd("docker", &["push", "-q", &own]).await;
@@ -523,13 +535,13 @@ pub async fn ensure_image(agent: &Arc<Agent>, rel: &Release) -> Result<()> {
                 }
                 return Ok(());
             }
-            Err(e) => last_err = Some(e),
+            Err(e) => errs.push(format!("{ip}: {}", summarize_pull_error(&e.to_string()))),
         }
     }
     bail!(
-        "image {} not available from any machine: {}",
+        "image {} not available from any machine ({})",
         rel.image,
-        last_err.map(|e| e.to_string()).unwrap_or_default()
+        errs.join("; ")
     )
 }
 
@@ -778,6 +790,34 @@ pub async fn ensure_docker_config(agent: &Agent) {
     agent.event("info", "fixed Docker's registry settings on this machine".to_string());
 }
 
+/// Registry config with the in-memory blob descriptor cache disabled.
+///
+/// `registry:2`'s default config enables `storage.cache.blobdescriptor: inmemory`,
+/// which is not invalidated when `registry garbage-collect` runs in a separate
+/// process. Re-pushing a previously garbage-collected layer then hits the stale
+/// cache ("Layer already exists") without writing the blob to disk, causing
+/// subsequent pulls to fail with an unexpected EOF / 0-byte body.
+const REGISTRY_CONFIG: &str = "\
+version: 0.1
+log:
+  fields:
+    service: registry
+storage:
+  filesystem:
+    rootdirectory: /var/lib/registry
+  delete:
+    enabled: true
+http:
+  addr: :5000
+  headers:
+    X-Content-Type-Options: [nosniff]
+health:
+  storagedriver:
+    enabled: true
+    interval: 10s
+    threshold: 3
+";
+
 /// Keep the local image registry running.
 pub async fn registry_loop(agent: Arc<Agent>) {
     if !agent.dev {
@@ -793,11 +833,15 @@ pub async fn registry_loop(agent: Arc<Agent>) {
         if mesh_ip != "127.0.0.1" && std::net::TcpListener::bind((mesh_ip.as_str(), 0)).is_ok() {
             ips.push(mesh_ip);
         }
-        // Check the *live* bindings: when one address is missing after a
-        // Docker restart, Docker silently drops all of a container's ports.
-        let live = cmd("docker", &["inspect", "-f", "{{.State.Running}} {{json .NetworkSettings.Ports}}", "latrix-registry"])
-            .await
-            .unwrap_or_default();
+        // Check the *live* bindings and mounted config: when one address is
+        // missing after a Docker restart, Docker silently drops all of a
+        // container's ports; older containers also lack our no-cache config.
+        let live = cmd(
+            "docker",
+            &["inspect", "-f", "{{.State.Running}} {{json .NetworkSettings.Ports}} {{json .Mounts}}", "latrix-registry"],
+        )
+        .await
+        .unwrap_or_default();
         let up = live.starts_with("true");
         let bound: Vec<String> = ips
             .iter()
@@ -805,25 +849,42 @@ pub async fn registry_loop(agent: Arc<Agent>) {
             .cloned()
             .collect();
         let stale_mesh = !ips.iter().any(|ip| ip != "127.0.0.1") && live.contains("\"HostIp\":\"10.77.");
+        let has_cfg = live.contains("/etc/docker/registry/config.yml");
         let answers = reqwest::Client::new()
             .get(format!("http://127.0.0.1:{REGISTRY_PORT}/v2/"))
             .timeout(Duration::from_secs(3))
             .send()
             .await
             .is_ok();
-        if up && bound.len() == ips.len() && !stale_mesh && answers {
+        if up && bound.len() == ips.len() && !stale_mesh && has_cfg && answers {
             continue;
         }
         let _ = cmd("docker", &["rm", "-f", "latrix-registry"]).await;
         let dir = agent.data.join("registry");
         let _ = std::fs::create_dir_all(&dir);
+        let cfg_path = agent.data.join("registry-config.yml");
+        if std::fs::read_to_string(&cfg_path).ok().as_deref() != Some(REGISTRY_CONFIG) {
+            if let Err(e) = std::fs::write(&cfg_path, REGISTRY_CONFIG) {
+                warn!("could not write {}: {e}", cfg_path.display());
+                continue;
+            }
+        }
         let vol = format!("{}:/var/lib/registry", dir.display());
+        let cfg_vol = format!("{}:/etc/docker/registry/config.yml:ro", cfg_path.display());
         let mut args: Vec<String> = ["run", "-d", "--name", "latrix-registry", "--restart", "always"].iter().map(|s| s.to_string()).collect();
         for ip in &ips {
             args.push("-p".into());
             args.push(format!("{ip}:{REGISTRY_PORT}:5000"));
         }
-        args.extend(["-v".to_string(), vol, "-e".into(), "REGISTRY_STORAGE_DELETE_ENABLED=true".into(), "registry:2".into()]);
+        args.extend([
+            "-v".to_string(),
+            vol,
+            "-v".to_string(),
+            cfg_vol,
+            "-e".into(),
+            "REGISTRY_STORAGE_DELETE_ENABLED=true".into(),
+            "registry:2".into(),
+        ]);
         let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         match cmd("docker", &refs).await {
             Ok(_) => info!("started image registry on {}", ips.iter().map(|i| format!("{i}:{REGISTRY_PORT}")).collect::<Vec<_>>().join(", ")),
@@ -919,6 +980,25 @@ async fn refresh_build_cache_size(agent: &Agent) {
     }
 }
 
+const MANIFEST_ACCEPT: &str = "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json";
+
+async fn manifest_digest(client: &reqwest::Client, base: &str, repo: &str, tag: &str) -> Result<Option<String>> {
+    let resp = client
+        .head(format!("{base}/v2/{repo}/manifests/{tag}"))
+        .header("Accept", MANIFEST_ACCEPT)
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await?;
+    if !resp.status().is_success() {
+        return Ok(None);
+    }
+    Ok(resp
+        .headers()
+        .get("Docker-Content-Digest")
+        .and_then(|d| d.to_str().ok())
+        .map(|s| s.to_string()))
+}
+
 async fn gc_once(agent: &Arc<Agent>) -> Result<()> {
     let s = agent.snapshot();
     // Images worth keeping: the last 3 releases of every app.
@@ -953,9 +1033,9 @@ async fn gc_once(agent: &Arc<Agent>) -> Result<()> {
     let _ = cmd("docker", &["image", "prune", "-f"]).await;
     prune_build_cache(agent).await;
 
-    // Registry: delete old tags, then garbage-collect blobs (only when idle).
+    // Registry: delete old manifests, then garbage-collect blobs (only when idle).
     if agent.rt.builds_running.load(std::sync::atomic::Ordering::SeqCst) == 0 {
-        let base = format!("http://{}", agent.registry());
+        let base = format!("http://127.0.0.1:{REGISTRY_PORT}");
         let client = &agent.http;
         let catalog: serde_json::Value = client
             .get(format!("{base}/v2/_catalog"))
@@ -967,38 +1047,71 @@ async fn gc_once(agent: &Arc<Agent>) -> Result<()> {
         let mut deleted = 0;
         for repo in catalog["repositories"].as_array().cloned().unwrap_or_default() {
             let Some(repo) = repo.as_str() else { continue };
-            let tags: serde_json::Value = client
+            let tags_json: serde_json::Value = client
                 .get(format!("{base}/v2/{repo}/tags/list"))
+                .timeout(Duration::from_secs(5))
                 .send()
                 .await?
                 .json()
                 .await?;
-            for tag in tags["tags"].as_array().cloned().unwrap_or_default() {
-                let Some(tag) = tag.as_str() else { continue };
-                if keep_tags.get(repo).map(|t| t.contains(tag)).unwrap_or(false) {
+            let tags: Vec<String> = tags_json["tags"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                .collect();
+            let kept = keep_tags.get(repo);
+
+            // Resolve kept tags first: registry DELETE operates on manifest
+            // digests, so deleting an old tag that shares a digest with a kept
+            // release (e.g. cached rebuilds) would delete the kept release too.
+            let mut keep_digests: HashSet<String> = HashSet::new();
+            let mut keep_ok = true;
+            for tag in tags.iter().filter(|t| kept.map(|k| k.contains(t.as_str())).unwrap_or(false)) {
+                match manifest_digest(client, &base, repo, tag).await {
+                    Ok(Some(d)) => {
+                        keep_digests.insert(d);
+                    }
+                    _ => {
+                        keep_ok = false;
+                        break;
+                    }
+                }
+            }
+            if !keep_ok {
+                continue;
+            }
+
+            let mut deleted_digests: HashSet<String> = HashSet::new();
+            for tag in tags.iter().filter(|t| !kept.map(|k| k.contains(t.as_str())).unwrap_or(false)) {
+                let Ok(Some(d)) = manifest_digest(client, &base, repo, tag).await else { continue };
+                if keep_digests.contains(&d) || !deleted_digests.insert(d.clone()) {
                     continue;
                 }
-                let head = client
-                    .head(format!("{base}/v2/{repo}/manifests/{tag}"))
-                    .header(
-                        "Accept",
-                        "application/vnd.docker.distribution.manifest.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json",
-                    )
+                if client
+                    .delete(format!("{base}/v2/{repo}/manifests/{d}"))
+                    .timeout(Duration::from_secs(5))
                     .send()
-                    .await?;
-                if let Some(d) = head.headers().get("Docker-Content-Digest").and_then(|d| d.to_str().ok()) {
-                    let _ = client.delete(format!("{base}/v2/{repo}/manifests/{d}")).send().await;
+                    .await
+                    .map(|r| r.status().is_success())
+                    .unwrap_or(false)
+                {
                     deleted += 1;
                 }
             }
         }
         if deleted > 0 {
-            let _ = cmd(
+            if let Err(e) = cmd(
                 "docker",
                 &["exec", "latrix-registry", "registry", "garbage-collect", "--delete-untagged", "/etc/docker/registry/config.yml"],
             )
-            .await;
-            info!("registry cleanup: removed {deleted} old image tag(s)");
+            .await
+            {
+                warn!("registry garbage-collect failed: {e}");
+            } else {
+                info!("registry cleanup: removed {deleted} old image manifest(s)");
+            }
         }
     }
     Ok(())
@@ -1065,4 +1178,33 @@ pub async fn handle_logs(State(_agent): State<Arc<Agent>>, Query(q): Query<LogsQ
             .map(|l| (Ok::<_, std::io::Error>(bytes::Bytes::from(l)), (rx, child)))
     });
     Body::from_stream(stream).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn registry_config_disables_inmemory_cache() {
+        let doc: serde_yaml::Value = serde_yaml::from_str(REGISTRY_CONFIG).expect("valid YAML");
+        assert_eq!(doc["storage"]["delete"]["enabled"].as_bool(), Some(true));
+        assert!(doc["storage"]["cache"].is_null());
+        assert!(!REGISTRY_CONFIG.contains("inmemory"));
+    }
+
+    #[test]
+    fn summarize_pull_errors() {
+        assert_eq!(
+            summarize_pull_error(
+                "docker pull -q 10.77.0.4:7471/app:1 failed: Error response from daemon: failed to resolve reference \"10.77.0.4:7471/app:1\": 10.77.0.4:7471/app:1: not found"
+            ),
+            "not found"
+        );
+        assert_eq!(
+            summarize_pull_error(
+                "docker pull -q 10.77.0.1:7471/app:1 failed: short read: expected 28247960 bytes but got 0: unexpected EOF"
+            ),
+            "short read: expected 28247960 bytes but got 0: unexpected EOF"
+        );
+    }
 }

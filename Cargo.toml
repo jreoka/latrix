@@ -1,6 +1,6 @@
 [package]
 name = "latrix"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2021"
 description = "A tiny self-managing cluster: deploy apps across your servers as if they were one machine."
 license = "MIT"
