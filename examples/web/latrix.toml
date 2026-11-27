@@ -1,0 +1,15 @@
+# A typical web app: built from ./Dockerfile, two instances, HTTPS on a custom domain.
+app = "web"
+
+[http]
+port = 3000
+domains = ["www.example.com"]
+health = "/healthz"
+
+[scale]
+count = 2
+cpu = 0.5
+memory = "512MB"
+
+[env]
+NODE_ENV = "production"

@@ -1,0 +1,21 @@
+# PostgreSQL with a replicated volume. Other apps connect to
+# postgres://postgres:<password>@postgres.internal:5432/postgres
+#
+#   latrix secrets set postgres POSTGRES_PASSWORD=change-me
+app = "postgres"
+
+[build]
+image = "postgres:16"
+
+[scale]
+cpu = 1
+memory = "1GB"
+
+[[volumes]]
+name = "data"
+path = "/var/lib/postgresql/data"
+copies = 2
+sync = "15s"
+
+[deploy]
+stop_timeout = "30s"   # let postgres shut down cleanly before a move

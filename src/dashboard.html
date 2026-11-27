@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>latrix</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #ffffff; --text: #16181d; --muted: #6b7280; --line: #e5e7eb;
+  --accent: #4f46e5; --ok: #059669; --warn: #d97706; --bad: #dc2626; --track: #eef0f3;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1014; --panel: #161920; --text: #e7e9ee; --muted: #8b93a3; --line: #262b35;
+    --accent: #818cf8; --ok: #34d399; --warn: #fbbf24; --bad: #f87171; --track: #222733;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text);
+  font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: .4rem 1.2rem;
+  padding: 1.1rem 1.5rem; border-bottom: 1px solid var(--line); background: var(--panel); }
+header h1 { margin: 0; font-size: 1.15rem; letter-spacing: -.01em; }
+header h1 span { color: var(--accent); }
+.meta { color: var(--muted); display: flex; flex-wrap: wrap; gap: .3rem 1rem; }
+.meta b { color: var(--text); font-weight: 600; }
+main { max-width: 1200px; margin: 0 auto; padding: 1.25rem 1.5rem 3rem; display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.5rem; }
+main > section { min-width: 0; }
+h2 { font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin: 0 0 .6rem; }
+.grid { display: grid; gap: .9rem; grid-template-columns: repeat(auto-fill, minmax(min(260px, 100%), 1fr)); }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: .9rem 1rem; }
+.card h3 { margin: 0; font-size: 1rem; display: flex; align-items: center; gap: .5rem; }
+.sub { color: var(--muted); font-size: .82rem; margin: .15rem 0 .7rem; overflow-wrap: anywhere; }
+.badge { font-size: .72rem; font-weight: 600; padding: .1rem .45rem; border-radius: 999px;
+  border: 1px solid currentColor; text-transform: lowercase; }
+.ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); } .mutedc { color: var(--muted); }
+.meter { display: grid; grid-template-columns: 3.2rem 1fr 3.2rem; align-items: center; gap: .5rem; font-size: .8rem; margin: .3rem 0; }
+.meter .label { color: var(--muted); }
+.meter .val { text-align: right; font-variant-numeric: tabular-nums; }
+.bar { height: 6px; background: var(--track); border-radius: 3px; overflow: hidden; }
+.bar i { display: block; height: 100%; background: var(--accent); border-radius: 3px; transition: width .4s; }
+.bar i.hot { background: var(--warn); } .bar i.crit { background: var(--bad); }
+.kv { display: flex; flex-wrap: wrap; gap: .2rem 1rem; font-size: .8rem; color: var(--muted); margin-top: .5rem; }
+.kv b { color: var(--text); font-weight: 600; }
+.table { width: 100%; min-width: 560px; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.tablewrap { overflow-x: auto; border-radius: 10px; }
+.table th, .table td { text-align: left; padding: .6rem .8rem; border-bottom: 1px solid var(--line); vertical-align: top; }
+.table th { font-size: .74rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 600; }
+.table tr:last-child td { border-bottom: 0; }
+.dots { display: flex; flex-wrap: wrap; gap: .25rem; }
+.dot { width: .7rem; height: .7rem; border-radius: 50%; background: var(--track); display: inline-block; }
+.dot.ok { background: var(--ok); } .dot.warn { background: var(--warn); } .dot.bad { background: var(--bad); }
+a { color: var(--accent); text-decoration: none; } a:hover { text-decoration: underline; }
+.events { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: .4rem 0; }
+.ev { display: grid; grid-template-columns: 5.5rem 1fr; gap: .8rem; padding: .35rem 1rem; font-size: .85rem; }
+.ev time { color: var(--muted); font-variant-numeric: tabular-nums; }
+.empty { color: var(--muted); padding: .8rem 1rem; }
+.err { background: var(--bad); color: #fff; padding: .6rem 1.5rem; display: none; }
+code { font: .8rem ui-monospace, SFMono-Regular, Menlo, monospace; }
+@media (max-width: 600px) { header, main { padding-left: 1rem; padding-right: 1rem; } .ev { grid-template-columns: 4.5rem 1fr; } }
+</style>
+</head>
+<body>
+<div class="err" id="err"></div>
+<header>
+  <h1><span>◆</span> latrix <span id="cluster" class="mutedc" style="color:var(--muted)"></span></h1>
+  <div class="meta" id="meta"></div>
+</header>
+<main>
+  <section><h2>Machines</h2><div class="grid" id="machines"></div></section>
+  <section><h2>Apps</h2><div class="tablewrap"><table class="table" id="apps"></table></div></section>
+  <section><h2>Volumes</h2><div class="tablewrap"><table class="table" id="volumes"></table></div></section>
+  <section><h2>Recent events</h2><div class="events" id="events"></div></section>
+</main>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const ago = (ts) => {
+  if (!ts) return "never";
+  const s = Math.max(0, Math.floor(Date.now() / 1000 - ts));
+  if (s < 60) return s + "s ago";
+  if (s < 3600) return Math.floor(s / 60) + "m ago";
+  if (s < 86400) return Math.floor(s / 3600) + "h ago";
+  return Math.floor(s / 86400) + "d ago";
+};
+const pct = (a, b) => (b > 0 ? Math.min(100, (a / b) * 100) : 0);
+const meter = (label, p, text) => {
+  const cls = p > 90 ? "crit" : p > 75 ? "hot" : "";
+  return `<div class="meter"><span class="label">${label}</span><div class="bar"><i class="${cls}" style="width:${p.toFixed(1)}%"></i></div><span class="val">${text}</span></div>`;
+};
+const statusClass = (s, alive) => !alive ? "bad" : s === "ready" ? "ok" : s === "cordoned" ? "mutedc" : "warn";
+
+function render(st) {
+  $("cluster").textContent = "· " + st.cluster;
+  const leader = st.machines.find((m) => m.machine.id === st.leader);
+  const inst = st.apps.reduce((n, a) => n + a.instances.filter((i) => !i.instance.stopping).length, 0);
+  let meta = `<span>leader <b>${esc(leader ? leader.machine.name : "electing…")}</b></span>
+    <span><b>${st.machines.length}</b> machines</span><span><b>${st.apps.length}</b> apps</span><span><b>${inst}</b> instances</span>`;
+  if (st.monthly_cost > 0) {
+    const over = st.settings.monthly_budget > 0 && st.monthly_cost > st.settings.monthly_budget;
+    meta += `<span>est. <b class="${over ? "bad" : ""}">${st.monthly_cost.toFixed(2)}</b>/month${st.settings.monthly_budget > 0 ? " of " + st.settings.monthly_budget.toFixed(2) : ""}</span>`;
+  }
+  meta += `<span>auto-updates <b>${st.settings.auto_updates ? "on" : "off"}</b>${st.settings.auto_updates && st.settings.update_window ? " (" + esc(st.settings.update_window) + " UTC)" : ""}</span>`;
+  $("meta").innerHTML = meta;
+
+  $("machines").innerHTML = st.machines.map((m) => {
+    const x = m.metrics || {};
+    const s = m.alive ? m.machine.status : "down";
+    const upd = m.updates && m.updates.checked_at ? (m.updates.pending ? `${m.updates.pending} updates${m.updates.reboot_required ? " + reboot" : ""}` : "up to date") : "–";
+    return `<div class="card">
+      <h3>${esc(m.machine.name)} <span class="badge ${statusClass(m.machine.status, m.alive)}">${esc(s)}</span>${m.leader ? ' <span class="badge mutedc">leader</span>' : ""}</h3>
+      <div class="sub">${esc(m.machine.public_ip)} · ${esc(m.machine.overlay_ip)} · ${esc(m.machine.os || m.machine.arch)}</div>
+      ${meter("cpu", x.cpu_pct || 0, (x.cpu_pct || 0).toFixed(0) + "%")}
+      ${meter("mem", pct(x.mem_used_mb, x.mem_total_mb), ((x.mem_used_mb || 0) / 1024).toFixed(1) + "G")}
+      ${meter("disk", pct(x.disk_used_gb, x.disk_total_gb), (x.disk_used_gb || 0).toFixed(0) + "G")}
+      ${meter("rsvd", pct(m.reserved_mb, x.mem_total_mb || m.machine.memory_mb), (m.reserved_mb / 1024).toFixed(1) + "G")}
+      <div class="kv"><span><b>${m.instances}</b> instance${m.instances === 1 ? "" : "s"}</span><span>${esc(upd)}</span>
+      ${m.build_cache_gb > 0.05 ? `<span>cache <b>${m.build_cache_gb.toFixed(1)}G</b></span>` : ""}
+      ${m.machine.monthly_cost ? `<span><b>${m.machine.monthly_cost.toFixed(2)}</b>/mo</span>` : ""}
+      ${m.machine.region ? `<span>${esc(m.machine.region)}</span>` : ""}</div>
+    </div>`;
+  }).join("") || '<div class="empty">No machines.</div>';
+
+  const rows = st.apps.map((a) => {
+    const live = a.instances.filter((i) => !i.instance.stopping);
+    const healthy = live.filter((i) => i.report && i.report.healthy).length;
+    const dots = live.map((i) => {
+      const r = i.report;
+      const c = r && r.healthy ? "ok" : r && r.status === "failed" ? "bad" : "warn";
+      return `<span class="dot ${c}" title="${esc(i.instance.id)} on ${esc(i.machine_name)} · v${i.instance.release} · ${esc(r ? r.status : "pending")}"></span>`;
+    }).join("");
+    const rs = a.release_status || "";
+    const rc = rs === "active" ? "ok" : rs === "failed" ? "bad" : "warn";
+    const urls = a.urls.map((u) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(u.replace(/^https?:\/\//, ""))}</a>`).join("<br>");
+    const machines = [...new Set(live.map((i) => i.machine_name))].join(", ");
+    return `<tr>
+      <td><b>${esc(a.name)}</b>${a.group ? `<div class="sub">${esc(a.group)}</div>` : ""}</td>
+      <td>v${a.current} <span class="badge ${rc}">${esc(rs)}</span></td>
+      <td><div class="dots">${dots}</div><div class="sub">${healthy}/${a.count} healthy${a.autoscale ? ` · autoscale ${a.min}–${a.max}` : ""}</div></td>
+      <td class="sub">${a.cpu} cpu · ${esc(a.memory)}${a.stateful ? " · volume" : ""}<br>${esc(machines)}</td>
+      <td>${urls || `<code>${esc(a.internal[0] || "")}</code>`}</td>
+    </tr>`;
+  }).join("");
+  $("apps").innerHTML = `<tr><th>App</th><th>Release</th><th>Instances</th><th>Resources</th><th>Address</th></tr>` +
+    (rows || `<tr><td colspan="5" class="empty">No apps yet — run <code>latrix launch</code> and <code>latrix deploy</code>.</td></tr>`);
+
+  const vols = st.apps.flatMap((a) => a.volumes);
+  $("volumes").innerHTML = `<tr><th>Volume</th><th>Primary</th><th>Replicas</th><th>Size</th><th>Last sync</th></tr>` +
+    (vols.map((v) => {
+      const r = v.report || {};
+      const syncs = Object.values(r.synced || {});
+      const last = syncs.length ? Math.min(...syncs) : 0;
+      return `<tr><td><b>${esc(v.volume.app)}/${esc(v.volume.name)}</b><div class="sub"><code>${esc(v.volume.path)}</code></div></td>
+        <td>${esc(v.primary_name)}${v.volume.moving_to ? ' <span class="badge warn">moving</span>' : ""}</td>
+        <td>${esc(v.replica_names.join(", ") || "–")}</td><td>${r.size_mb ?? 0} MB</td>
+        <td class="${r.error ? "bad" : ""}">${v.volume.replicas.length ? ago(last) : "–"}${r.error ? "<div class='sub'>" + esc(r.error) + "</div>" : ""}</td></tr>`;
+    }).join("") || `<tr><td colspan="5" class="empty">No volumes.</td></tr>`);
+
+  $("events").innerHTML = st.events.map((e) =>
+    `<div class="ev"><time>${ago(e.ts)}</time><span class="${e.level === "warn" ? "warn" : ""}">${esc(e.message)}</span></div>`
+  ).join("") || '<div class="empty">Nothing has happened yet.</div>';
+}
+
+async function tick() {
+  try {
+    const r = await fetch("/v1/status", { cache: "no-store" });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.statusText);
+    render(await r.json());
+    $("err").style.display = "none";
+  } catch (e) {
+    $("err").textContent = "Cannot reach the cluster: " + e.message + " (retrying)";
+    $("err").style.display = "block";
+  }
+}
+tick();
+setInterval(tick, 3000);
+</script>
+</body>
+</html>

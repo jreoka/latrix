@@ -1,0 +1,13 @@
+#!/bin/bash
+# Minimal systemctl stand-in for the test containers (no systemd inside).
+cmd="$1"; shift; svc=""
+for a in "$@"; do case "$a" in --*) ;; *) svc="${a%.service}";; esac; done
+start_latrix() { pkill -f "latrix agent run"; sleep 1; setsid nohup /usr/local/bin/latrix agent run </dev/null >>/var/log/latrix.log 2>&1 & }
+case "$cmd" in
+  daemon-reload|enable) exit 0 ;;
+  disable) [[ "$*" == *--now* && "$svc" == latrix ]] && pkill -f "latrix agent run"; exit 0 ;;
+  is-active) if [ "$svc" = docker ]; then pgrep -x dockerd >/dev/null; else pgrep -f "latrix agent run" >/dev/null; fi ;;
+  start|restart) [ "$svc" = latrix ] && start_latrix; exit 0 ;;
+  stop) [ "$svc" = latrix ] && pkill -f "latrix agent run"; exit 0 ;;
+  *) exit 0 ;;
+esac

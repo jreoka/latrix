@@ -1,0 +1,13 @@
+# A background worker from a git repo, autoscaled on CPU/memory.
+app = "worker"
+command = "python worker.py"
+
+[build]
+git = "https://github.com/me/worker"
+branch = "main"
+
+[scale]
+min = 1
+max = 5
+cpu = 1
+memory = "512MB"
