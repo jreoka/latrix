@@ -32,9 +32,41 @@ fn sanitize(name: &str) -> String {
     }
 }
 
-/// Terminal width when stdout is an interactive terminal (and colors aren't
-/// disabled with NO_COLOR / LATRIX_PLAIN); None means plain text output.
-pub fn tty_width() -> Option<u16> {
+/// Returned when the user cancels a deploy or stops watching with Ctrl+C.
+#[derive(Debug)]
+pub struct DeployCancelled;
+
+impl std::fmt::Display for DeployCancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for DeployCancelled {}
+
+struct TempFile(PathBuf);
+
+impl Drop for TempFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+struct TtyReset(bool);
+
+impl Drop for TtyReset {
+    fn drop(&mut self) {
+        if self.0 {
+            let mut out = std::io::stdout();
+            let _ = out.write_all(b"\x1b[?2026l\x1b[0m\x1b[?25h");
+            let _ = out.flush();
+        }
+    }
+}
+
+/// Terminal `(cols, rows)` when stdout is an interactive terminal (and colors
+/// aren't disabled with NO_COLOR / LATRIX_PLAIN); None means plain text output.
+pub fn tty_size() -> Option<(u16, u16)> {
     use std::io::IsTerminal;
     if !std::io::stdout().is_terminal()
         || std::env::var_os("NO_COLOR").is_some()
@@ -47,7 +79,84 @@ pub fn tty_width() -> Option<u16> {
     if enable_ansi_support::enable_ansi_support().is_err() {
         return None;
     }
-    Some(terminal_size::terminal_size().map(|(w, _)| w.0).unwrap_or(100))
+    let (w, h) = terminal_size::terminal_size()
+        .map(|(w, h)| (w.0, h.0))
+        .unwrap_or((100, 24));
+    Some((w, h))
+}
+
+/// Terminal width when stdout is an interactive terminal (and colors aren't
+/// disabled with NO_COLOR / LATRIX_PLAIN); None means plain text output.
+pub fn tty_width() -> Option<u16> {
+    tty_size().map(|(w, _)| w)
+}
+
+fn push_valid_utf8(carry: &mut Vec<u8>, bytes: &[u8], out: &mut String) {
+    carry.extend_from_slice(bytes);
+    let valid = match std::str::from_utf8(carry) {
+        Ok(_) => carry.len(),
+        Err(e) if e.error_len().is_none() => e.valid_up_to(),
+        Err(_) => carry.len(),
+    };
+    if valid > 0 {
+        let chunk: Vec<u8> = carry.drain(..valid).collect();
+        out.push_str(&String::from_utf8_lossy(&chunk));
+    }
+}
+
+/// True if `tail` (which starts with ESC) is a truncated CSI or OSC sequence.
+fn is_incomplete_ansi(tail: &str) -> bool {
+    let b = tail.as_bytes();
+    if b.is_empty() || b[0] != 0x1b {
+        return false;
+    }
+    if b.len() == 1 {
+        return true;
+    }
+    match b[1] {
+        b'[' => {
+            // CSI ends at a final byte in 0x40..=0x7E. Cap length so malformed
+            // input can't stall output forever.
+            b.len() < 64 && !b[2..].iter().any(|&c| (0x40..=0x7e).contains(&c))
+        }
+        b']' => {
+            // OSC ends at BEL or ST (ESC \).
+            b.len() < 256 && !b[2..].contains(&0x07) && !tail[2..].contains("\x1b\\")
+        }
+        _ => false,
+    }
+}
+
+/// Number of trailing bytes to hold back so we neither split `marker` nor
+/// flush an incomplete ANSI escape sequence.
+fn tail_keep_len(s: &str, marker: &str) -> usize {
+    let mut keep = 0;
+    let max = s.len().min(marker.len().saturating_sub(1));
+    for k in (1..=max).rev() {
+        if s.is_char_boundary(s.len() - k) && marker.starts_with(&s[s.len() - k..]) {
+            keep = k;
+            break;
+        }
+    }
+    if let Some(esc) = s[..s.len() - keep].rfind('\x1b') {
+        if is_incomplete_ansi(&s[esc..]) {
+            keep = s.len() - esc;
+        }
+    }
+    keep
+}
+
+fn write_raw_frame(out: &mut impl Write, data: &[u8]) -> std::io::Result<()> {
+    if data.is_empty() {
+        return Ok(());
+    }
+    // DEC mode 2026 (Synchronized Output): terminals that support it (Windows
+    // Terminal, iTerm2, Kitty, Alacritty, WezTerm, Ghostty) apply the whole
+    // cursor-up + redraw atomically without flicker; others ignore it.
+    out.write_all(b"\x1b[?2026h")?;
+    out.write_all(data)?;
+    out.write_all(b"\x1b[?2026l")?;
+    out.flush()
 }
 
 /// "==>" in bold blue on a terminal, plain otherwise.
@@ -148,6 +257,7 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
     let plan: BuildPlan = client
         .post(&format!("/v1/apps/{}/build-plan", app.app), &serde_json::json!({}))
         .await?;
+    let tty = tty_size();
     let req = BuildRequest {
         app: app.app.clone(),
         tag: plan.tag.clone(),
@@ -158,13 +268,15 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
         branch: app.build.branch.clone(),
         context: app.build.context.clone(),
         cache_from: plan.cache_from.clone(),
-        tty_cols: tty_width(),
+        tty_cols: tty.map(|(w, _)| w),
+        tty_rows: tty.map(|(_, h)| h),
     };
     let header = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&req)?);
+    // Keep TempFile declared before `rb` so the file handle closes before removal on Windows.
+    let mut _cleanup: Option<TempFile> = None;
     let mut rb = client
         .request(reqwest::Method::POST, &format!("/v1/m/{}/build", plan.machine))
         .header(BUILD_HEADER, header);
-    let mut cleanup = None;
     if app.build.git.is_none() {
         let ctx = base.join(app.build.context.as_deref().unwrap_or("."));
         if !ctx.is_dir() {
@@ -178,32 +290,72 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
             plan.machine_name
         );
         let f = tokio::fs::File::open(&archive).await?;
+        _cleanup = Some(TempFile(archive));
         rb = rb.body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(f)));
-        cleanup = Some(archive);
     } else {
         println!("{} Building {} from git on {}", arrow(), app.build.git.as_deref().unwrap(), plan.machine_name);
     }
-    let resp = rb.send().await;
-    if let Some(p) = cleanup {
-        let _ = std::fs::remove_file(p);
-    }
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
+    let resp = tokio::select! {
+        r = rb.send() => r,
+        _ = &mut ctrl_c => {
+            println!("\nCancelled build — nothing was deployed.");
+            return Err(DeployCancelled.into());
+        }
+    };
+    drop(_cleanup);
     let resp = resp?;
     if !resp.status().is_success() {
         bail!("build request failed: {} {}", resp.status(), resp.text().await.unwrap_or_default());
     }
     let mut stream = resp.bytes_stream();
+    let mut raw_carry: Vec<u8> = Vec::new();
     let mut buf = String::new();
     let mut result: Option<BuildResult> = None;
     let raw = req.tty_cols.is_some();
+    let _tty_reset = TtyReset(raw);
     let mut out = std::io::stdout();
-    while let Some(chunk) = stream.next().await {
-        buf.push_str(&String::from_utf8_lossy(&chunk?));
+    let mut eof = false;
+    while !eof {
+        let first = tokio::select! {
+            c = stream.next() => c,
+            _ = &mut ctrl_c => {
+                drop(stream);
+                drop(_tty_reset);
+                println!("\nCancelled build — nothing was deployed.");
+                return Err(DeployCancelled.into());
+            }
+        };
+        let Some(chunk) = first else { break };
+        push_valid_utf8(&mut raw_carry, &chunk?, &mut buf);
         if raw {
+            // Coalesce back-to-back TCP chunks of the same BuildKit redraw
+            // before painting inside a single synchronized update.
+            while buf.len() < 64 * 1024 && !buf.contains(BUILD_RESULT_PREFIX) {
+                let next = tokio::select! {
+                    r = tokio::time::timeout(Duration::from_millis(8), stream.next()) => r,
+                    _ = &mut ctrl_c => {
+                        drop(stream);
+                        drop(_tty_reset);
+                        println!("\nCancelled build — nothing was deployed.");
+                        return Err(DeployCancelled.into());
+                    }
+                };
+                match next {
+                    Ok(Some(c)) => push_valid_utf8(&mut raw_carry, &c?, &mut buf),
+                    Ok(None) => {
+                        eof = true;
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
             // Docker's live view: print everything as it arrives, except the
             // final result line (which may be split across chunks).
             match buf.find(BUILD_RESULT_PREFIX) {
                 Some(i) => {
-                    out.write_all(&buf.as_bytes()[..i])?;
+                    write_raw_frame(&mut out, &buf.as_bytes()[..i])?;
                     buf.drain(..i);
                     if let Some(end) = buf.find('\n') {
                         let line: String = buf.drain(..=end).collect();
@@ -211,17 +363,12 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
                     }
                 }
                 None => {
-                    // Keep a possible partial marker at the end.
-                    let keep = (BUILD_RESULT_PREFIX.len()).min(buf.len());
-                    let mut cut = buf.len() - keep;
-                    while !buf.is_char_boundary(cut) {
-                        cut -= 1;
-                    }
-                    out.write_all(&buf.as_bytes()[..cut])?;
+                    let keep = tail_keep_len(&buf, BUILD_RESULT_PREFIX);
+                    let cut = buf.len() - keep;
+                    write_raw_frame(&mut out, &buf.as_bytes()[..cut])?;
                     buf.drain(..cut);
                 }
             }
-            out.flush()?;
             continue;
         }
         while let Some(i) = buf.find('\n') {
@@ -234,10 +381,19 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
             }
         }
     }
-    if raw {
-        print!("\x1b[0m\x1b[?25h"); // reset colors, show the cursor
-        let _ = out.flush();
+    if !raw_carry.is_empty() {
+        buf.push_str(&String::from_utf8_lossy(&raw_carry));
     }
+    if raw && !buf.is_empty() {
+        if let Some(i) = buf.find(BUILD_RESULT_PREFIX) {
+            write_raw_frame(&mut out, &buf.as_bytes()[..i])?;
+            let rest = &buf[i + BUILD_RESULT_PREFIX.len()..];
+            result = serde_json::from_str(rest.trim()).ok();
+        } else {
+            write_raw_frame(&mut out, buf.as_bytes())?;
+        }
+    }
+    drop(_tty_reset);
     let r = result.ok_or_else(|| anyhow!("build connection closed before finishing"))?;
     if !r.ok {
         let e = r.error.unwrap_or_default();
@@ -290,16 +446,37 @@ pub async fn watch(client: &Client, app: &str, version: u64, health_timeout: u64
         .map(|v| v.iter().map(event_key).collect())
         .unwrap_or_default();
     let prefix = format!("{app}: ");
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     loop {
-        tokio::time::sleep(Duration::from_secs(2)).await;
-        if let Ok(evs) = client.get::<Vec<crate::state::Event>>("/v1/events").await {
-            for e in evs {
-                if seen.insert(event_key(&e)) && e.level == "warn" && e.message.starts_with(&prefix) {
-                    println!("    ! {}", &e.message[prefix.len()..]);
-                }
+        tokio::select! {
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+            _ = &mut ctrl_c => {
+                println!(
+                    "\nStopped watching — release v{version} is still rolling out on the cluster.\n  Check progress: latrix ps {app}\n  Undo rollout:   latrix rollback {app}"
+                );
+                return Err(DeployCancelled.into());
             }
         }
-        let v: AppView = client.get(&format!("/v1/apps/{app}")).await?;
+        let poll = async {
+            if let Ok(evs) = client.get::<Vec<crate::state::Event>>("/v1/events").await {
+                for e in evs {
+                    if seen.insert(event_key(&e)) && e.level == "warn" && e.message.starts_with(&prefix) {
+                        println!("    ! {}", &e.message[prefix.len()..]);
+                    }
+                }
+            }
+            client.get::<AppView>(&format!("/v1/apps/{app}")).await
+        };
+        let v = tokio::select! {
+            r = poll => r?,
+            _ = &mut ctrl_c => {
+                println!(
+                    "\nStopped watching — release v{version} is still rolling out on the cluster.\n  Check progress: latrix ps {app}\n  Undo rollout:   latrix rollback {app}"
+                );
+                return Err(DeployCancelled.into());
+            }
+        };
         let status = v.releases.iter().find(|r| r.version == version).map(|r| r.status.clone());
         let mine: Vec<&InstanceView> = v
             .instances
@@ -358,5 +535,37 @@ pub async fn watch(client: &Client, app: &str, version: u64, health_timeout: u64
             println!("still rolling out in the background — check `latrix ps {app}`");
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tail_keep_does_not_hold_back_complete_frames() {
+        assert_eq!(tail_keep_len("=> [builder 5/7] RUN cargo build\x1b[0m\r\n", BUILD_RESULT_PREFIX), 0);
+        assert_eq!(tail_keep_len("\x1b[28Ahello world\x1b[K", BUILD_RESULT_PREFIX), 0);
+    }
+
+    #[test]
+    fn tail_keep_holds_partial_marker_and_partial_ansi() {
+        assert_eq!(tail_keep_len("done\nLATRIX_RES", BUILD_RESULT_PREFIX), "LATRIX_RES".len());
+        assert_eq!(tail_keep_len("done\nL", BUILD_RESULT_PREFIX), 1);
+        assert_eq!(tail_keep_len("hello\x1b[38;5;", BUILD_RESULT_PREFIX), "\x1b[38;5;".len());
+        assert_eq!(tail_keep_len("hello\x1b", BUILD_RESULT_PREFIX), 1);
+        assert_eq!(tail_keep_len("hello\x1b[38;5;242m", BUILD_RESULT_PREFIX), 0);
+    }
+
+    #[test]
+    fn push_valid_utf8_handles_split_multibyte_chars() {
+        let mut carry = Vec::new();
+        let mut out = String::new();
+        let bytes = "✓ ok".as_bytes();
+        push_valid_utf8(&mut carry, &bytes[..2], &mut out);
+        assert_eq!(out, "");
+        push_valid_utf8(&mut carry, &bytes[2..], &mut out);
+        assert_eq!(out, "✓ ok");
+        assert!(carry.is_empty());
     }
 }

@@ -66,6 +66,10 @@ pub struct BuildRequest {
     /// is streamed as-is (built in a pseudo-terminal of that width).
     #[serde(default)]
     pub tty_cols: Option<u16>,
+    /// Your terminal's height (rows). When omitted by an older CLI, the
+    /// builder falls back to a safe default so live output doesn't overflow.
+    #[serde(default)]
+    pub tty_rows: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

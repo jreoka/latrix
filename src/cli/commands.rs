@@ -927,6 +927,9 @@ async fn deploy_cmd(cfg: &CliConfig, cl: Option<&str>, args: DeployArgs) -> Resu
                 println!("warning ({}): {w}", a.config.app);
             }
             if let Err(e) = deploy::deploy_one(&c, &a.config, &a.base, args.detach, args.message.clone()).await {
+                if e.is::<deploy::DeployCancelled>() {
+                    return Err(e);
+                }
                 println!("✗ {}: {e:#}", a.config.app);
                 failed.push(a.config.app.clone());
             }

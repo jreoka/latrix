@@ -31,6 +31,9 @@ async fn main() {
         .with_target(false)
         .init();
     if let Err(e) = Box::pin(cli::commands::run(cli)).await {
+        if e.is::<cli::deploy::DeployCancelled>() {
+            std::process::exit(130);
+        }
         eprintln!("error: {e:#}");
         std::process::exit(1);
     }

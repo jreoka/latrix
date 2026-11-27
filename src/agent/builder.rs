@@ -51,6 +51,10 @@ pub async fn handle_build(State(agent): State<Arc<Agent>>, req: Request) -> Resp
         return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
     }
     let archive = work.with_extension("tar.gz");
+    let cleanup = BuildCleanup {
+        work: work.clone(),
+        archive: archive.clone(),
+    };
     let mut received = 0u64;
     if spec.git.is_none() {
         let mut file = match tokio::fs::File::create(&archive).await {
@@ -74,24 +78,36 @@ pub async fn handle_build(State(agent): State<Arc<Agent>>, req: Request) -> Resp
 
     let (tx, rx) = mpsc::channel::<String>(512);
     tokio::spawn(async move {
+        let _cleanup = cleanup;
+        let _guard = BuildGuard::new(agent.clone());
         let started = Instant::now();
-        agent.rt.builds_running.fetch_add(1, Ordering::SeqCst);
         let image = format!("{}/{}:{}", agent.registry(), spec.app, spec.tag);
         let arrow = if spec.tty_cols.is_some() { "\x1b[1;34m==>\x1b[0m" } else { "==>" };
-        let _ = tx
+        if tx
             .send(format!(
                 "{arrow} building {} on machine #{} ({:.1} MB context)\n",
                 spec.app,
                 agent.me.machine_id,
                 received as f64 / 1048576.0
             ))
-            .await;
-        let res = build(&agent, &spec, &work, &archive, &image, &tx).await;
-        agent.rt.builds_running.fetch_sub(1, Ordering::SeqCst);
-        let _ = std::fs::remove_dir_all(&work);
-        let _ = std::fs::remove_file(&archive);
+            .await
+            .is_err()
+        {
+            info!("build of {} cancelled before start (client disconnected)", spec.app);
+            return;
+        }
+        let res = tokio::select! {
+            r = build(&agent, &spec, &work, &archive, &image, &tx) => Some(r),
+            _ = tx.closed() => {
+                info!("build of {} cancelled after {}s (client disconnected)", spec.app, started.elapsed().as_secs());
+                None
+            }
+        };
+        drop(_guard);
+        drop(_cleanup);
         // Keep the build cache within budget after every build.
         super::runtime::prune_build_cache(&agent).await;
+        let Some(res) = res else { return };
         let result = BuildResult {
             ok: res.is_ok(),
             image: image.clone(),
@@ -109,6 +125,35 @@ pub async fn handle_build(State(agent): State<Arc<Agent>>, req: Request) -> Resp
             .map(|l| (Ok::<_, std::io::Error>(bytes::Bytes::from(l)), rx))
     });
     Body::from_stream(stream).into_response()
+}
+
+struct BuildCleanup {
+    work: PathBuf,
+    archive: PathBuf,
+}
+
+impl Drop for BuildCleanup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.work);
+        let _ = std::fs::remove_file(&self.archive);
+    }
+}
+
+struct BuildGuard {
+    agent: Arc<Agent>,
+}
+
+impl BuildGuard {
+    fn new(agent: Arc<Agent>) -> Self {
+        agent.rt.builds_running.fetch_add(1, Ordering::SeqCst);
+        Self { agent }
+    }
+}
+
+impl Drop for BuildGuard {
+    fn drop(&mut self) {
+        self.agent.rt.builds_running.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 async fn build(
@@ -193,18 +238,23 @@ async fn build(
     args.push(ctx.display().to_string());
     let bk = if buildkit { "1" } else { "0" };
     let tty = match spec.tty_cols {
-        Some(cols) if buildkit && cmd("sh", &["-c", "command -v script"]).await.is_ok() => Some(cols.clamp(40, 400)),
+        Some(cols) if buildkit && cmd("sh", &["-c", "command -v script"]).await.is_ok() => {
+            // Leave 2 rows of headroom so BuildKit's cursor-up redraws never
+            // hit the top of the viewport and scroll/duplicate lines.
+            let rows = spec.tty_rows.unwrap_or(24).saturating_sub(2).clamp(10, 200);
+            Some((cols.clamp(40, 400), rows))
+        }
         _ => None,
     };
-    if let Some(cols) = tty {
+    if let Some((cols, rows)) = tty {
         // Docker's own live, colored progress view (it needs a terminal).
         let mut a = args.clone();
         a.insert(1, "--progress=tty".into());
         a.retain(|x| x != "--progress=plain");
-        run_in_pty(&format!("DOCKER_BUILDKIT=1 docker {}", shell_join(&a)), cols, tx).await?;
+        run_in_pty(&format!("docker {}", shell_join(&a)), &[("DOCKER_BUILDKIT", "1")], cols, rows, tx).await?;
         let _ = tx.send(format!("\n\x1b[1;34m==>\x1b[0m pushing {image} to the cluster registry\n")).await;
         let local = local_alias(image).await?;
-        run_in_pty(&format!("docker push {}", crate::util::shell_quote(&local)), cols, tx).await?;
+        run_in_pty(&format!("docker push {}", crate::util::shell_quote(&local)), &[], cols, rows, tx).await?;
         return Ok(());
     }
     run_streaming("docker", &args, &[("DOCKER_BUILDKIT", bk)], tx).await?;
@@ -287,13 +337,22 @@ fn shell_join(args: &[String]) -> String {
     args.iter().map(|a| crate::util::shell_quote(a)).collect::<Vec<_>>().join(" ")
 }
 
-/// Run a shell command in a pseudo-terminal of `cols` columns (via util-linux
+/// Run a shell command in a pseudo-terminal of `cols`×`rows` (via util-linux
 /// `script`) and forward its raw output, escape sequences included.
-async fn run_in_pty(command: &str, cols: u16, tx: &mpsc::Sender<String>) -> Result<()> {
+async fn run_in_pty(
+    command: &str,
+    envs: &[(&str, &str)],
+    cols: u16,
+    rows: u16,
+    tx: &mpsc::Sender<String>,
+) -> Result<()> {
     use tokio::io::AsyncReadExt;
-    let inner = format!("stty cols {cols} rows 50 2>/dev/null; {command}");
+    let inner = format!("stty cols {cols} rows {rows} 2>/dev/null; exec {command}");
     let mut child = tokio::process::Command::new("script")
         .args(["-qfec", &inner, "/dev/null"])
+        .envs(envs.iter().cloned())
+        .env("COLUMNS", cols.to_string())
+        .env("LINES", rows.to_string())
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -303,20 +362,38 @@ async fn run_in_pty(command: &str, cols: u16, tx: &mpsc::Sender<String>) -> Resu
     let mut out = child.stdout.take().unwrap();
     let mut buf = vec![0u8; 16 * 1024];
     let mut carry: Vec<u8> = vec![];
-    loop {
+    let mut eof = false;
+    while !eof {
         let n = out.read(&mut buf).await?;
         if n == 0 {
             break;
         }
         carry.extend_from_slice(&buf[..n]);
+        // Coalesce back-to-back PTY reads (Linux's PTY buffer is 4 KB, so a
+        // single BuildKit redraw often arrives in 2+ immediate reads).
+        while carry.len() < 64 * 1024 {
+            match tokio::time::timeout(std::time::Duration::from_millis(5), out.read(&mut buf)).await {
+                Ok(Ok(0)) => {
+                    eof = true;
+                    break;
+                }
+                Ok(Ok(m)) => carry.extend_from_slice(&buf[..m]),
+                Ok(Err(e)) => return Err(e.into()),
+                Err(_) => break,
+            }
+        }
         // Only forward complete UTF-8; keep a split character for the next read.
         let valid = match std::str::from_utf8(&carry) {
             Ok(_) => carry.len(),
             Err(e) if e.error_len().is_none() => e.valid_up_to(),
             Err(_) => carry.len(),
         };
-        let chunk: Vec<u8> = carry.drain(..valid).collect();
-        let _ = tx.send(String::from_utf8_lossy(&chunk).into_owned()).await;
+        if valid > 0 {
+            let chunk: Vec<u8> = carry.drain(..valid).collect();
+            if tx.send(String::from_utf8_lossy(&chunk).into_owned()).await.is_err() {
+                return Ok(());
+            }
+        }
     }
     if !carry.is_empty() {
         let _ = tx.send(String::from_utf8_lossy(&carry).into_owned()).await;
@@ -349,13 +426,17 @@ async fn run_streaming(
     let a = tokio::spawn(async move {
         let mut l = BufReader::new(out).lines();
         while let Ok(Some(line)) = l.next_line().await {
-            let _ = t1.send(line + "\n").await;
+            if t1.send(line + "\n").await.is_err() {
+                break;
+            }
         }
     });
     let b = tokio::spawn(async move {
         let mut l = BufReader::new(err).lines();
         while let Ok(Some(line)) = l.next_line().await {
-            let _ = t2.send(line + "\n").await;
+            if t2.send(line + "\n").await.is_err() {
+                break;
+            }
         }
     });
     let status = child.wait().await?;
