@@ -197,6 +197,46 @@ pub struct StatusView {
     pub certs: Vec<CertView>,
     pub events: Vec<Event>,
     pub monthly_cost: f64,
+    #[serde(default)]
+    pub autopilot: Option<crate::agent::autopilot::Status>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AutopilotRequest {
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub budget: Option<f64>,
+    #[serde(default)]
+    pub min_machines: Option<u32>,
+    #[serde(default)]
+    pub max_machines: Option<u32>,
+    /// provider -> API token
+    #[serde(default)]
+    pub tokens: BTreeMap<String, String>,
+    /// SSH public keys to install on servers the autopilot creates.
+    #[serde(default)]
+    pub ssh_keys: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AutopilotView {
+    pub enabled: bool,
+    pub budget: f64,
+    pub min_machines: u32,
+    pub max_machines: u32,
+    pub status: crate::agent::autopilot::Status,
+}
+
+/// Ask the leader to set up a server over SSH (it must accept the leader's key).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProvisionRequest {
+    pub ssh: String,
+    pub name: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+    #[serde(default)]
+    pub public_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

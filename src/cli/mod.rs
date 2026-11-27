@@ -172,6 +172,22 @@ pub enum Cmd {
     /// Use a Kubernetes cluster as a deploy target
     #[command(subcommand)]
     K8s(K8sCmd),
+    /// Start (or grow) a cluster with zero decisions: buys the cheapest
+    /// server, then lets the autopilot manage servers from there
+    Up {
+        /// Monthly spending limit for servers (0 = no limit)
+        #[arg(long)]
+        budget: Option<f64>,
+        /// hetzner or digitalocean (default: any you have a token for)
+        #[arg(long)]
+        provider: Option<String>,
+        /// Most machines the autopilot may run
+        #[arg(long)]
+        max_machines: Option<u32>,
+    },
+    /// Automatic server management: buy, resize and delete servers as needed
+    #[command(subcommand)]
+    Autopilot(AutopilotCmd),
     /// Upgrade the latrix agent on every machine to this version
     Upgrade {
         /// Only this machine
@@ -243,17 +259,20 @@ pub enum MachineCmd {
         #[arg(long)]
         agent_binary: Option<PathBuf>,
     },
-    /// Create a new server at a cloud provider and add it
+    /// Buy a new server and add it (cheapest that fits, unless you choose)
     Create {
-        /// hetzner or digitalocean
+        /// hetzner or digitalocean (default: any you have a token for)
         #[arg(long)]
-        provider: String,
-        /// Server size/type (see `latrix provider sizes <provider>`)
+        provider: Option<String>,
+        /// Server size/type (default: cheapest with at least --min-memory)
         #[arg(long = "type", alias = "size")]
         size: Option<String>,
-        /// Region / location
+        /// Region / location (default: wherever that is cheapest)
         #[arg(long)]
         region: Option<String>,
+        /// Minimum memory when picking automatically, e.g. 4GB
+        #[arg(long, default_value = "2GB")]
+        min_memory: String,
         /// OS image
         #[arg(long)]
         image: Option<String>,
@@ -308,6 +327,29 @@ pub enum ComposeCmd {
         #[arg(long)]
         write: bool,
     },
+}
+
+#[derive(Subcommand)]
+pub enum AutopilotCmd {
+    /// Turn it on (sends your provider tokens and SSH key to the cluster)
+    On {
+        /// Monthly spending limit for servers (0 = no limit)
+        #[arg(long)]
+        budget: Option<f64>,
+        /// Keep at least this many machines
+        #[arg(long)]
+        min_machines: Option<u32>,
+        /// Never run more than this many machines
+        #[arg(long)]
+        max_machines: Option<u32>,
+        /// Only use these providers (default: every provider you have a token for)
+        #[arg(long)]
+        provider: Vec<String>,
+    },
+    /// Turn it off (servers stay as they are)
+    Off,
+    /// What it sees and what it decided last
+    Status,
 }
 
 #[derive(Subcommand)]

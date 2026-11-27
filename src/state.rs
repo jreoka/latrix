@@ -33,6 +33,13 @@ pub struct ClusterState {
     /// Volume directories to delete everywhere (destroyed with --purge-volumes).
     #[serde(default)]
     pub tombstones: BTreeMap<String, u64>,
+    /// Cloud provider API tokens the autopilot uses (never shown in status).
+    #[serde(default)]
+    pub provider_tokens: BTreeMap<String, String>,
+    /// Extra SSH public keys installed on servers the autopilot creates
+    /// (yours, so `latrix` on your computer can reach them).
+    #[serde(default)]
+    pub ssh_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Copy)]
@@ -246,6 +253,22 @@ pub struct Settings {
     /// estimate exceeds it.
     #[serde(default)]
     pub monthly_budget: f64,
+    /// Let latrix buy, resize and delete servers by itself (needs a provider token).
+    #[serde(default)]
+    pub autopilot: bool,
+    /// Autopilot keeps at least this many machines.
+    #[serde(default = "one")]
+    pub min_machines: u32,
+    /// ...and never more than this many.
+    #[serde(default = "five")]
+    pub max_machines: u32,
+}
+
+fn one() -> u32 {
+    1
+}
+fn five() -> u32 {
+    5
 }
 
 fn yes() -> bool {
@@ -266,6 +289,9 @@ impl Default for Settings {
             acme_staging: false,
             base_domain: String::new(),
             monthly_budget: 0.0,
+            autopilot: false,
+            min_machines: 1,
+            max_machines: 5,
         }
     }
 }

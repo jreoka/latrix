@@ -6,6 +6,7 @@
 //! over within seconds, with a full copy of the state.
 
 pub mod acme;
+pub mod autopilot;
 pub mod api;
 pub mod builder;
 pub mod dns;
@@ -64,6 +65,7 @@ pub struct Agent {
     pub updates: Mutex<UpdateInfo>,
     pub maintenance_done: Mutex<Option<String>>,
     pub sampler: metrics::Sampler,
+    pub autopilot: autopilot::Shared,
 }
 
 impl Agent {
@@ -267,6 +269,7 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
         updates: Mutex::new(UpdateInfo::default()),
         maintenance_done: Mutex::new(maintenance::read_done_marker(&data)),
         sampler: Default::default(),
+        autopilot: Default::default(),
     });
 
     if !dev {
@@ -297,6 +300,7 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
         tokio::spawn(mesh::sync_loop(agent.clone()));
         tokio::spawn(dns::run(agent.clone()));
         tokio::spawn(maintenance::run(agent.clone()));
+        tokio::spawn(autopilot::run(agent.clone()));
     }
 
     shutdown_signal().await;

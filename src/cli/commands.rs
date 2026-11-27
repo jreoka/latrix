@@ -21,7 +21,247 @@ fn read_stdin_json<T: serde::de::DeserializeOwned>() -> Result<T> {
 async fn connect(cfg: &CliConfig, cluster: Option<&str>) -> Result<(String, ClusterProfile, Client)> {
     let (name, p) = cfg.profile(cluster)?;
     let c = Client::connect(&p).await?;
+    if !p.local {
+        let _ = sync_machines(&name, &c).await;
+    }
     Ok((name, p, c))
+}
+
+/// The autopilot adds and removes servers on its own; keep the local list of
+/// machines (used to reach the cluster over SSH) in step with the cluster.
+async fn sync_machines(cluster: &str, c: &Client) -> Result<()> {
+    let st: StatusView = c.get("/v1/status").await?;
+    let mut cfg = CliConfig::load()?;
+    let Some(p) = cfg.clusters.get_mut(cluster) else { return Ok(()) };
+    let before = p.machines.len();
+    let names: Vec<String> = st.machines.iter().map(|m| m.machine.name.clone()).collect();
+    let mut changed = false;
+    // Only forget machines the cluster removed when we still know some others.
+    if names.iter().any(|n| p.machines.iter().any(|m| &m.name == n)) {
+        p.machines.retain(|m| names.contains(&m.name));
+        changed |= p.machines.len() != before;
+    }
+    for m in &st.machines {
+        if m.machine.provider.is_some() && !p.machines.iter().any(|x| x.name == m.machine.name) {
+            p.machines.push(super::profile::MachineSsh {
+                name: m.machine.name.clone(),
+                ssh: format!("root@{}", m.machine.public_ip),
+                port: 22,
+                key: p.default_key.clone(),
+            });
+            changed = true;
+        }
+    }
+    if changed {
+        cfg.save()?;
+    }
+    Ok(())
+}
+
+pub struct CreateOptions {
+    pub provider: Option<String>,
+    pub size: Option<String>,
+    pub region: Option<String>,
+    pub min_memory: String,
+    pub image: Option<String>,
+    pub name: Option<String>,
+    pub key: Option<String>,
+    pub agent_binary: Option<std::path::PathBuf>,
+}
+
+/// Providers to use: the one asked for, or every provider with a token.
+fn providers_with_tokens(cfg: &CliConfig, only: Option<&str>) -> Result<Vec<(String, String)>> {
+    let names: Vec<&str> = match only {
+        Some(p) => vec![providers::canonical(p)?],
+        None => vec!["hetzner", "digitalocean"],
+    };
+    let found: Vec<(String, String)> = names
+        .into_iter()
+        .filter_map(|p| providers::token(cfg, p).ok().map(|t| (p.to_string(), t)))
+        .collect();
+    if found.is_empty() {
+        bail!(
+            "no cloud provider token yet. Add one:\n  latrix provider set hetzner <token>        (console.hetzner.cloud → Security → API tokens)\n  latrix provider set digitalocean <token>   (cloud.digitalocean.com → API)"
+        );
+    }
+    Ok(found)
+}
+
+/// Buy a server and add it. Picks the cheapest offer that fits unless a
+/// size/region was given; always the newest Ubuntu LTS unless --image.
+pub async fn create_machine(cfg: &mut CliConfig, cl: Option<&str>, o: CreateOptions) -> Result<()> {
+    let candidates = providers_with_tokens(cfg, o.provider.as_deref())?;
+    let min_mb = util::parse_size_mb(&o.min_memory)?;
+    // Servers run the same CPU type as the binary we install on them.
+    let arch = providers::provider_arch(if cfg!(target_os = "linux") { std::env::consts::ARCH } else { "x86_64" });
+    let mut offers = vec![];
+    for (p, t) in &candidates {
+        match providers::catalog(p, t).await {
+            Ok(list) => offers.extend(list),
+            Err(e) => println!("    ({p}: could not read prices: {e:#})"),
+        }
+    }
+    let filtered: Vec<providers::Offer> = offers
+        .into_iter()
+        .filter(|x| o.size.as_ref().map(|s| &x.size == s).unwrap_or(true))
+        .filter(|x| o.region.as_ref().map(|r| &x.location == r).unwrap_or(true))
+        .collect();
+    let min = if o.size.is_some() { 0 } else { min_mb };
+    let offer = providers::cheapest(&filtered, min, 1.0, arch, &[], None)
+        .or_else(|| providers::cheapest(&filtered, min, 1.0, if arch == "x86" { "arm" } else { "x86" }, &[], None))
+        .cloned()
+        .ok_or_else(|| anyhow!("no matching server type found (check --type / --region, or `latrix provider sizes <provider>`)"))?;
+    let token = candidates.iter().find(|(p, _)| *p == offer.provider).map(|(_, t)| t.clone()).unwrap();
+    let image = match o.image {
+        Some(i) => i,
+        None => providers::latest_ubuntu(&offer.provider, &token, &offer.size).await,
+    };
+    let name = o.name.unwrap_or_else(|| format!("{}-{}", offer.location, util::random_id(4)));
+    util::validate_name("machine", &name)?;
+    let (pubkey, key) = providers::ssh_key(o.key.as_deref())?;
+    println!(
+        "==> {} {} in {} ({} vCPU, {} GB RAM) — {:.2}/month{}",
+        offer.provider,
+        offer.size,
+        offer.location,
+        offer.cpus,
+        offer.memory_mb / 1024,
+        offer.price,
+        if o.size.is_none() && o.region.is_none() { ", the cheapest that fits" } else { "" }
+    );
+    println!("==> creating server '{name}' with {image}");
+    let created = providers::create(&offer.provider, &token, &name, &offer.size, &offer.location, &image, std::slice::from_ref(&pubkey)).await?;
+    println!("==> server is up at {}", created.ip);
+    let ssh = ssh::Ssh::new(&format!("root@{}", created.ip), 22, key.clone());
+    ssh.forget_host_key(); // cloud IPs get reused
+    print!("==> waiting for SSH");
+    let start = std::time::Instant::now();
+    loop {
+        if ssh.run("true").await.is_ok() {
+            println!();
+            break;
+        }
+        if start.elapsed() > Duration::from_secs(240) {
+            bail!("SSH to {} never became available", created.ip);
+        }
+        print!(".");
+        std::io::stdout().flush()?;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    }
+    machine::add(
+        cfg,
+        cl,
+        machine::AddOptions {
+            target: format!("root@{}", created.ip),
+            name: Some(name),
+            port: 22,
+            key: key.clone(),
+            region: Some(offer.location.clone()),
+            public_ip: Some(created.ip.clone()),
+            agent_binary: o.agent_binary,
+            provider: Some(created.provider),
+            monthly_cost: created.monthly_cost.or(Some(offer.price)),
+        },
+    )
+    .await?;
+    // Remember the key for servers the autopilot adds later.
+    let mut fresh = CliConfig::load()?;
+    if let Ok(cname) = fresh.cluster_name(cl) {
+        if let Some(p) = fresh.clusters.get_mut(&cname) {
+            if p.default_key.is_none() {
+                p.default_key = key;
+                fresh.save()?;
+            }
+        }
+    }
+    *cfg = fresh;
+    Ok(())
+}
+
+async fn autopilot_on(cfg: &CliConfig, cl: Option<&str>, budget: Option<f64>, min: Option<u32>, max: Option<u32>, only: &[String]) -> Result<()> {
+    let tokens: std::collections::BTreeMap<String, String> = if only.is_empty() {
+        providers_with_tokens(cfg, None)?.into_iter().collect()
+    } else {
+        let mut m = std::collections::BTreeMap::new();
+        for p in only {
+            for (k, v) in providers_with_tokens(cfg, Some(p))? {
+                m.insert(k, v);
+            }
+        }
+        m
+    };
+    let (name, p, c) = connect(cfg, cl).await?;
+    if p.kubernetes.is_some() || p.local {
+        bail!("the autopilot manages latrix's own servers; '{name}' isn't one of those clusters");
+    }
+    // Your SSH key goes on new servers too, so this computer can always reach them.
+    let (pubkey, key) = providers::ssh_key(p.default_key.as_deref())?;
+    let v: AutopilotView = c
+        .post(
+            "/v1/autopilot",
+            &AutopilotRequest {
+                enabled: Some(true),
+                budget,
+                min_machines: min,
+                max_machines: max,
+                tokens: tokens.clone(),
+                ssh_keys: vec![pubkey],
+            },
+        )
+        .await?;
+    let mut fresh = CliConfig::load()?;
+    if let Some(prof) = fresh.clusters.get_mut(&name) {
+        if prof.default_key.is_none() {
+            prof.default_key = key;
+            fresh.save()?;
+        }
+    }
+    println!(
+        "✓ autopilot on for '{name}' — budget {}, {}–{} machines, providers: {}",
+        if v.budget > 0.0 { format!("{:.2}/month", v.budget) } else { "unlimited".into() },
+        v.min_machines,
+        v.max_machines,
+        tokens.keys().cloned().collect::<Vec<_>>().join(", ")
+    );
+    println!("  latrix now buys the cheapest server that fits when apps need room, removes ones it");
+    println!("  doesn't need, replaces oversized ones, and reboots/replaces dead ones.");
+    println!("  Machines you added yourself are never touched. See `latrix autopilot status`.");
+    Ok(())
+}
+
+fn print_autopilot(v: &AutopilotView) {
+    let c = &v.status.capacity;
+    println!(
+        "autopilot {} · budget {} · {}–{} machines",
+        if v.enabled { "ON" } else { "off" },
+        if v.budget > 0.0 { format!("{:.2}/month", v.budget) } else { "unlimited".into() },
+        v.min_machines,
+        v.max_machines
+    );
+    if c.machines > 0 || c.req_mem_mb > 0.0 {
+        println!(
+            "capacity: {} machine(s), apps want {:.1} of {:.1} GB and {:.1} of {:.1} CPUs ({:.0}% used), {:.2}/month",
+            c.machines,
+            c.req_mem_mb / 1024.0,
+            c.cap_mem_mb / 1024.0,
+            c.req_cpu,
+            c.cap_cpu,
+            if c.utilization.is_finite() { c.utilization * 100.0 } else { 100.0 },
+            c.monthly_cost
+        );
+    }
+    if !v.status.providers.is_empty() {
+        println!("providers: {}", v.status.providers.join(", "));
+    }
+    if let Some(o) = &v.status.cheapest {
+        println!("cheapest server now: {} {} in {} ({} GB) at {:.2}/month", o.provider, o.size, o.location, o.memory_mb / 1024, o.price);
+    }
+    if let Some(w) = &v.status.working_on {
+        println!("working on: {w}");
+    }
+    if !v.status.last_decision.is_empty() {
+        println!("last decision ({}): {}", ago(v.status.last_check), v.status.last_decision);
+    }
 }
 
 fn parse_pairs(pairs: &[String]) -> Result<std::collections::BTreeMap<String, String>> {
@@ -148,6 +388,54 @@ pub async fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Cmd::Dashboard { port, no_open } => dashboard(&cfg, cl, port, no_open).await,
+        Cmd::Autopilot(a) => match a {
+            AutopilotCmd::On { budget, min_machines, max_machines, provider } => {
+                autopilot_on(&cfg, cl, budget, min_machines, max_machines, &provider).await
+            }
+            AutopilotCmd::Off => {
+                let (_, _, c) = connect(&cfg, cl).await?;
+                let v: AutopilotView = c
+                    .post("/v1/autopilot", &AutopilotRequest { enabled: Some(false), ..Default::default() })
+                    .await?;
+                print_autopilot(&v);
+                Ok(())
+            }
+            AutopilotCmd::Status => {
+                let (_, _, c) = connect(&cfg, cl).await?;
+                let v: AutopilotView = c.get("/v1/autopilot").await?;
+                print_autopilot(&v);
+                Ok(())
+            }
+        },
+        Cmd::Up { budget, provider, max_machines } => {
+            let has_cluster = cfg
+                .profile(cl)
+                .map(|(_, p)| !p.local && p.kubernetes.is_none() && !p.machines.is_empty())
+                .unwrap_or(false);
+            if !has_cluster {
+                println!("==> no cluster yet: buying the cheapest server that fits");
+                create_machine(
+                    &mut cfg,
+                    cl,
+                    CreateOptions {
+                        provider: provider.clone(),
+                        size: None,
+                        region: None,
+                        min_memory: "2GB".into(),
+                        image: None,
+                        name: None,
+                        key: None,
+                        agent_binary: None,
+                    },
+                )
+                .await?;
+                println!();
+            }
+            let only: Vec<String> = provider.into_iter().collect();
+            autopilot_on(&cfg, cl, budget, None, max_machines, &only).await?;
+            println!("\nNext: cd your-app && latrix launch && latrix deploy");
+            Ok(())
+        }
         Cmd::Upgrade { machine, agent_binary } => {
             machine::upgrade_agents(&cfg, cl, machine.as_deref(), agent_binary.as_deref()).await
         }
@@ -208,6 +496,7 @@ async fn dev(data: Option<std::path::PathBuf>) -> Result<()> {
             token: id.token,
             local: true,
             machines: vec![],
+            default_key: None,
             kubernetes: None,
         },
     );
@@ -674,57 +963,9 @@ async fn machine_cmd(cfg: &mut CliConfig, cl: Option<&str>, m: MachineCmd) -> Re
             )
             .await
         }
-        MachineCmd::Create { provider, size, region, image, name, key, agent_binary } => {
-            let p = providers::canonical(&provider)?;
-            let token = providers::token(cfg, p)?;
-            let (dsize, dregion) = providers::defaults(p);
-            let size = size.unwrap_or_else(|| dsize.into());
-            let region = region.unwrap_or_else(|| dregion.into());
-            let image = match image {
-                Some(i) => i,
-                None => providers::latest_ubuntu(p, &token, &size).await,
-            };
-            let name = name.unwrap_or_else(|| format!("{}-{}", region, util::random_id(4)));
-            util::validate_name("machine", &name)?;
-            let (pubkey, key) = providers::ssh_key(key.as_deref())?;
-            println!("==> creating {p} server '{name}' ({size} in {region}, {image})");
-            let created = providers::create(p, &token, &name, &size, &region, &image, &pubkey).await?;
-            println!(
-                "==> server is up at {}{}",
-                created.ip,
-                created.monthly_cost.map(|c| format!(" (~{c:.2}/month)")).unwrap_or_default()
-            );
-            let ssh = ssh::Ssh::new(&format!("root@{}", created.ip), 22, key.clone());
-            print!("==> waiting for SSH");
-            let start = std::time::Instant::now();
-            loop {
-                if ssh.run("true").await.is_ok() {
-                    println!();
-                    break;
-                }
-                if start.elapsed() > Duration::from_secs(240) {
-                    bail!("SSH to {} never became available", created.ip);
-                }
-                print!(".");
-                std::io::stdout().flush()?;
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            machine::add(
-                cfg,
-                cl,
-                machine::AddOptions {
-                    target: format!("root@{}", created.ip),
-                    name: Some(name),
-                    port: 22,
-                    key,
-                    region: Some(region),
-                    public_ip: Some(created.ip.clone()),
-                    agent_binary,
-                    provider: Some(created.provider),
-                    monthly_cost: created.monthly_cost,
-                },
-            )
-            .await
+        MachineCmd::Create { provider, size, region, min_memory, image, name, key, agent_binary } => {
+            let opts = CreateOptions { provider, size, region, min_memory, image, name, key, agent_binary };
+            create_machine(cfg, cl, opts).await
         }
         MachineCmd::List => {
             let (_, _, c) = connect(cfg, cl).await?;

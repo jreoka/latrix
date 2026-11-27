@@ -34,9 +34,9 @@ case "$pm" in
   apt-get)
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -q >/dev/null
-    install_pkgs ca-certificates curl git rsync wireguard-tools iproute2 ;;
+    install_pkgs ca-certificates curl git rsync wireguard-tools iproute2 openssh-client ;;
   dnf|yum)
-    install_pkgs ca-certificates curl git rsync iproute
+    install_pkgs ca-certificates curl git rsync iproute openssh-clients
     if ! install_pkgs wireguard-tools; then
       log "enabling EPEL for wireguard-tools"
       install_pkgs epel-release || true
@@ -45,10 +45,10 @@ case "$pm" in
     install_pkgs dnf-plugins-core || true ;;
   zypper)
     zypper -n -q refresh >/dev/null || true
-    install_pkgs ca-certificates curl git rsync wireguard-tools iproute2 ;;
+    install_pkgs ca-certificates curl git rsync wireguard-tools iproute2 openssh-clients ;;
   pacman)
     pacman -Sy --noconfirm >/dev/null
-    install_pkgs ca-certificates curl git rsync wireguard-tools iproute2 ;;
+    install_pkgs ca-certificates curl git rsync wireguard-tools iproute2 openssh ;;
   *)
     log "unsupported distribution: no apt, dnf, yum, zypper or pacman found"; exit 1 ;;
 esac

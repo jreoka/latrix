@@ -1010,7 +1010,7 @@ pub async fn k8s_cmd(cl: Option<&str>, c: K8sCmd) -> Result<()> {
             }
             cfg.clusters.insert(
                 name.clone(),
-                ClusterProfile { token: String::new(), local: false, machines: vec![], kubernetes: Some(t.clone()) },
+                ClusterProfile { token: String::new(), local: false, machines: vec![], default_key: None, kubernetes: Some(t.clone()) },
             );
             if cfg.current.is_none() {
                 cfg.current = Some(name.clone());

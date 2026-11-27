@@ -12,12 +12,24 @@ pub struct Ssh {
     pub target: String,
     pub port: u16,
     pub key: Option<String>,
+    /// Separate known_hosts file (the agent uses its own).
+    pub known_hosts: Option<String>,
 }
 
 impl Ssh {
     pub fn new(target: &str, port: u16, key: Option<String>) -> Ssh {
         let target = if target.contains('@') { target.to_string() } else { format!("root@{target}") };
-        Ssh { target, port, key }
+        Ssh { target, port, key, known_hosts: None }
+    }
+
+    /// Forget any old host key for this host (cloud IPs get reused by new servers).
+    pub fn forget_host_key(&self) {
+        let mut cmd = std::process::Command::new("ssh-keygen");
+        cmd.arg("-R").arg(self.host());
+        if let Some(f) = &self.known_hosts {
+            cmd.arg("-f").arg(f);
+        }
+        let _ = cmd.stdout(Stdio::null()).stderr(Stdio::null()).status();
     }
 
     pub fn host(&self) -> &str {
@@ -42,6 +54,10 @@ impl Ssh {
         if let Some(k) = &self.key {
             a.push("-i".into());
             a.push(k.clone());
+        }
+        if let Some(f) = &self.known_hosts {
+            a.push("-o".into());
+            a.push(format!("UserKnownHostsFile={f}"));
         }
         a
     }

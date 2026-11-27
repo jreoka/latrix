@@ -33,14 +33,6 @@ pub fn token(cfg: &CliConfig, provider: &str) -> Result<String> {
         .ok_or_else(|| anyhow!("no API token for {p}: run `latrix provider set {p} <token>` or set {env}"))
 }
 
-pub fn defaults(provider: &str) -> (&'static str, &'static str) {
-    // (size, region)
-    match provider {
-        "hetzner" => ("cx22", "fsn1"),
-        _ => ("s-1vcpu-1gb", "fra1"),
-    }
-}
-
 /// Fallback when the provider's image list can't be read.
 fn fallback_image(provider: &str) -> &'static str {
     match provider {
@@ -116,7 +108,7 @@ pub async fn latest_ubuntu(provider: &str, token: &str, size: &str) -> String {
     };
     found.unwrap_or_else(|| {
         let f = fallback_image(provider);
-        println!("    (could not list {provider} images; using {f}, pass --image to choose)");
+        tracing::warn!("could not list {provider} images; using {f} (pass --image to choose)");
         f.to_string()
     })
 }
@@ -195,6 +187,30 @@ async fn api(
     Ok(serde_json::from_str(&text)?)
 }
 
+/// Make sure every public key is registered with the provider; returns their ids.
+async fn ensure_keys(http: &reqwest::Client, token: &str, url: &str, pubkeys: &[String]) -> Result<Vec<Value>> {
+    let existing = api(http, reqwest::Method::GET, &format!("{url}?per_page=200"), token, None).await?;
+    let list = existing["ssh_keys"].as_array().cloned().unwrap_or_default();
+    let mut ids = vec![];
+    for pk in pubkeys {
+        match list.iter().find(|k| same_key(k["public_key"].as_str().unwrap_or(""), pk)) {
+            Some(k) => ids.push(k["id"].clone()),
+            None => {
+                let k = api(
+                    http,
+                    reqwest::Method::POST,
+                    url,
+                    token,
+                    Some(json!({"name": format!("latrix-{}", random_id(5)), "public_key": pk})),
+                )
+                .await?;
+                ids.push(k["ssh_key"]["id"].clone());
+            }
+        }
+    }
+    Ok(ids)
+}
+
 pub async fn create(
     provider: &str,
     token: &str,
@@ -202,31 +218,14 @@ pub async fn create(
     size: &str,
     region: &str,
     image: &str,
-    pubkey: &str,
+    pubkeys: &[String],
 ) -> Result<Created> {
     let http = reqwest::Client::new();
     use reqwest::Method as M;
     match provider {
         "hetzner" => {
             let base = "https://api.hetzner.cloud/v1";
-            let keys = api(&http, M::GET, &format!("{base}/ssh_keys?per_page=50"), token, None).await?;
-            let key_id = match keys["ssh_keys"]
-                .as_array()
-                .and_then(|a| a.iter().find(|k| same_key(k["public_key"].as_str().unwrap_or(""), pubkey)))
-            {
-                Some(k) => k["id"].clone(),
-                None => {
-                    let k = api(
-                        &http,
-                        M::POST,
-                        &format!("{base}/ssh_keys"),
-                        token,
-                        Some(json!({"name": format!("latrix-{}", random_id(5)), "public_key": pubkey})),
-                    )
-                    .await?;
-                    k["ssh_key"]["id"].clone()
-                }
-            };
+            let key_ids = ensure_keys(&http, token, &format!("{base}/ssh_keys"), pubkeys).await?;
             let res = api(
                 &http,
                 M::POST,
@@ -234,7 +233,7 @@ pub async fn create(
                 token,
                 Some(json!({
                     "name": name, "server_type": size, "image": image, "location": region,
-                    "ssh_keys": [key_id], "start_after_create": true,
+                    "ssh_keys": key_ids, "start_after_create": true,
                     "labels": {"managed-by": "latrix"}
                 })),
             )
@@ -270,24 +269,7 @@ pub async fn create(
         }
         _ => {
             let base = "https://api.digitalocean.com/v2";
-            let keys = api(&http, M::GET, &format!("{base}/account/keys?per_page=200"), token, None).await?;
-            let key_id = match keys["ssh_keys"]
-                .as_array()
-                .and_then(|a| a.iter().find(|k| same_key(k["public_key"].as_str().unwrap_or(""), pubkey)))
-            {
-                Some(k) => k["id"].clone(),
-                None => {
-                    let k = api(
-                        &http,
-                        M::POST,
-                        &format!("{base}/account/keys"),
-                        token,
-                        Some(json!({"name": format!("latrix-{}", random_id(5)), "public_key": pubkey})),
-                    )
-                    .await?;
-                    k["ssh_key"]["id"].clone()
-                }
-            };
+            let key_ids = ensure_keys(&http, token, &format!("{base}/account/keys"), pubkeys).await?;
             let res = api(
                 &http,
                 M::POST,
@@ -295,7 +277,7 @@ pub async fn create(
                 token,
                 Some(json!({
                     "name": name, "region": region, "size": size, "image": image,
-                    "ssh_keys": [key_id], "tags": ["latrix"]
+                    "ssh_keys": key_ids, "tags": ["latrix"]
                 })),
             )
             .await?;
@@ -339,6 +321,147 @@ pub async fn destroy(p: &ProviderRef, token: &str) -> Result<()> {
         other => bail!("unknown provider {other}"),
     };
     api(&http, reqwest::Method::DELETE, &url, token, None).await?;
+    Ok(())
+}
+
+/// One purchasable server: a size in a location, with its monthly price.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct Offer {
+    pub provider: String,
+    pub size: String,
+    pub location: String,
+    pub cpus: f64,
+    pub memory_mb: u64,
+    pub disk_gb: u64,
+    /// "x86" or "arm"
+    pub arch: String,
+    pub price: f64,
+}
+
+/// Parse Hetzner's /server_types into offers (one per size and location).
+pub fn hetzner_offers(v: &Value) -> Vec<Offer> {
+    let mut out = vec![];
+    for t in v["server_types"].as_array().cloned().unwrap_or_default() {
+        if t["deprecated"].as_bool().unwrap_or(false) || !t["deprecation"].is_null() {
+            continue;
+        }
+        for p in t["prices"].as_array().cloned().unwrap_or_default() {
+            let price = p["price_monthly"]["gross"].as_str().and_then(|x| x.parse::<f64>().ok());
+            let (Some(price), Some(loc)) = (price, p["location"].as_str()) else { continue };
+            out.push(Offer {
+                provider: "hetzner".into(),
+                size: t["name"].as_str().unwrap_or_default().into(),
+                location: loc.into(),
+                cpus: t["cores"].as_f64().unwrap_or(1.0),
+                memory_mb: (t["memory"].as_f64().unwrap_or(0.0) * 1024.0) as u64,
+                disk_gb: t["disk"].as_u64().unwrap_or(0),
+                arch: t["architecture"].as_str().unwrap_or("x86").into(),
+                price,
+            });
+        }
+    }
+    out
+}
+
+/// Parse DigitalOcean's /sizes into offers (one per size and region).
+pub fn do_offers(v: &Value) -> Vec<Offer> {
+    let mut out = vec![];
+    for s in v["sizes"].as_array().cloned().unwrap_or_default() {
+        if !s["available"].as_bool().unwrap_or(true) {
+            continue;
+        }
+        let slug = s["slug"].as_str().unwrap_or_default();
+        if slug.contains("gpu") {
+            continue;
+        }
+        for r in s["regions"].as_array().cloned().unwrap_or_default() {
+            let Some(r) = r.as_str() else { continue };
+            out.push(Offer {
+                provider: "digitalocean".into(),
+                size: slug.into(),
+                location: r.into(),
+                cpus: s["vcpus"].as_f64().unwrap_or(1.0),
+                memory_mb: s["memory"].as_u64().unwrap_or(0),
+                disk_gb: s["disk"].as_u64().unwrap_or(0),
+                arch: "x86".into(),
+                price: s["price_monthly"].as_f64().unwrap_or(f64::MAX),
+            });
+        }
+    }
+    out
+}
+
+/// Everything a provider sells right now, with prices.
+pub async fn catalog(provider: &str, token: &str) -> Result<Vec<Offer>> {
+    let http = reqwest::Client::new();
+    match provider {
+        "hetzner" => Ok(hetzner_offers(
+            &api(&http, reqwest::Method::GET, "https://api.hetzner.cloud/v1/server_types?per_page=50", token, None).await?,
+        )),
+        _ => Ok(do_offers(
+            &api(&http, reqwest::Method::GET, "https://api.digitalocean.com/v2/sizes?per_page=200", token, None).await?,
+        )),
+    }
+}
+
+/// The cheapest offer with at least this much memory/CPU. At equal price it
+/// prefers the given locations (where the cluster already is), then more memory.
+pub fn cheapest<'a>(
+    offers: &'a [Offer],
+    min_memory_mb: u64,
+    min_cpus: f64,
+    arch: &str,
+    prefer: &[String],
+    max_price: Option<f64>,
+) -> Option<&'a Offer> {
+    offers
+        .iter()
+        .filter(|o| o.arch == arch && o.memory_mb >= min_memory_mb && o.cpus >= min_cpus)
+        .filter(|o| max_price.map(|m| o.price <= m + 1e-9).unwrap_or(true))
+        .min_by(|a, b| {
+            a.price
+                .partial_cmp(&b.price)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then((!prefer.contains(&a.location)).cmp(&!prefer.contains(&b.location)))
+                .then(b.memory_mb.cmp(&a.memory_mb))
+        })
+}
+
+/// "x86_64"/"aarch64" -> the providers' "x86"/"arm".
+pub fn provider_arch(arch: &str) -> &'static str {
+    match arch {
+        "aarch64" | "arm64" | "arm" => "arm",
+        _ => "x86",
+    }
+}
+
+/// Server state at the provider ("running", "off", ...), or None if it no longer exists.
+pub async fn server_status(p: &ProviderRef, token: &str) -> Result<Option<String>> {
+    let http = reqwest::Client::new();
+    let (url, field) = match p.provider.as_str() {
+        "hetzner" => (format!("https://api.hetzner.cloud/v1/servers/{}", p.id), "server"),
+        _ => (format!("https://api.digitalocean.com/v2/droplets/{}", p.id), "droplet"),
+    };
+    match api(&http, reqwest::Method::GET, &url, token, None).await {
+        Ok(v) => Ok(v[field]["status"].as_str().map(String::from)),
+        Err(e) if e.to_string().contains("404") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Hard-reboot a server through the provider API.
+pub async fn reboot(p: &ProviderRef, token: &str) -> Result<()> {
+    let http = reqwest::Client::new();
+    match p.provider.as_str() {
+        "hetzner" => {
+            let url = format!("https://api.hetzner.cloud/v1/servers/{}/actions/reset", p.id);
+            api(&http, reqwest::Method::POST, &url, token, None).await?;
+        }
+        _ => {
+            let url = format!("https://api.digitalocean.com/v2/droplets/{}/actions", p.id);
+            api(&http, reqwest::Method::POST, &url, token, Some(json!({"type": "power_cycle"}))).await?;
+        }
+    }
     Ok(())
 }
 
@@ -439,6 +562,37 @@ mod tests {
         // second call reuses it
         assert_eq!(ssh_key(None).unwrap().0, pubkey);
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn offers_and_cheapest() {
+        let h = json!({"server_types": [
+            {"name": "cx23", "cores": 2, "memory": 4.0, "disk": 40, "architecture": "x86", "deprecated": false, "deprecation": null,
+             "prices": [{"location": "fsn1", "price_monthly": {"gross": "4.8500"}}, {"location": "ash", "price_monthly": {"gross": "5.9900"}}]},
+            {"name": "cax11", "cores": 2, "memory": 4.0, "disk": 40, "architecture": "arm", "deprecated": false, "deprecation": null,
+             "prices": [{"location": "fsn1", "price_monthly": {"gross": "4.4900"}}]},
+            {"name": "cx33", "cores": 4, "memory": 8.0, "disk": 80, "architecture": "x86", "deprecated": false, "deprecation": null,
+             "prices": [{"location": "fsn1", "price_monthly": {"gross": "7.9900"}}, {"location": "nbg1", "price_monthly": {"gross": "7.9900"}}]},
+            {"name": "cx11", "cores": 1, "memory": 2.0, "disk": 20, "architecture": "x86", "deprecated": true, "deprecation": {},
+             "prices": [{"location": "fsn1", "price_monthly": {"gross": "3.0000"}}]}
+        ]});
+        let offers = hetzner_offers(&h);
+        assert_eq!(offers.len(), 5, "deprecated types skipped");
+        let c = cheapest(&offers, 2048, 1.0, "x86", &[], None).unwrap();
+        assert_eq!((c.size.as_str(), c.location.as_str()), ("cx23", "fsn1"));
+        let c = cheapest(&offers, 6000, 1.0, "x86", &["nbg1".into()], None).unwrap();
+        assert_eq!((c.size.as_str(), c.location.as_str()), ("cx33", "nbg1"), "same price: prefer existing location");
+        assert!(cheapest(&offers, 6000, 1.0, "x86", &[], Some(5.0)).is_none(), "budget respected");
+        assert_eq!(cheapest(&offers, 2048, 1.0, "arm", &[], None).unwrap().size, "cax11");
+
+        let d = json!({"sizes": [
+            {"slug": "s-1vcpu-1gb", "memory": 1024, "vcpus": 1, "disk": 25, "price_monthly": 6.0, "regions": ["fra1", "nyc3"], "available": true},
+            {"slug": "s-1vcpu-2gb", "memory": 2048, "vcpus": 1, "disk": 50, "price_monthly": 12.0, "regions": ["fra1"], "available": true},
+            {"slug": "gpu-h100x1", "memory": 245760, "vcpus": 20, "disk": 720, "price_monthly": 2500.0, "regions": ["nyc2"], "available": true}
+        ]});
+        let offers = do_offers(&d);
+        assert_eq!(offers.len(), 3);
+        assert_eq!(cheapest(&offers, 2048, 1.0, "x86", &[], None).unwrap().size, "s-1vcpu-2gb");
     }
 
     #[test]

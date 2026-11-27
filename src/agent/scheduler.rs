@@ -813,6 +813,10 @@ fn orchestrate_maintenance(s: &mut ClusterState, cx: &mut Ctx) {
                             ));
                         }
                         cx.info(format!("{}: drained, installing OS updates", m.name));
+                    } else if kind == "remove" {
+                        // The autopilot deletes it next (keeps the task as a marker).
+                        mm.status = MachineStatus::Cordoned;
+                        cx.info(format!("{}: drained, ready to be removed", m.name));
                     } else {
                         mm.status = MachineStatus::Cordoned;
                         mm.maintenance = None;

@@ -25,6 +25,9 @@ pub struct ClusterProfile {
     pub local: bool,
     #[serde(default)]
     pub machines: Vec<MachineSsh>,
+    /// SSH key for machines latrix creates (used for ones the autopilot adds).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_key: Option<String>,
     /// Set when this "cluster" is a Kubernetes cluster used as a deploy target.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kubernetes: Option<K8sTarget>,

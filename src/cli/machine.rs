@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const BOOTSTRAP: &str = include_str!("bootstrap.sh");
+pub const BOOTSTRAP: &str = include_str!("bootstrap.sh");
 
 #[derive(Serialize, Deserialize)]
 pub struct InitFirst {
@@ -158,6 +158,7 @@ pub async fn add(cfg: &mut CliConfig, cluster: Option<&str>, opts: AddOptions) -
         token: util::random_token(),
         local: false,
         machines: vec![],
+        default_key: None,
         kubernetes: None,
     });
     if profile.kubernetes.is_some() {

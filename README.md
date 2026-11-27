@@ -15,12 +15,13 @@ a NUC under your desk...) and it:
 - **replicates volumes** across machines, and moves them with a final sync (no data loss) when a machine is drained
 - **does HTTPS for you**: Let's Encrypt certificates, renewed automatically and served by every machine
 - **updates the OS for you**: one machine at a time, in a time window. It moves work off first, reboots if needed, then moves work back
+- **buys and sizes servers for you (autopilot)**: give it a cloud token and a budget. It picks the cheapest server that fits, adds servers when apps need room, removes or downsizes ones you don't need, and replaces dead ones
 - **runs the control plane on your servers**, so nothing has to keep running on your PC
 - **also deploys to Kubernetes**: the same `latrix.toml` and commands work on any Kubernetes cluster you already have
 
 ```
-$ latrix machine add root@203.0.113.10
-$ latrix machine add root@203.0.113.11
+$ latrix provider set hetzner <token>
+$ latrix up --budget 30          # cheapest server + autopilot
 $ cd my-app && latrix launch && latrix deploy
 ==> Deploying my-app
 ==> Uploading build context (14 files, 0.1 MB) to hel1
@@ -54,7 +55,20 @@ latrix deploy                  # → http://my-app.localhost:7480
 latrix dashboard               # → http://127.0.0.1:7470
 ```
 
-### 3. Add servers
+### 3. Let latrix run the servers (recommended)
+
+Give it a cloud API token and a budget. latrix buys the cheapest server
+that fits, then manages servers from there:
+
+```bash
+latrix provider set hetzner <api-token>    # and/or: latrix provider set digitalocean <token>
+latrix up --budget 30                      # cheapest server + autopilot, ≤ 30/month
+```
+
+That's the whole setup. You don't pick sizes, regions or OS versions, and
+you don't need an SSH key (latrix makes one if you have none).
+
+### Or add servers yourself
 
 You need root SSH access, or a user with passwordless sudo.
 
@@ -64,14 +78,11 @@ latrix machine add root@203.0.113.11          # more machines join it
 latrix machine add ubuntu@my-box.example.com --name office -i ~/.ssh/id_ed25519
 ```
 
-Or let latrix create the server for you:
-
-```bash
-latrix provider set hetzner <api-token>       # or: export HCLOUD_TOKEN=...
-latrix provider sizes hetzner                 # sizes + monthly prices
-latrix machine create --provider hetzner --type cx22 --region fsn1
-latrix machine create --provider digitalocean --type s-1vcpu-1gb --region fra1
-```
+Or let latrix buy one: `latrix machine create` picks the cheapest server
+(across every provider you have a token for) with at least 2 GB of RAM, and
+installs the newest Ubuntu LTS. You can still choose with `--provider`,
+`--type`, `--region`, `--min-memory 8GB` or `--image`. To see prices, run
+`latrix provider sizes hetzner`.
 
 Supported server OSes: Ubuntu, Debian, Fedora, RHEL/Rocky/Alma, openSUSE and
 Arch (anything with systemd plus apt/dnf/yum/zypper/pacman).
@@ -165,6 +176,44 @@ reaching each other by their compose names, even across machines. Bind mounts
 (`./dir:/path`) are skipped, because they can't follow an app between
 machines. Bake those files into the image instead.
 
+## Autopilot
+
+With `latrix up`, or `latrix autopilot on --budget 30`, the leader manages
+servers by itself once a minute. It compares what your apps ask for
+(instances × cpu/memory) with what the machines have.
+
+- **Grows:** when apps need more than ~80% of capacity or a machine is full,
+  it buys the cheapest server that covers the shortfall. It uses live prices
+  from every provider you gave a token for, prefers the location the
+  cluster already uses at equal price, and never exceeds the monthly budget.
+  If an app runs 2+ instances or has volume replicas, it makes sure there
+  are at least 2 machines.
+- **Shrinks:** after ~30 minutes under ~45% use, it drains the most expensive
+  server the cluster can do without (apps move first, nothing goes down),
+  then deletes it.
+- **Right-sizes:** after an hour, a server much bigger than its load is
+  replaced with one at least 30% cheaper. The new server starts first, then
+  the old one is drained and deleted.
+- **Heals:** a server it bought that stops responding for 15 minutes is
+  rebooted through the provider API. If it's still dead 30 minutes later,
+  it's replaced.
+- **Never touches** servers you added with `latrix machine add`, and never
+  removes the current leader.
+
+New servers are set up by the cluster itself, over SSH with its own key and
+your key (so this computer can still reach them). Your computer doesn't need
+to be on.
+
+```bash
+latrix autopilot status    # capacity, cost, cheapest server right now, last decision
+latrix autopilot on --budget 50 --max-machines 6
+latrix autopilot off       # servers stay as they are
+```
+
+Your provider token is stored in the cluster's state, which is root-only
+(0600) on your servers and never shown in status output. Use a token
+scoped to a dedicated project.
+
 ## Kubernetes
 
 Already have a Kubernetes cluster (k3s, DOKS, GKE, EKS, AKS...)? Register it
@@ -219,6 +268,8 @@ latrix --cluster prod status
 | `latrix rollback <app> [version]` | back to the previous (or a given) release |
 | `latrix secrets set <app> KEY=value` | secrets as env vars (triggers a rolling restart) |
 | `latrix console <app> [-- cmd]` | shell into an instance |
+| `latrix up [--budget 30]` | buy the cheapest server and turn on the autopilot |
+| `latrix autopilot on\|off\|status` | automatic buying, resizing and deleting of servers |
 | `latrix machine list\|add\|create\|remove\|drain\|cordon\|uncordon\|update\|ssh` | machines |
 | `latrix volumes`, `latrix certs`, `latrix events` | the rest of the state |
 | `latrix settings [key=value ...]` | cluster settings (see below) |
@@ -298,11 +349,11 @@ person or a small team. To keep it simple:
 - **One writer per volume:** apps with volumes run a single instance (with
   fast failover).
 - **Kubernetes is a deploy target, not part of the mesh.** latrix doesn't
-  move apps between your own machines and a Kubernetes cluster. Not yet
-  built: budget-driven automatic
-  creation and resizing of cloud machines. latrix can *create* Hetzner and
-  DigitalOcean servers, shows estimated costs, and warns when you go over
-  `monthly_budget`.
+  move apps between your own machines and a Kubernetes cluster.
+- **The autopilot sizes by what apps reserve** (`cpu`/`memory` in
+  latrix.toml), not by live traffic. Autoscaling changes instance counts,
+  and the autopilot follows. Prices are refreshed hourly; a small
+  provider-side extra such as a public IPv4 fee isn't counted.
 - The CLI needs `ssh`/`scp` (OpenSSH) on your computer.
 
 ## Building

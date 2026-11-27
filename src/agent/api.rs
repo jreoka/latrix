@@ -70,6 +70,8 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/v1/apps/{app}/rollback", post(rollback))
         .route("/v1/apps/{app}/secrets", post(secrets))
         .route("/v1/settings", get(get_settings).post(set_settings))
+        .route("/v1/autopilot", get(get_autopilot).post(set_autopilot))
+        .route("/v1/machines/provision", post(provision_machine))
         .route_layer(middleware::from_fn_with_state(agent.clone(), leader_forward));
 
     Router::new()
@@ -358,7 +360,7 @@ async fn status(State(agent): AgentState) -> ApiResult<StatusView> {
     let mut events: Vec<Event> = agent.events.lock().unwrap().iter().cloned().collect();
     events.reverse();
     events.truncate(50);
-    let monthly_cost = s.machines.values().filter_map(|m| m.monthly_cost).sum();
+    let monthly_cost = s.machines.values().filter_map(|m| m.monthly_cost).sum::<f64>() + 0.0;
     Ok(Json(StatusView {
         cluster: s.cluster.clone(),
         version: s.version,
@@ -370,6 +372,7 @@ async fn status(State(agent): AgentState) -> ApiResult<StatusView> {
         certs,
         events,
         monthly_cost,
+        autopilot: Some(agent.autopilot.status.lock().unwrap().clone()),
     }))
 }
 
@@ -395,45 +398,7 @@ async fn join(State(agent): AgentState, Json(req): Json<JoinRequest>) -> ApiResu
     if agent.dev {
         return Err(anyhow!("the local dev cluster cannot have more machines").into());
     }
-    let machine = agent
-        .mutate(|s| {
-            if let Some(existing) = s.machines.values().find(|m| m.name == req.name) {
-                if existing.wg_pubkey == req.wg_pubkey {
-                    return Ok(existing.clone()); // re-running `machine add` is fine
-                }
-                bail!("a machine named '{}' already exists", req.name);
-            }
-            if let Some(existing) = s.machines.values().find(|m| m.public_ip == req.public_ip) {
-                bail!(
-                    "{} is already in the cluster as '{}'",
-                    req.public_ip,
-                    existing.name
-                );
-            }
-            let id = s.next_machine_id.max(s.machines.keys().copied().max().unwrap_or(0)) + 1;
-            s.next_machine_id = id;
-            let m = Machine {
-                id,
-                name: req.name.clone(),
-                public_ip: req.public_ip.clone(),
-                overlay_ip: mesh::overlay_ip(id),
-                wg_pubkey: req.wg_pubkey.clone(),
-                os: req.os.clone(),
-                arch: req.arch.clone(),
-                cpus: req.cpus,
-                memory_mb: req.memory_mb,
-                region: req.region.clone(),
-                provider: req.provider.clone(),
-                monthly_cost: req.monthly_cost,
-                status: MachineStatus::Ready,
-                joined_at: now(),
-                maintenance: None,
-                last_maintenance: now(),
-            };
-            s.machines.insert(id, m.clone());
-            Ok(m)
-        })
-        .await?;
+    let machine = agent.mutate(|s| register_machine(s, &req)).await?;
     agent.event("info", format!("machine {} joined the cluster", machine.name));
     let state = (*agent.snapshot()).clone();
     Ok(Json(JoinResponse {
@@ -446,6 +411,45 @@ async fn join(State(agent): AgentState, Json(req): Json<JoinRequest>) -> ApiResu
         machine,
         state,
     }))
+}
+
+/// Add a machine to the cluster state (idempotent for the same name + key).
+pub fn register_machine(s: &mut ClusterState, req: &JoinRequest) -> anyhow::Result<Machine> {
+    if let Some(existing) = s.machines.values().find(|m| m.name == req.name) {
+        if existing.wg_pubkey == req.wg_pubkey {
+            return Ok(existing.clone()); // re-running `machine add` is fine
+        }
+        bail!("a machine named '{}' already exists", req.name);
+    }
+    if let Some(existing) = s.machines.values().find(|m| m.public_ip == req.public_ip) {
+        bail!(
+            "{} is already in the cluster as '{}'",
+            req.public_ip,
+            existing.name
+        );
+    }
+    let id = s.next_machine_id.max(s.machines.keys().copied().max().unwrap_or(0)) + 1;
+    s.next_machine_id = id;
+    let m = Machine {
+        id,
+        name: req.name.clone(),
+        public_ip: req.public_ip.clone(),
+        overlay_ip: mesh::overlay_ip(id),
+        wg_pubkey: req.wg_pubkey.clone(),
+        os: req.os.clone(),
+        arch: req.arch.clone(),
+        cpus: req.cpus,
+        memory_mb: req.memory_mb,
+        region: req.region.clone(),
+        provider: req.provider.clone(),
+        monthly_cost: req.monthly_cost,
+        status: MachineStatus::Ready,
+        joined_at: now(),
+        maintenance: None,
+        last_maintenance: now(),
+    };
+    s.machines.insert(id, m.clone());
+    Ok(m)
 }
 
 async fn machine_action(
@@ -932,4 +936,93 @@ async fn set_settings(
         })
         .await?;
     Ok(Json(settings))
+}
+
+// ---------------------------------------------------------------------------
+// autopilot
+
+fn autopilot_view(agent: &Agent) -> AutopilotView {
+    let s = agent.snapshot();
+    AutopilotView {
+        enabled: s.settings.autopilot,
+        budget: s.settings.monthly_budget,
+        min_machines: s.settings.min_machines,
+        max_machines: s.settings.max_machines,
+        status: agent.autopilot.status.lock().unwrap().clone(),
+    }
+}
+
+async fn get_autopilot(State(agent): AgentState) -> ApiResult<AutopilotView> {
+    let mut v = autopilot_view(&agent);
+    if v.status.leader_ssh_key.is_empty() {
+        if let Ok((_, public)) = super::autopilot::leader_key(&agent).await {
+            v.status.leader_ssh_key = public;
+        }
+    }
+    Ok(Json(v))
+}
+
+async fn set_autopilot(State(agent): AgentState, Json(req): Json<AutopilotRequest>) -> ApiResult<AutopilotView> {
+    if agent.dev && req.enabled == Some(true) {
+        return Err(anyhow!("the local dev cluster can't buy servers").into());
+    }
+    for p in req.tokens.keys() {
+        crate::cli::providers::canonical(p)?;
+    }
+    agent
+        .mutate(|s| {
+            for (p, t) in &req.tokens {
+                let p = crate::cli::providers::canonical(p)?.to_string();
+                s.provider_tokens.insert(p, t.clone());
+            }
+            for k in &req.ssh_keys {
+                if !s.ssh_keys.contains(k) {
+                    s.ssh_keys.push(k.clone());
+                }
+            }
+            if let Some(b) = req.budget {
+                s.settings.monthly_budget = b.max(0.0);
+            }
+            if let Some(m) = req.min_machines {
+                s.settings.min_machines = m.max(1);
+            }
+            if let Some(m) = req.max_machines {
+                s.settings.max_machines = m.max(1);
+            }
+            if s.settings.min_machines > s.settings.max_machines {
+                bail!("min_machines can't be larger than max_machines");
+            }
+            if let Some(e) = req.enabled {
+                if e && s.provider_tokens.is_empty() {
+                    bail!("the autopilot needs a provider token (hetzner or digitalocean)");
+                }
+                s.settings.autopilot = e;
+            }
+            Ok(())
+        })
+        .await?;
+    let v = autopilot_view(&agent);
+    agent.event(
+        "info",
+        if v.enabled {
+            format!("autopilot on (budget {})", if v.budget > 0.0 { format!("{:.2}/month", v.budget) } else { "unlimited".into() })
+        } else {
+            "autopilot off".into()
+        },
+    );
+    Ok(Json(v))
+}
+
+async fn provision_machine(State(agent): AgentState, Json(req): Json<ProvisionRequest>) -> ApiResult<Machine> {
+    validate_name("machine", &req.name)?;
+    let (key, _) = super::autopilot::leader_key(&agent).await?;
+    let ssh = super::autopilot::leader_ssh(&agent, &req.ssh, req.port.unwrap_or(22), &key);
+    let ip = match &req.public_ip {
+        Some(ip) => ip.clone(),
+        None => ssh.host().to_string(),
+    };
+    let m = super::autopilot::provision(&agent, &ssh, &req.name, &ip, None, None, None).await?;
+    agent.autopilot.status.lock().unwrap().working_on = None;
+    agent.event("info", format!("machine {} joined the cluster (set up by the leader)", m.name));
+    Ok(Json(m))
 }

@@ -100,6 +100,10 @@ function render(st) {
     const over = st.settings.monthly_budget > 0 && st.monthly_cost > st.settings.monthly_budget;
     meta += `<span>est. <b class="${over ? "bad" : ""}">${st.monthly_cost.toFixed(2)}</b>/month${st.settings.monthly_budget > 0 ? " of " + st.settings.monthly_budget.toFixed(2) : ""}</span>`;
   }
+  if (st.settings.autopilot) {
+    const ap = st.autopilot || {};
+    meta += `<span>autopilot <b class="ok">on</b>${ap.working_on ? " · " + esc(ap.working_on) : ap.last_decision ? " · " + esc(ap.last_decision) : ""}</span>`;
+  }
   meta += `<span>auto-updates <b>${st.settings.auto_updates ? "on" : "off"}</b>${st.settings.auto_updates && st.settings.update_window ? " (" + esc(st.settings.update_window) + " UTC)" : ""}</span>`;
   $("meta").innerHTML = meta;
 
