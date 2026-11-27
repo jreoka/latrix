@@ -253,6 +253,11 @@ latrix autopilot on --budget 50 --max-machines 6
 latrix autopilot off       # servers stay as they are
 ```
 
+Stop using a provider with `latrix provider unset digitalocean`: it removes
+the token from this computer and the cluster. Remove machines that run there
+(`latrix machine remove <name> --destroy`) while the token still works, then
+revoke it in the provider's console.
+
 Your provider token is stored in the cluster's state, which is root-only
 (0600) on your servers and never shown in status output. Use a token
 scoped to a dedicated project.

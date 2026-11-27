@@ -324,7 +324,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Compose(ComposeCmd::Convert { file, write }) => return compose_convert(&file, write),
         Cmd::Cluster(ClusterCmd::Connect { target, port, key }) => return cluster_connect(&target, port, key).await,
         Cmd::Cluster(c) => return cluster_cmd(c),
-        Cmd::Provider(p) => return provider_cmd(p).await,
+        Cmd::Provider(p) => return provider_cmd(p, cl).await,
         Cmd::K8s(k) => return k8s::k8s_cmd(cl, k).await,
         Cmd::Rexctl { action: Some(RexctlCmd::Inspect { file, skip_verify }) } => {
             return rexctl::inspect(&file, skip_verify);
@@ -814,7 +814,7 @@ async fn keys_cmd(cfg: &CliConfig, cl: Option<&str>, action: KeysCmd) -> Result<
     Ok(())
 }
 
-async fn provider_cmd(p: ProviderCmd) -> Result<()> {
+async fn provider_cmd(p: ProviderCmd, cl: Option<&str>) -> Result<()> {
     let mut cfg = CliConfig::load()?;
     match p {
         ProviderCmd::Set { provider, token } => {
@@ -834,6 +834,58 @@ async fn provider_cmd(p: ProviderCmd) -> Result<()> {
             cfg.providers.insert(p.into(), token);
             cfg.save()?;
             println!("saved {p} token in {}", CliConfig::path().display());
+        }
+        ProviderCmd::Unset { provider } => {
+            let lower = provider.to_ascii_lowercase();
+            if lower == "cloudflare" || lower == "cf" {
+                if cfg.providers.remove("cloudflare").is_some() {
+                    cfg.save()?;
+                    println!("removed cloudflare token from {}", CliConfig::path().display());
+                } else {
+                    println!("no cloudflare token saved in {}", CliConfig::path().display());
+                }
+                println!("note: `latrix dns off` also disables Cloudflare DNS on the cluster");
+                return Ok(());
+            }
+            let p = providers::canonical(&provider)?;
+            if cfg.providers.remove(p).is_some() {
+                cfg.save()?;
+                println!("removed {p} token from {}", CliConfig::path().display());
+            } else {
+                println!("no {p} token saved in {}", CliConfig::path().display());
+            }
+            match connect(&cfg, cl).await {
+                Ok((_, _, c)) => {
+                    let remaining: Vec<String> = c.delete(&format!("/v1/providers/{p}")).await?;
+                    println!(
+                        "removed {p} token from the cluster (autopilot has tokens for: {})",
+                        if remaining.is_empty() { "none".into() } else { remaining.join(", ") }
+                    );
+                    let st: StatusView = c.get("/v1/status").await?;
+                    let on_provider: Vec<&str> = st
+                        .machines
+                        .iter()
+                        .filter(|m| m.machine.provider.as_ref().map(|x| x.provider.as_str()) == Some(p))
+                        .map(|m| m.machine.name.as_str())
+                        .collect();
+                    if !on_provider.is_empty() {
+                        println!(
+                            "note: still running on {p}: {} — remove them with `latrix machine remove <name> --destroy`\n\
+                             (while the token still works at {p}), then revoke the token in the {p} console",
+                            on_provider.join(", ")
+                        );
+                    } else {
+                        println!("note: revoke the token in the {p} console to fully disconnect it");
+                    }
+                    if remaining.is_empty() {
+                        println!("note: without a provider token the autopilot can't buy servers");
+                    }
+                }
+                Err(e) => {
+                    println!("note: could not reach the cluster ({e}); its copy of the {p} token is still there");
+                    println!("      run `latrix provider unset {p}` again when the cluster is reachable");
+                }
+            }
         }
         ProviderCmd::Sizes { provider } => {
             let p = providers::canonical(&provider)?;

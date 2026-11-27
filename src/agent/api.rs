@@ -94,6 +94,7 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/v1/rexctl/config", post(update_rexctl_config))
         .route("/v1/settings", get(get_settings).post(set_settings))
         .route("/v1/autopilot", get(get_autopilot).post(set_autopilot))
+        .route("/v1/providers/{provider}", delete(remove_provider))
         .route("/v1/ssh-keys", get(get_ssh_keys).post(set_ssh_keys))
         .route("/v1/upgrade-now", post(super::selfupdate::handle_now))
         .route("/v1/machines/provision", post(provision_machine))
@@ -1415,6 +1416,21 @@ async fn set_autopilot(State(agent): AgentState, Json(req): Json<AutopilotReques
         },
     );
     Ok(Json(v))
+}
+
+/// Drop a provider token from the cluster state (what the autopilot uses to
+/// buy, resize and destroy servers). The CLI's own copy is separate.
+async fn remove_provider(State(agent): AgentState, Path(provider): Path<String>) -> ApiResult<Vec<String>> {
+    let name = crate::cli::providers::canonical(&provider)?.to_string();
+    agent
+        .mutate(|s| {
+            s.provider_tokens.remove(&name);
+            Ok(())
+        })
+        .await?;
+    let remaining = agent.snapshot().provider_tokens.keys().cloned().collect::<Vec<_>>();
+    agent.event("info", format!("provider token for {name} removed (left: {})", if remaining.is_empty() { "none".into() } else { remaining.join(", ") }));
+    Ok(Json(remaining))
 }
 
 async fn provision_machine(State(agent): AgentState, Json(req): Json<ProvisionRequest>) -> ApiResult<Machine> {

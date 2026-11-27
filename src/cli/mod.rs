@@ -533,6 +533,9 @@ pub enum MachineCmd {
 pub enum ProviderCmd {
     /// Save an API token: latrix provider set hetzner <token>
     Set { provider: String, token: String },
+    /// Remove an API token (locally and on the cluster): latrix provider unset digitalocean
+    #[command(aliases = ["rm", "remove", "delete"])]
+    Unset { provider: String },
     /// List server sizes with monthly prices
     Sizes { provider: String },
 }
