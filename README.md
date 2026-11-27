@@ -214,6 +214,43 @@ Your provider token is stored in the cluster's state, which is root-only
 (0600) on your servers and never shown in status output. Use a token
 scoped to a dedicated project.
 
+## Backups
+
+```bash
+latrix backup myapp           # one app
+latrix backup --all --stop    # everything; --stop briefly stops apps with volumes for a consistent copy
+latrix restore ~/latrix-backups/myapp-2026-11-27-0207.latrix-backup.tar [--as myapp-copy]
+```
+
+A backup is a single file in `~/latrix-backups` (or `-o dir`) holding the
+app's config, secrets, image and a snapshot of every volume. Restoring
+recreates the app with its data on this or any other latrix cluster, without
+needing the source code. Backup files contain your secrets, so they're
+written readable only by you; keep them somewhere safe.
+
+## Moving from Fly.io
+
+```bash
+latrix import fly my-fly-app            # run where your `fly` CLI is logged in
+latrix import fly my-fly-app --from-source   # build from this directory instead of copying Fly's image
+```
+
+latrix reads the app through your `fly` CLI:
+
+- **Config:** `fly.toml` becomes `latrix.toml`. That covers the HTTP
+  service and health check, extra services, env, VM size, mounts and process
+  command.
+- **Secrets:** Fly never shows secret values, so they're read from a running
+  machine's environment.
+- **Image:** the deployed image is copied over (needs Docker locally).
+- **Volume data:** each volume is archived on the machine and copied.
+- **Domains:** your custom domains carry over, and latrix gets new
+  certificates once DNS points here.
+
+The import is also saved as a normal backup file. latrix then prints the
+DNS change for the cut-over. Fly process groups other than `app`, and
+`release_command`, are reported rather than migrated.
+
 ## Kubernetes
 
 Already have a Kubernetes cluster (k3s, DOKS, GKE, EKS, AKS...)? Register it
@@ -269,6 +306,8 @@ latrix --cluster prod status
 | `latrix secrets set <app> KEY=value` | secrets as env vars (triggers a rolling restart) |
 | `latrix console <app> [-- cmd]` | shell into an instance |
 | `latrix up [--budget 30]` | buy the cheapest server and turn on the autopilot |
+| `latrix backup [app] [--all] [--stop]` / `latrix restore <file>` | full app backups to your computer |
+| `latrix import fly <app>` | move a Fly.io app (config, secrets, image, data, domains) |
 | `latrix autopilot on\|off\|status` | automatic buying, resizing and deleting of servers |
 | `latrix machine list\|add\|create\|remove\|drain\|cordon\|uncordon\|update\|ssh` | machines |
 | `latrix volumes`, `latrix certs`, `latrix events` | the rest of the state |

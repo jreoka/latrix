@@ -17,6 +17,7 @@ pub mod proxy;
 pub mod runtime;
 pub mod scheduler;
 pub mod store;
+pub mod transfer;
 pub mod volumes;
 
 use crate::state::*;

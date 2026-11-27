@@ -1,9 +1,11 @@
 //! Command line interface.
 
+pub mod backup;
 pub mod client;
 pub mod commands;
 pub mod compose;
 pub mod deploy;
+pub mod fly;
 pub mod k8s;
 pub mod machine;
 pub mod profile;
@@ -137,6 +139,33 @@ pub enum Cmd {
     /// Cloud provider API tokens and sizes/prices
     #[command(subcommand)]
     Provider(ProviderCmd),
+    /// Back up apps to this computer: config, secrets, image and volume data
+    Backup {
+        /// Apps to back up (default: the only app, or use --all)
+        apps: Vec<String>,
+        /// Back up every app
+        #[arg(long)]
+        all: bool,
+        /// Directory for the backup files (default: ~/latrix-backups)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+        /// Skip the image (restoring then needs the image or source again)
+        #[arg(long)]
+        no_image: bool,
+        /// Briefly stop apps with volumes for a fully consistent copy (databases)
+        #[arg(long)]
+        stop: bool,
+    },
+    /// Restore an app from a backup file (onto this or any other cluster)
+    Restore {
+        file: PathBuf,
+        /// Restore under a different app name
+        #[arg(long = "as")]
+        as_name: Option<String>,
+    },
+    /// Bring apps over from other platforms
+    #[command(subcommand)]
+    Import(ImportCmd),
     /// List volumes and their replicas
     Volumes,
     /// List TLS certificates
@@ -326,6 +355,27 @@ pub enum ComposeCmd {
         /// Write latrix.<service>.toml files next to the compose file
         #[arg(long)]
         write: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum ImportCmd {
+    /// Move a Fly.io app here: config, secrets, image, volume data, domains
+    Fly {
+        /// The Fly app name
+        app: String,
+        /// Name on latrix (default: same as on Fly)
+        #[arg(long = "as")]
+        as_name: Option<String>,
+        /// Don't copy volume data
+        #[arg(long)]
+        no_data: bool,
+        /// Don't copy secrets
+        #[arg(long)]
+        no_secrets: bool,
+        /// Build from the current directory instead of copying Fly's image
+        #[arg(long)]
+        from_source: bool,
     },
 }
 

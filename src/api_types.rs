@@ -239,6 +239,18 @@ pub struct ProvisionRequest {
     pub public_ip: Option<String>,
 }
 
+/// Everything needed to recreate an app elsewhere (used by backups).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppExport {
+    pub config: AppConfig,
+    pub image: String,
+    /// Machines whose registry has the image (empty = public image).
+    pub sources: Vec<u32>,
+    pub secrets: BTreeMap<String, String>,
+    pub count: u32,
+    pub volumes: Vec<Volume>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiErrorBody {
     pub error: String,

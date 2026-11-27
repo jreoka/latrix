@@ -54,7 +54,9 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/v1/local/report", post(report))
         .route("/v1/local/routes", get(routes))
         .route("/v1/local/build", post(builder::handle_build))
-        .route("/v1/local/logs", get(runtime::handle_logs));
+        .route("/v1/local/logs", get(runtime::handle_logs))
+        .route("/v1/local/volume-data", get(super::transfer::get_volume).post(super::transfer::put_volume))
+        .route("/v1/local/image", get(super::transfer::get_image).post(super::transfer::put_image));
 
     let cluster = Router::new()
         .route("/v1/status", get(status))
@@ -69,6 +71,7 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/v1/apps/{app}/restart", post(restart))
         .route("/v1/apps/{app}/rollback", post(rollback))
         .route("/v1/apps/{app}/secrets", post(secrets))
+        .route("/v1/apps/{app}/export", get(export_app))
         .route("/v1/settings", get(get_settings).post(set_settings))
         .route("/v1/autopilot", get(get_autopilot).post(set_autopilot))
         .route("/v1/machines/provision", post(provision_machine))
@@ -1025,4 +1028,22 @@ async fn provision_machine(State(agent): AgentState, Json(req): Json<ProvisionRe
     agent.autopilot.status.lock().unwrap().working_on = None;
     agent.event("info", format!("machine {} joined the cluster (set up by the leader)", m.name));
     Ok(Json(m))
+}
+
+/// The app's config, image, secrets (values) and volumes, for backups.
+async fn export_app(State(agent): AgentState, Path(app): Path<String>) -> ApiResult<AppExport> {
+    let s = agent.snapshot();
+    let a = s
+        .apps
+        .get(&app)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("app '{app}' not found")))?;
+    let rel = a.current_release().ok_or_else(|| anyhow!("app has no release"))?;
+    Ok(Json(AppExport {
+        config: rel.config.clone(),
+        image: rel.image.clone(),
+        sources: rel.sources.clone(),
+        secrets: a.secrets.clone(),
+        count: a.count,
+        volumes: s.volumes_of(&app).cloned().collect(),
+    }))
 }
