@@ -65,9 +65,19 @@ pub async fn sync(agent: &Arc<Agent>) -> Result<()> {
             m.name, m.wg_pubkey, m.overlay_ip
         ));
     }
-    let path = agent.data.join("wg.conf");
+    // Under /etc/wireguard: Ubuntu's AppArmor profile for `wg` (25.04+)
+    // only lets it read files there.
+    let dir = std::path::Path::new("/etc/wireguard");
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    }
+    let path = dir.join(format!("{WG_IFACE}.conf"));
     std::fs::write(&path, conf)?;
     set_private(&path);
+    let _ = std::fs::remove_file(agent.data.join("wg.conf")); // old location
     cmd("wg", &["syncconf", WG_IFACE, &path.display().to_string()]).await?;
     let addrs = cmd("ip", &["-4", "-o", "addr", "show", "dev", WG_IFACE]).await.unwrap_or_default();
     if !addrs.contains(&format!("inet {}/", agent.me.overlay_ip)) {

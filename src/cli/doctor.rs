@@ -14,6 +14,7 @@ check "latrix agent running" "systemctl is-active --quiet latrix" "restart it: s
 check "Docker running" "docker info" "start it: systemctl restart docker"
 check "agent API answering" "curl -fsS -m 3 http://127.0.0.1:7470/v1/local/ping" "the agent is up but not answering; see journalctl -u latrix -n 50"
 check "WireGuard interface latrix0" "ip link show latrix0" "the kernel could not create it: modprobe wireguard; then systemctl restart latrix"
+check "WireGuard config loaded" "wg show latrix0 listen-port | grep -q 51870" "see the agent log lines below"
 check "mesh address $ov on latrix0" "ip -4 addr show dev latrix0 | grep -q 'inet $ov/'" "mesh setup failed; see the agent log lines below"
 check "image registry running" "docker ps -q --filter name=latrix-registry --filter status=running | grep -q ." "it is restarted automatically within 30s; if not: docker logs latrix-registry"
 check "registry on 127.0.0.1:7471 (builds push here)" "curl -fsS -m 3 http://127.0.0.1:7471/v2/" "wait 30s after upgrading, then run doctor again"
