@@ -203,7 +203,7 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
             // final result line (which may be split across chunks).
             match buf.find(BUILD_RESULT_PREFIX) {
                 Some(i) => {
-                    out.write_all(buf[..i].as_bytes())?;
+                    out.write_all(&buf.as_bytes()[..i])?;
                     buf.drain(..i);
                     if let Some(end) = buf.find('\n') {
                         let line: String = buf.drain(..=end).collect();
@@ -217,7 +217,7 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
                     while !buf.is_char_boundary(cut) {
                         cut -= 1;
                     }
-                    out.write_all(buf[..cut].as_bytes())?;
+                    out.write_all(&buf.as_bytes()[..cut])?;
                     buf.drain(..cut);
                 }
             }
