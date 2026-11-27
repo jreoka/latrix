@@ -44,9 +44,15 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Compose(ComposeCmd::Convert { file, write }) => return compose_convert(&file, write),
         Cmd::Cluster(c) => return cluster_cmd(c),
         Cmd::Provider(p) => return provider_cmd(p).await,
+        Cmd::K8s(k) => return k8s::k8s_cmd(cl, k).await,
         _ => {}
     }
     let mut cfg = CliConfig::load()?;
+    if let Ok((name, p)) = cfg.profile(cl) {
+        if let Some(t) = p.kubernetes {
+            return k8s::dispatch(&cfg, &name, t, cli.cmd).await;
+        }
+    }
     match cli.cmd {
         Cmd::Deploy(args) => deploy_cmd(&cfg, cl, args).await,
         Cmd::Status => status(&cfg, cl).await,
@@ -202,6 +208,7 @@ async fn dev(data: Option<std::path::PathBuf>) -> Result<()> {
             token: id.token,
             local: true,
             machines: vec![],
+            kubernetes: None,
         },
     );
     if cfg.current.is_none() {
@@ -231,7 +238,13 @@ fn cluster_cmd(c: ClusterCmd) -> Result<()> {
                 .map(|(n, p)| {
                     vec![
                         format!("{}{}", n, if cfg.current.as_deref() == Some(n) { " *" } else { "" }),
-                        if p.local { "local".into() } else { format!("{} machine(s)", p.machines.len()) },
+                        if p.local {
+                            "local".into()
+                        } else if let Some(k) = &p.kubernetes {
+                            format!("kubernetes ({}, ns {})", k.context.as_deref().unwrap_or("current context"), k.namespace)
+                        } else {
+                            format!("{} machine(s)", p.machines.len())
+                        },
                         p.machines.iter().map(|m| m.ssh.clone()).collect::<Vec<_>>().join(", "),
                     ]
                 })
@@ -311,6 +324,13 @@ async fn deploy_cmd(cfg: &CliConfig, cl: Option<&str>, args: DeployArgs) -> Resu
         }
         return Ok(());
     }
+    let (app, base) = load_app_for_deploy(&args)?;
+    let (_, _, c) = connect(cfg, cl).await?;
+    deploy::deploy_one(&c, &app, &base, args.detach, args.message).await
+}
+
+/// latrix.toml plus --image / --git overrides, and the directory builds are relative to.
+pub fn load_app_for_deploy(args: &DeployArgs) -> Result<(crate::config::AppConfig, std::path::PathBuf)> {
     if !args.config.exists() {
         bail!(
             "{} not found. Run `latrix launch` to create one{}",
@@ -323,11 +343,11 @@ async fn deploy_cmd(cfg: &CliConfig, cl: Option<&str>, args: DeployArgs) -> Resu
         );
     }
     let mut app = crate::config::AppConfig::load(&args.config)?;
-    if let Some(img) = args.image {
+    if let Some(img) = args.image.clone() {
         app.build.image = Some(img);
         app.build.git = None;
     }
-    if let Some(g) = args.git {
+    if let Some(g) = args.git.clone() {
         let (url, branch) = match g.split_once('#') {
             Some((u, b)) => (u.to_string(), Some(b.to_string())),
             None => (g, None),
@@ -344,8 +364,7 @@ async fn deploy_cmd(cfg: &CliConfig, cl: Option<&str>, args: DeployArgs) -> Resu
         .map(|p| if p.as_os_str().is_empty() { Path::new(".") } else { p })
         .unwrap_or(Path::new("."))
         .to_path_buf();
-    let (_, _, c) = connect(cfg, cl).await?;
-    deploy::deploy_one(&c, &app, &base, args.detach, args.message).await
+    Ok((app, base))
 }
 
 fn bar(frac: f64) -> String {

@@ -224,6 +224,7 @@ pub fn convert(path: &Path) -> Result<Vec<Converted>> {
                     copies: 2,
                     sync: "30s".into(),
                     pre_sync: None,
+                    size: None,
                 });
             }
         }

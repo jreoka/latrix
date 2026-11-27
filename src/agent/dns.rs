@@ -85,7 +85,10 @@ pub fn parse_question(q: &[u8]) -> Option<(String, u16, usize)> {
         labels.push(String::from_utf8_lossy(label).to_ascii_lowercase());
         i += 1 + len;
     }
-    let qtype = u16::from_be_bytes([*q.get(i)?, *q.get(i + 1)?]);
+    if q.len() < i + 4 {
+        return None; // truncated question (no QCLASS)
+    }
+    let qtype = u16::from_be_bytes([q[i], q[i + 1]]);
     Some((labels.join("."), qtype, i + 4))
 }
 

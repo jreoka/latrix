@@ -4,6 +4,7 @@ pub mod client;
 pub mod commands;
 pub mod compose;
 pub mod deploy;
+pub mod k8s;
 pub mod machine;
 pub mod profile;
 pub mod providers;
@@ -168,6 +169,9 @@ pub enum Cmd {
     /// Switch between clusters
     #[command(subcommand)]
     Cluster(ClusterCmd),
+    /// Use a Kubernetes cluster as a deploy target
+    #[command(subcommand)]
+    K8s(K8sCmd),
     /// Upgrade the latrix agent on every machine to this version
     Upgrade {
         /// Only this machine
@@ -303,6 +307,58 @@ pub enum ComposeCmd {
         /// Write latrix.<service>.toml files next to the compose file
         #[arg(long)]
         write: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum K8sCmd {
+    /// Register a Kubernetes cluster (via kubectl) under a name
+    Add {
+        /// Name to use with --cluster / `latrix cluster use`
+        name: String,
+        /// kubeconfig context (default: kubectl's current context)
+        #[arg(long)]
+        context: Option<String>,
+        /// Path to a kubeconfig file
+        #[arg(long)]
+        kubeconfig: Option<String>,
+        /// Namespace for your apps
+        #[arg(long, default_value = "default")]
+        namespace: String,
+        /// Registry to push built images to, e.g. ghcr.io/you
+        #[arg(long)]
+        registry: Option<String>,
+        /// Ingress class (e.g. nginx, traefik); default: the cluster's default
+        #[arg(long)]
+        ingress_class: Option<String>,
+        /// StorageClass for volumes; default: the cluster's default
+        #[arg(long)]
+        storage_class: Option<String>,
+        /// Platform to build images for
+        #[arg(long, default_value = "linux/amd64")]
+        platform: String,
+        /// Give every HTTP app <app>.<base_domain> (needs wildcard DNS to your ingress)
+        #[arg(long)]
+        base_domain: Option<String>,
+    },
+    /// Print the Kubernetes YAML for latrix.toml (or a compose file)
+    Export {
+        #[arg(short, long, default_value = "latrix.toml")]
+        config: PathBuf,
+        #[arg(long)]
+        compose: Option<PathBuf>,
+        /// Image to use instead of [build] image / the registry
+        #[arg(long)]
+        image: Option<String>,
+    },
+    /// Install cert-manager + a Let's Encrypt issuer so domains get HTTPS
+    SetupTls {
+        /// Email for Let's Encrypt
+        #[arg(long)]
+        email: String,
+        /// ClusterIssuer name
+        #[arg(long, default_value = "letsencrypt")]
+        issuer: String,
     },
 }
 

@@ -84,7 +84,7 @@ if ! command -v docker >/dev/null 2>&1; then
         yum-config-manager --add-repo "$url" >/dev/null 2>&1 || true
       fi
       install_pkgs docker-ce docker-ce-cli containerd.io docker-buildx-plugin ;;
-    zypper) install_pkgs docker ;;
+    zypper) install_pkgs docker; install_pkgs docker-buildx || true ;;
     pacman) install_pkgs docker docker-buildx ;;
   esac
 fi

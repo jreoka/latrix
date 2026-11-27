@@ -151,7 +151,11 @@ pub async fn add(cfg: &mut CliConfig, cluster: Option<&str>, opts: AddOptions) -
         token: util::random_token(),
         local: false,
         machines: vec![],
+        kubernetes: None,
     });
+    if profile.kubernetes.is_some() {
+        bail!("'{cluster_name}' is a Kubernetes target; its nodes are managed by Kubernetes (use --cluster to pick or create another cluster)");
+    }
     if profile.local {
         bail!("'{cluster_name}' is the local dev cluster; use --cluster <name> to create a real one");
     }
@@ -174,11 +178,22 @@ pub async fn add(cfg: &mut CliConfig, cluster: Option<&str>, opts: AddOptions) -
     ssh.stream_script(BOOTSTRAP, "      ").await?;
 
     step(4, total, &format!("joining cluster '{cluster_name}'"));
-    let pubkey = ssh.run("latrix agent keygen").await?.trim().to_string();
+    let pubkey = ssh.run("/usr/local/bin/latrix agent keygen").await?.trim().to_string();
     let public_ip = match &opts.public_ip {
         Some(ip) => ip.clone(),
-        None => resolve_ip(ssh.host()).await?,
+        None => match resolve_ip(ssh.host()).await {
+            Ok(ip) => ip,
+            // e.g. a Host alias from ~/.ssh/config: ask the machine itself.
+            Err(_) => ssh
+                .run("ip -4 route get 1.1.1.1 | sed -n 's/.* src \\([0-9.]*\\).*/\\1/p'")
+                .await?
+                .trim()
+                .to_string(),
+        },
     };
+    if public_ip.is_empty() {
+        bail!("could not determine the machine's public IP; pass --public-ip");
+    }
     if first {
         let init = InitFirst {
             cluster: cluster_name.clone(),
@@ -190,9 +205,9 @@ pub async fn add(cfg: &mut CliConfig, cluster: Option<&str>, opts: AddOptions) -
             provider: opts.provider.clone(),
             monthly_cost: opts.monthly_cost,
         };
-        ssh.run_input("latrix agent init-first", Some(&serde_json::to_vec(&init)?)).await?;
+        ssh.run_input("/usr/local/bin/latrix agent init-first", Some(&serde_json::to_vec(&init)?)).await?;
     } else {
-        let facts: Facts = serde_json::from_str(&ssh.run("latrix agent facts").await?)?;
+        let facts: Facts = serde_json::from_str(&ssh.run("/usr/local/bin/latrix agent facts").await?)?;
         let join: JoinResponse = client
             .as_ref()
             .unwrap()
@@ -216,7 +231,7 @@ pub async fn add(cfg: &mut CliConfig, cluster: Option<&str>, opts: AddOptions) -
             identity: join.identity,
             state: join.state,
         };
-        ssh.run_input("latrix agent write-join", Some(&serde_json::to_vec(&wj)?)).await?;
+        ssh.run_input("/usr/local/bin/latrix agent write-join", Some(&serde_json::to_vec(&wj)?)).await?;
     }
     ssh.run("systemctl enable latrix >/dev/null 2>&1; systemctl restart latrix").await?;
 

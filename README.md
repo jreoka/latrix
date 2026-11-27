@@ -16,6 +16,7 @@ a NUC under your desk...) and it:
 - **does HTTPS for you**: Let's Encrypt certificates, renewed automatically and served by every machine
 - **updates the OS for you**: one machine at a time, in a time window. It moves work off first, reboots if needed, then moves work back
 - **runs the control plane on your servers**, so nothing has to keep running on your PC
+- **also deploys to Kubernetes**: the same `latrix.toml` and commands work on any Kubernetes cluster you already have
 
 ```
 $ latrix machine add root@203.0.113.10
@@ -164,6 +165,46 @@ reaching each other by their compose names, even across machines. Bind mounts
 (`./dir:/path`) are skipped, because they can't follow an app between
 machines. Bake those files into the image instead.
 
+## Kubernetes
+
+Already have a Kubernetes cluster (k3s, DOKS, GKE, EKS, AKS...)? Register it
+and the same `latrix.toml` and commands work there. latrix drives the
+`kubectl` on your computer, so anything kubectl can reach works.
+
+```bash
+latrix k8s add prod --context my-cluster --namespace apps --registry ghcr.io/you
+latrix --cluster prod k8s setup-tls --email you@example.com   # optional: cert-manager + Let's Encrypt
+latrix --cluster prod deploy        # or `latrix cluster use prod`, then plain `latrix deploy`
+latrix --cluster prod status
+```
+
+| latrix.toml | becomes |
+|---|---|
+| app | Deployment (rolling updates, spread across nodes) |
+| app with `[[volumes]]` | StatefulSet with a PersistentVolumeClaim per volume (`size = "20GB"`) |
+| `[http]` / `[[ports]]` | Service `<app>`, plus `<service>` for compose short names |
+| `[[ports]] public = true` | Service of type LoadBalancer |
+| `[http] domains` | Ingress, with TLS via cert-manager after `k8s setup-tls` |
+| `[scale] min/max` | HorizontalPodAutoscaler |
+| secrets | Secret `<app>-secrets` |
+
+- **Builds** run on your computer with Docker (`buildx`, for `--platform`,
+  default `linux/amd64`). They're pushed to the registry you set with
+  `--registry`, and `:latest` doubles as the build cache. You need to be
+  logged in to it (`docker login`). Prebuilt images (`[build] image`) need
+  nothing extra.
+- **Rollouts** are watched. If a release doesn't become ready, latrix
+  re-applies the previous one and marks the new one failed. Release history
+  lives in a ConfigMap `<app>-latrix`, so `releases`, `rollback`, `scale`,
+  `restart`, `secrets`, `logs`, `console`, `ps` and `destroy` all work.
+- `latrix k8s export` prints the YAML instead, if you'd rather apply it yourself.
+- **Declare ports on Kubernetes.** latrix's own machines discover EXPOSEd
+  ports automatically, but Kubernetes can't, so an app with no `[http]` or
+  `[[ports]]` gets no Service.
+- **Nodes** are managed by Kubernetes, not latrix. `latrix machine list` shows
+  them; draining, OS updates and volume replication are the cluster's job
+  there.
+
 ## Commands
 
 | | |
@@ -183,6 +224,7 @@ machines. Bake those files into the image instead.
 | `latrix settings [key=value ...]` | cluster settings (see below) |
 | `latrix upgrade` | roll a new latrix version out to every machine (apps keep running) |
 | `latrix cluster list\|use\|forget` | switch between clusters |
+| `latrix k8s add\|export\|setup-tls` | use a Kubernetes cluster as a target |
 
 Every command has `--help`.
 
@@ -255,7 +297,9 @@ person or a small team. To keep it simple:
   replication or backups, or set `pre_sync` to take consistent snapshots.
 - **One writer per volume:** apps with volumes run a single instance (with
   fast failover).
-- **No Kubernetes integration.** Not yet built: budget-driven automatic
+- **Kubernetes is a deploy target, not part of the mesh.** latrix doesn't
+  move apps between your own machines and a Kubernetes cluster. Not yet
+  built: budget-driven automatic
   creation and resizing of cloud machines. latrix can *create* Hetzner and
   DigitalOcean servers, shows estimated costs, and warns when you go over
   `monthly_budget`.

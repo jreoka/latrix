@@ -25,6 +25,44 @@ pub struct ClusterProfile {
     pub local: bool,
     #[serde(default)]
     pub machines: Vec<MachineSsh>,
+    /// Set when this "cluster" is a Kubernetes cluster used as a deploy target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubernetes: Option<K8sTarget>,
+}
+
+/// A Kubernetes cluster latrix deploys to (through kubectl).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct K8sTarget {
+    /// kubeconfig context (default: kubectl's current context)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kubeconfig: Option<String>,
+    #[serde(default = "default_namespace")]
+    pub namespace: String,
+    /// Registry for images built by `latrix deploy`, e.g. ghcr.io/you
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_class: Option<String>,
+    /// cert-manager ClusterIssuer used for HTTPS (set by `latrix k8s setup-tls`)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_issuer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_class: Option<String>,
+    /// Platform images are built for.
+    #[serde(default = "default_platform")]
+    pub platform: String,
+    /// Every app with [http] also gets <app>.<base_domain>.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_domain: Option<String>,
+}
+
+pub fn default_namespace() -> String {
+    "default".into()
+}
+pub fn default_platform() -> String {
+    "linux/amd64".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -7,6 +7,11 @@ app = "postgres"
 [build]
 image = "postgres:16"
 
+# latrix's own machines discover EXPOSEd ports automatically; declaring it
+# also makes it reachable on Kubernetes targets.
+[[ports]]
+port = 5432
+
 [scale]
 cpu = 1
 memory = "1GB"

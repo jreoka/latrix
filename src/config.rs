@@ -200,6 +200,10 @@ pub struct VolumeConfig {
     /// (e.g. "sqlite3 /data/db.sqlite '.backup /data/db.backup'").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_sync: Option<String>,
+    /// Size to request on Kubernetes (PersistentVolumeClaim), e.g. "20GB".
+    /// latrix's own machines don't need it (volumes use the machine's disk).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size: Option<String>,
 }
 
 fn default_copies() -> u32 {
@@ -307,6 +311,9 @@ impl AppConfig {
                 bail!("volume '{}' copies must be at least 1", v.name);
             }
             parse_duration(&v.sync).with_context(|| format!("volume '{}' sync", v.name))?;
+            if let Some(sz) = &v.size {
+                parse_size_mb(sz).with_context(|| format!("volume '{}' size", v.name))?;
+            }
         }
         if !self.volumes.is_empty() && max > 1 {
             bail!(

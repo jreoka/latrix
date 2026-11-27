@@ -13,6 +13,14 @@ use clap::Parser;
 async fn main() {
     let cli = cli::Cli::parse();
     let is_agent = matches!(cli.cmd, cli::Cmd::Agent(cli::AgentCmd::Run { .. }) | cli::Cmd::Dev { .. });
+    if !is_agent {
+        // Behave like other CLI tools when piped into `head` etc. (exit quietly
+        // instead of panicking on a closed pipe). The agent keeps Rust's default.
+        #[cfg(unix)]
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        }
+    }
     let default = if is_agent { "info" } else { "warn" };
     tracing_subscriber::fmt()
         .with_env_filter(

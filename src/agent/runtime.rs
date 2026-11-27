@@ -478,6 +478,23 @@ async fn exposed_ports(image: &str) -> Vec<u16> {
         .unwrap_or_default()
 }
 
+/// Like Docker named volumes: a brand-new volume starts with the image's
+/// files at that path and the same owner/permissions, so images that run as
+/// a non-root user (postgres, many others) can write to it. Best effort.
+async fn seed_volume(image: &str, dir: &std::path::Path, path: &str) {
+    let script = r#"if [ -d "$P" ]; then cp -a "$P"/. /__latrix_vol/ 2>/dev/null; chown "$(stat -c %u:%g "$P")" /__latrix_vol 2>/dev/null; chmod "$(stat -c %a "$P")" /__latrix_vol 2>/dev/null; fi; true"#;
+    let mount = format!("{}:/__latrix_vol", dir.display());
+    let env = format!("P={path}");
+    if let Err(e) = cmd(
+        "docker",
+        &["run", "--rm", "--user", "0", "--entrypoint", "sh", "-e", &env, "-v", &mount, image, "-c", script],
+    )
+    .await
+    {
+        debug!("could not seed volume {} from {image}: {e}", dir.display());
+    }
+}
+
 async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
     let s = agent.snapshot();
     let app = s.apps.get(&inst.app).context("app no longer exists")?;
@@ -542,7 +559,11 @@ async fn start_instance(agent: &Arc<Agent>, inst: &Instance) -> Result<()> {
     }
     for v in &cfg.volumes {
         let dir = agent.data.join("volumes").join(Volume::dir_name(&inst.app, &v.name));
+        let fresh = std::fs::read_dir(&dir).map(|mut d| d.next().is_none()).unwrap_or(true);
         std::fs::create_dir_all(&dir)?;
+        if fresh {
+            seed_volume(&rel.image, &dir, &v.path).await;
+        }
         args.push("-v".into());
         args.push(format!("{}:{}", dir.display(), v.path));
     }

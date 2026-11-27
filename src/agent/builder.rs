@@ -155,16 +155,23 @@ async fn build(
     for c in &spec.cache_from {
         let _ = tx.send(format!("==> using cache from {c}\n")).await;
     }
-    let mut args: Vec<String> = vec![
-        "build".into(),
-        "--progress=plain".into(),
+    // BuildKit needs the buildx plugin; without it fall back to the classic builder.
+    let buildkit = cmd("docker", &["buildx", "version"]).await.is_ok();
+    if !buildkit {
+        let _ = tx.send("==> docker buildx not found, using the classic builder (slower, no cache sharing)\n".into()).await;
+    }
+    let mut args: Vec<String> = vec!["build".into()];
+    if buildkit {
+        args.push("--progress=plain".into());
+    }
+    args.extend([
         "-t".into(),
         image.into(),
         "-f".into(),
         dockerfile.display().to_string(),
         "--build-arg".into(),
         "BUILDKIT_INLINE_CACHE=1".into(),
-    ];
+    ]);
     for c in &spec.cache_from {
         args.push("--cache-from".into());
         args.push(c.clone());
@@ -178,7 +185,8 @@ async fn build(
         args.push(format!("{k}={v}"));
     }
     args.push(ctx.display().to_string());
-    run_streaming("docker", &args, &[("DOCKER_BUILDKIT", "1")], tx).await?;
+    let bk = if buildkit { "1" } else { "0" };
+    run_streaming("docker", &args, &[("DOCKER_BUILDKIT", bk)], tx).await?;
     let _ = tx.send(format!("==> pushing {image} to the cluster registry\n")).await;
     run_streaming("docker", &["push".to_string(), image.to_string()], &[], tx).await?;
     Ok(())

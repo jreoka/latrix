@@ -94,9 +94,11 @@ impl Agent {
     fn persist(&self, s: &ClusterState) {
         match serde_json::to_vec(s) {
             Ok(bytes) => {
-                if let Err(e) = util::write_atomic(&self.data.join("state.json"), &bytes) {
+                let path = self.data.join("state.json");
+                if let Err(e) = util::write_atomic(&path, &bytes) {
                     warn!("could not persist state: {e}");
                 }
+                super::set_private(&path); // contains secrets
             }
             Err(e) => warn!("could not serialize state: {e}"),
         }

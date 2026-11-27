@@ -40,6 +40,9 @@ impl Tunnel {
             "-N".to_string(),
             "-o".into(),
             "ExitOnForwardFailure=yes".into(),
+            // Fail fast so a dead machine doesn't stall every command.
+            "-o".into(),
+            "ConnectTimeout=6".into(),
             "-L".into(),
             format!("127.0.0.1:{port}:127.0.0.1:{API_PORT}"),
             "-p".into(),

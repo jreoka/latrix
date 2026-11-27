@@ -135,6 +135,17 @@ pub fn init_first(
     dev: bool,
 ) -> Result<()> {
     std::fs::create_dir_all(data)?;
+    // Re-running `machine add` on the first machine must not wipe the cluster.
+    if let Ok(existing) = load_json::<NodeIdentity>(&data.join("node.json")) {
+        if existing.token == token {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "this machine already belongs to cluster '{}'. To reset it, remove {} first",
+            existing.cluster,
+            data.display()
+        );
+    }
     let overlay_ip = if dev { "127.0.0.1".to_string() } else { mesh::overlay_ip(1) };
     let id = NodeIdentity {
         machine_id: 1,
@@ -185,6 +196,7 @@ pub fn write_join(data: &Path, id: &NodeIdentity, state: &ClusterState) -> Resul
     util::write_atomic(&data.join("node.json"), &serde_json::to_vec_pretty(id)?)?;
     util::write_atomic(&data.join("state.json"), &serde_json::to_vec_pretty(state)?)?;
     set_private(&data.join("node.json"));
+    set_private(&data.join("state.json"));
     Ok(())
 }
 

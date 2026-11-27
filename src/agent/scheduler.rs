@@ -927,8 +927,7 @@ fn rebalance(s: &mut ClusterState, cx: &mut Ctx) {
             a.current_release()
                 .map(|r| r.status == ReleaseStatus::Deploying)
                 .unwrap_or(true)
-        })
-        && s.instances.values().all(|i| live.healthy(i));
+        });
     if !calm {
         return;
     }
@@ -949,7 +948,7 @@ fn rebalance(s: &mut ClusterState, cx: &mut Ctx) {
         if cfg.stateful() {
             continue;
         }
-        let insts: Vec<Instance> = s.instances_of(&name).cloned().collect();
+        let insts: Vec<Instance> = s.instances_of(&name).filter(|i| !i.stopping).cloned().collect();
         let mut per: HashMap<u32, Vec<&Instance>> = HashMap::new();
         for i in &insts {
             per.entry(i.machine).or_default().push(i);
@@ -957,7 +956,7 @@ fn rebalance(s: &mut ClusterState, cx: &mut Ctx) {
         let crowded = per.iter().filter(|(_, v)| v.len() >= 2).max_by_key(|(_, v)| v.len());
         let has_empty = ready.iter().any(|m| !per.contains_key(&m.id));
         if let (Some((_, v)), true) = (crowded, has_empty) {
-            let victim = v[0].clone();
+            let Some(victim) = v.iter().find(|i| live.healthy(i)).map(|i| (*i).clone()) else { continue };
             let exclude: Vec<u32> = per.keys().copied().collect();
             if let Some(t) = place(s, live, &name, cfg, &exclude) {
                 let id = create(s, &name, victim.release, t, now);
@@ -989,6 +988,7 @@ fn rebalance(s: &mut ClusterState, cx: &mut Ctx) {
                 .map(|c| !c.stateful())
                 .unwrap_or(false)
         })
+        .filter(|i| !i.stopping && i.replaces.is_none() && live.healthy(i))
         .filter(|i| {
             // don't stack two of the same app on the target
             !s.instances_of(&i.app).any(|o| o.machine == lo_id)
@@ -1198,6 +1198,7 @@ mod tests {
                 copies: 2,
                 sync: "30s".into(),
                 pre_sync: None,
+                size: None,
             });
             s.volumes.insert(
                 format!("{name}__data"),
