@@ -835,7 +835,7 @@ async fn provider_cmd(p: ProviderCmd, cl: Option<&str>) -> Result<()> {
             cfg.save()?;
             println!("saved {p} token in {}", CliConfig::path().display());
         }
-        ProviderCmd::Unset { provider } => {
+        ProviderCmd::Unset { provider, keep_machines, yes } => {
             let lower = provider.to_ascii_lowercase();
             if lower == "cloudflare" || lower == "cf" {
                 if cfg.providers.remove("cloudflare").is_some() {
@@ -848,43 +848,108 @@ async fn provider_cmd(p: ProviderCmd, cl: Option<&str>) -> Result<()> {
                 return Ok(());
             }
             let p = providers::canonical(&provider)?;
+            if keep_machines {
+                if cfg.providers.remove(p).is_some() {
+                    cfg.save()?;
+                    println!("removed {p} token from {}", CliConfig::path().display());
+                } else {
+                    println!("no {p} token saved in {}", CliConfig::path().display());
+                }
+                match connect(&cfg, cl).await {
+                    Ok((_, _, c)) => {
+                        let remaining: Vec<String> = c.delete(&format!("/v1/providers/{p}")).await?;
+                        println!(
+                            "removed {p} token from the cluster (autopilot has tokens for: {})",
+                            if remaining.is_empty() { "none".into() } else { remaining.join(", ") }
+                        );
+                        let st: StatusView = c.get("/v1/status").await?;
+                        let on_provider: Vec<&str> = st
+                            .machines
+                            .iter()
+                            .filter(|m| m.machine.provider.as_ref().map(|x| x.provider.as_str()) == Some(p))
+                            .map(|m| m.machine.name.as_str())
+                            .collect();
+                        if !on_provider.is_empty() {
+                            println!(
+                                "note: still running on {p}: {} — remove them with `latrix machine remove <name> --destroy`\n\
+                                 (while the token still works at {p}), then revoke the token in the {p} console",
+                                on_provider.join(", ")
+                            );
+                        } else {
+                            println!("note: revoke the token in the {p} console to fully disconnect it");
+                        }
+                        if remaining.is_empty() {
+                            println!("note: without a provider token the autopilot can't buy servers");
+                        }
+                    }
+                    Err(e) => {
+                        println!("note: could not reach the cluster ({e}); its copy of the {p} token is still there");
+                        println!("      run `latrix provider unset {p}` again when the cluster is reachable");
+                    }
+                }
+                return Ok(());
+            }
+            // Default: move the apps off the provider's machines and destroy
+            // them first, so nothing keeps billing after the token is gone.
+            if cfg.profile(cl).is_err() {
+                // No cluster yet: the token is only local.
+                if cfg.providers.remove(p).is_some() {
+                    cfg.save()?;
+                    println!("removed {p} token from {}", CliConfig::path().display());
+                } else {
+                    println!("no {p} token saved in {}", CliConfig::path().display());
+                }
+                return Ok(());
+            }
+            let (_, _, c) = connect(&cfg, cl).await.with_context(|| {
+                format!(
+                    "could not reach the cluster; refusing to remove the {p} token while machines may still run there (use --keep-machines to just drop the token)"
+                )
+            })?;
+            let st: StatusView = c.get("/v1/status").await?;
+            let doomed: Vec<_> = st
+                .machines
+                .iter()
+                .filter(|m| m.machine.provider.as_ref().map(|x| x.provider.as_str()) == Some(p))
+                .map(|m| (m.machine.name.clone(), m.instances))
+                .collect();
+            if !doomed.is_empty() {
+                println!("machines at {p}:");
+                for (name, inst) in &doomed {
+                    println!("  {name} ({inst} instance{})", if *inst == 1 { "" } else { "s" });
+                }
+                if !yes {
+                    print!("Move their apps to the other machines and destroy these servers? [y/N] ");
+                    std::io::stdout().flush()?;
+                    let mut line = String::new();
+                    std::io::stdin().lock().read_line(&mut line)?;
+                    if !matches!(line.trim(), "y" | "Y" | "yes") {
+                        bail!("aborted");
+                    }
+                }
+                for (name, _) in &doomed {
+                    machine::remove(&mut cfg, cl, name, false, true).await.with_context(|| {
+                        format!("stopping at {name}: the {p} token is kept so you can retry (or finish in the {p} console)")
+                    })?;
+                }
+            }
+            // The token goes last: everything at {p} is gone by now.
             if cfg.providers.remove(p).is_some() {
                 cfg.save()?;
-                println!("removed {p} token from {}", CliConfig::path().display());
-            } else {
-                println!("no {p} token saved in {}", CliConfig::path().display());
             }
-            match connect(&cfg, cl).await {
-                Ok((_, _, c)) => {
-                    let remaining: Vec<String> = c.delete(&format!("/v1/providers/{p}")).await?;
-                    println!(
-                        "removed {p} token from the cluster (autopilot has tokens for: {})",
-                        if remaining.is_empty() { "none".into() } else { remaining.join(", ") }
-                    );
-                    let st: StatusView = c.get("/v1/status").await?;
-                    let on_provider: Vec<&str> = st
-                        .machines
-                        .iter()
-                        .filter(|m| m.machine.provider.as_ref().map(|x| x.provider.as_str()) == Some(p))
-                        .map(|m| m.machine.name.as_str())
-                        .collect();
-                    if !on_provider.is_empty() {
-                        println!(
-                            "note: still running on {p}: {} — remove them with `latrix machine remove <name> --destroy`\n\
-                             (while the token still works at {p}), then revoke the token in the {p} console",
-                            on_provider.join(", ")
-                        );
-                    } else {
-                        println!("note: revoke the token in the {p} console to fully disconnect it");
-                    }
-                    if remaining.is_empty() {
-                        println!("note: without a provider token the autopilot can't buy servers");
-                    }
-                }
-                Err(e) => {
-                    println!("note: could not reach the cluster ({e}); its copy of the {p} token is still there");
-                    println!("      run `latrix provider unset {p}` again when the cluster is reachable");
-                }
+            // Reconnect: the old tunnel may have gone through a destroyed machine.
+            let (_, _, c) = connect(&cfg, cl).await?;
+            let remaining: Vec<String> = c.delete(&format!("/v1/providers/{p}")).await?;
+            if doomed.is_empty() {
+                println!("no machines at {p}");
+            }
+            println!(
+                "removed the {p} token from this computer and the cluster (autopilot has tokens for: {})",
+                if remaining.is_empty() { "none".into() } else { remaining.join(", ") }
+            );
+            println!("note: revoke the token in the {p} console to fully disconnect it");
+            if remaining.is_empty() {
+                println!("note: without a provider token the autopilot can't buy servers");
             }
         }
         ProviderCmd::Sizes { provider } => {
