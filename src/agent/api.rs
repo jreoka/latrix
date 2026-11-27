@@ -1081,6 +1081,7 @@ async fn set_autopilot(State(agent): AgentState, Json(req): Json<AutopilotReques
             Ok(())
         })
         .await?;
+    agent.autopilot.wake.notify_one();
     let v = autopilot_view(&agent);
     agent.event(
         "info",

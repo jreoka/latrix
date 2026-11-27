@@ -47,7 +47,7 @@ const DOWN_STREAK: u32 = 30;
 const RIGHTSIZE_STREAK: u32 = 60;
 /// Memory per machine reserved for the OS, Docker and latrix.
 const OVERHEAD_MB: f64 = 400.0;
-const MIN_SERVER_MB: u64 = 2048;
+const MIN_SERVER_MB: u64 = 1024;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Capacity {
@@ -84,6 +84,7 @@ pub struct Memory {
 pub struct Shared {
     pub status: Mutex<Status>,
     pub busy: AtomicBool,
+    pub wake: tokio::sync::Notify,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -254,8 +255,9 @@ fn decide_with(
         if total >= s.settings.max_machines {
             return nothing("more capacity needed, but max_machines reached");
         }
-        let shortfall_mem = (c.req_mem_mb / 0.7 - c.cap_mem_mb)
+        let need_mem = ((c.req_mem_mb / 0.7 - c.cap_mem_mb)
             .max(c.largest_mb as f64 * 1.2)
+            + OVERHEAD_MB)
             .max(MIN_SERVER_MB as f64);
         let shortfall_cpu = (c.req_cpu / 0.7 - c.cap_cpu).clamp(1.0, 16.0);
         if let Some((app, regions, mb)) = missing {
@@ -279,7 +281,7 @@ fn decide_with(
         } else {
             format!("apps need {:.0}% of current capacity", c.utilization * 100.0)
         };
-        return match providers::cheapest(offers, (shortfall_mem + OVERHEAD_MB) as u64, shortfall_cpu, arch, &prefer, room) {
+        return match providers::cheapest(offers, need_mem as u64, shortfall_cpu, arch, &prefer, room) {
             Some(o) => Decision::ScaleUp { offer: o.clone(), reason, replaces: None },
             None => nothing(&format!(
                 "{reason}, but no server fits the monthly budget ({:.2} used of {:.2})",
@@ -344,7 +346,7 @@ fn decide_with(
             let Some(price) = m.monthly_cost else { continue };
             let load_mem = s.reserved_mb(m.id) as f64;
             let load_cpu = s.reserved_cpu(m.id);
-            let need = (load_mem * 1.5).max(c.largest_mb as f64 * 1.2).max(MIN_SERVER_MB as f64) + OVERHEAD_MB;
+            let need = ((load_mem * 1.5).max(c.largest_mb as f64 * 1.2) + OVERHEAD_MB).max(MIN_SERVER_MB as f64);
             let local = offers_in(offers, pinned_region(s, m).as_deref());
             if let Some(o) = providers::cheapest(&local, need as u64, (load_cpu * 1.5).max(1.0), arch, &prefer, None) {
                 if o.price < price * 0.7 && o.memory_mb < m.memory_mb {
@@ -696,14 +698,31 @@ async fn set_surge(agent: &Arc<Agent>, temp: Option<u32>, phase: &str) {
         .await;
 }
 
+fn catalog_stale(
+    cached_at: Option<Instant>,
+    cached_tokens: &std::collections::BTreeMap<String, String>,
+    current_tokens: &std::collections::BTreeMap<String, String>,
+    now: Instant,
+) -> bool {
+    match cached_at {
+        None => true,
+        Some(t) => now.saturating_duration_since(t) > Duration::from_secs(3600) || cached_tokens != current_tokens,
+    }
+}
+
 pub async fn run(agent: Arc<Agent>) {
     tokio::time::sleep(Duration::from_secs(90)).await;
     let mut mem = Memory::default();
-    let mut catalog: Option<(Instant, Vec<Offer>)> = None;
+    let mut catalog_at: Option<Instant> = None;
+    let mut catalog_tokens: std::collections::BTreeMap<String, String> = Default::default();
+    let mut catalog_offers: Vec<Offer> = vec![];
     let mut price_error: Option<String> = None;
     let mut tick = tokio::time::interval(Duration::from_secs(60));
     loop {
-        tick.tick().await;
+        tokio::select! {
+            _ = tick.tick() => {}
+            _ = agent.autopilot.wake.notified() => {}
+        }
         if !agent.is_leader() {
             continue;
         }
@@ -726,13 +745,17 @@ pub async fn run(agent: Arc<Agent>) {
         let live = agent.live();
         heal(&agent, &live.view(), &mut mem).await;
 
-        // Prices change rarely; refresh hourly.
-        if catalog.as_ref().map(|(t, _)| t.elapsed() > Duration::from_secs(3600)).unwrap_or(true) {
+        // Prices change rarely; refresh hourly or whenever provider tokens change.
+        if catalog_stale(catalog_at, &catalog_tokens, &s.provider_tokens, Instant::now()) {
             let mut offers = vec![];
+            let mut fetched = std::collections::BTreeMap::new();
             price_error = None;
             for (p, token) in &s.provider_tokens {
                 match providers::catalog(p, token).await {
-                    Ok(o) => offers.extend(o),
+                    Ok(o) => {
+                        offers.extend(o);
+                        fetched.insert(p.clone(), token.clone());
+                    }
                     Err(e) => {
                         warn!("autopilot: {p} prices: {e:#}");
                         let short = if e.to_string().contains("401") { "the API token was rejected".to_string() } else { format!("{e:#}") };
@@ -740,11 +763,13 @@ pub async fn run(agent: Arc<Agent>) {
                     }
                 }
             }
-            if !offers.is_empty() {
-                catalog = Some((Instant::now(), offers));
+            if !offers.is_empty() || s.provider_tokens.is_empty() {
+                catalog_at = Some(Instant::now());
+                catalog_tokens = fetched;
+                catalog_offers = offers;
             }
         }
-        let offers = catalog.as_ref().map(|(_, o)| o.clone()).unwrap_or_default();
+        let offers = catalog_offers.clone();
         let s = agent.snapshot();
         if let Some(sg) = s.surge.clone().filter(|sg| sg.phase == "buying" && sg.temp_machine.is_none()) {
             if !agent.autopilot.busy.load(Ordering::SeqCst) {
@@ -994,6 +1019,46 @@ mod tests {
         match run(&s, &mut mem, RIGHTSIZE_STREAK) {
             Decision::ScaleUp { offer, replaces: Some(2), .. } => assert_eq!(offer.size, "small"),
             other => panic!("expected replacement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn catalog_invalidates_when_provider_tokens_change() {
+        use std::collections::BTreeMap;
+        let t0 = Instant::now();
+        let hetzner = BTreeMap::from([("hetzner".into(), "tok1".into())]);
+        let both = BTreeMap::from([("hetzner".into(), "tok1".into()), ("digitalocean".into(), "tok2".into())]);
+        let rotated = BTreeMap::from([("hetzner".into(), "tok-new".into())]);
+
+        assert!(catalog_stale(None, &BTreeMap::new(), &hetzner, t0));
+        assert!(!catalog_stale(Some(t0), &hetzner, &hetzner, t0 + Duration::from_secs(60)));
+        assert!(catalog_stale(Some(t0), &hetzner, &both, t0 + Duration::from_secs(60)));
+        assert!(catalog_stale(Some(t0), &hetzner, &rotated, t0 + Duration::from_secs(60)));
+        assert!(catalog_stale(Some(t0), &hetzner, &hetzner, t0 + Duration::from_secs(3601)));
+    }
+
+    #[test]
+    fn buys_1gb_server_for_small_app() {
+        let mut s = ClusterState::default();
+        s.settings.autopilot = true;
+        s.settings.max_machines = 5;
+        s.machines.insert(1, machine(1, 4096, true, 5.49));
+        app(&mut s, "tiny", 1, "256MB");
+        s.apps.get_mut("tiny").unwrap().releases[0].config.regions = vec!["nyc1".into()];
+        let offers = vec![
+            Offer { provider: "digitalocean".into(), size: "s-1vcpu-512mb-10gb".into(), location: "nyc1".into(), cpus: 1.0, memory_mb: 512, disk_gb: 10, arch: "x86".into(), price: 4.0 },
+            Offer { provider: "digitalocean".into(), size: "s-1vcpu-1gb".into(), location: "nyc1".into(), cpus: 1.0, memory_mb: 1024, disk_gb: 25, arch: "x86".into(), price: 6.0 },
+            Offer { provider: "digitalocean".into(), size: "s-1vcpu-2gb".into(), location: "nyc1".into(), cpus: 1.0, memory_mb: 2048, disk_gb: 50, arch: "x86".into(), price: 12.0 },
+        ];
+        let alive: HashSet<u32> = s.machines.keys().copied().collect();
+        let dead = Map::new();
+        let reports = Map::new();
+        let live = LiveView { now: 1000, alive: &alive, dead_since: &dead, reports: &reports, leader_for: 1000 };
+        let mut mem = Memory::default();
+        let _ = decide(&s, &live, &offers, 1, &mut mem, 10_000);
+        match decide(&s, &live, &offers, 1, &mut mem, 10_060).1 {
+            Decision::ScaleUp { offer, .. } => assert_eq!(offer.size, "s-1vcpu-1gb"),
+            other => panic!("expected 1GB droplet, got {other:?}"),
         }
     }
 }
