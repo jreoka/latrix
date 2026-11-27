@@ -859,6 +859,12 @@ fn orchestrate_maintenance(s: &mut ClusterState, cx: &mut Ctx) {
         }
     }
 
+    // A temporary server for maintenance is in progress: drive it.
+    if let Some(sg) = s.surge.clone() {
+        drive_surge(s, cx, sg);
+        return;
+    }
+
     // Automatic OS updates: one machine at a time, inside the window.
     if !s.settings.auto_updates || live.grace() || !in_window(&s.settings.update_window, now) {
         return;
@@ -882,7 +888,7 @@ fn orchestrate_maintenance(s: &mut ClusterState, cx: &mut Ctx) {
     let cand = s
         .machines
         .values()
-        .filter(|m| m.status == MachineStatus::Ready && live.alive.contains(&m.id))
+        .filter(|m| m.status == MachineStatus::Ready && live.alive.contains(&m.id) && !m.temporary)
         .filter(|m| now.saturating_sub(m.last_maintenance) > 20 * 3600)
         .filter(|m| {
             live.reports
@@ -893,19 +899,124 @@ fn orchestrate_maintenance(s: &mut ClusterState, cx: &mut Ctx) {
         .min_by_key(|m| m.last_maintenance)
         .map(|m| m.id);
     if let Some(id) = cand {
-        let mm = s.machines.get_mut(&id).unwrap();
-        mm.status = MachineStatus::Draining;
-        mm.maintenance = Some(MaintenanceTask {
-            id: random_id(8),
-            kind: "updates".into(),
-            started_at: now,
-        });
         let pending = live.reports.get(&id).map(|r| r.updates.pending).unwrap_or(0);
+        if !can_absorb(s, live, id) && surge_possible(s) {
+            s.surge = Some(Surge { for_machine: id, requested_at: now, temp_machine: None, phase: "buying".into() });
+            cx.info(format!(
+                "{}: {pending} OS update(s) pending and no other machine can take its apps — buying a temporary server first",
+                machine_name(s, id)
+            ));
+            return;
+        }
+        start_maintenance(s, id, now);
         cx.info(format!(
-            "{}: {} OS update(s) pending — draining for automatic maintenance",
-            mm.name, pending
+            "{}: {pending} OS update(s) pending — draining for automatic maintenance",
+            machine_name(s, id)
         ));
     }
+}
+
+pub fn start_maintenance(s: &mut ClusterState, id: u32, now: u64) {
+    if let Some(mm) = s.machines.get_mut(&id) {
+        mm.status = MachineStatus::Draining;
+        mm.maintenance = Some(MaintenanceTask { id: random_id(8), kind: "updates".into(), started_at: now });
+    }
+}
+
+/// The autopilot can buy servers (on, with a provider token).
+pub fn surge_possible(s: &ClusterState) -> bool {
+    s.settings.autopilot && !s.provider_tokens.is_empty()
+}
+
+/// Could the other machines take everything running on `m`?
+pub fn can_absorb(s: &ClusterState, live: &LiveView, m: u32) -> bool {
+    let need = s.reserved_mb(m) as f64;
+    if s.instances_on(m).all(|i| i.stopping) {
+        return true;
+    }
+    let others: Vec<&Machine> = s
+        .machines
+        .values()
+        .filter(|o| o.id != m && schedulable(s, live, o.id))
+        .collect();
+    if others.is_empty() {
+        return false;
+    }
+    let free: f64 = others
+        .iter()
+        .map(|o| {
+            let total = live.metrics(o.id).map(|x| x.mem_total_mb).filter(|x| *x > 0).unwrap_or(o.memory_mb) as f64;
+            (total * 0.9 - s.reserved_mb(o.id) as f64).max(0.0)
+        })
+        .sum();
+    need <= free
+}
+
+/// Step a "temporary server for maintenance" forward.
+fn drive_surge(s: &mut ClusterState, cx: &mut Ctx, sg: Surge) {
+    let live = cx.live;
+    let now = live.now;
+    let target = sg.for_machine;
+    let mut next = sg.clone();
+    match sg.phase.as_str() {
+        "buying" => {
+            if now.saturating_sub(sg.requested_at) > 45 * 60 {
+                next.phase = "failed".into();
+                cx.warn("temporary server didn't arrive in time; updating in place instead");
+            }
+        }
+        "ready" => {
+            let temp_ok = sg.temp_machine.map(|t| schedulable(s, live, t)).unwrap_or(false);
+            let target_ready = s.machines.get(&target).map(|m| m.status == MachineStatus::Ready).unwrap_or(false);
+            if !s.machines.contains_key(&target) {
+                next.phase = "maintaining".into();
+            } else if temp_ok && target_ready {
+                start_maintenance(s, target, now);
+                next.phase = "maintaining".into();
+                cx.info(format!("{}: moving apps to the temporary server, then installing updates", machine_name(s, target)));
+            } else if now.saturating_sub(sg.requested_at) > 60 * 60 {
+                next.phase = "failed".into();
+                cx.warn("temporary server never became ready; updating in place instead");
+            }
+        }
+        "maintaining" => {
+            let back = s
+                .machines
+                .get(&target)
+                .map(|m| m.status == MachineStatus::Ready && m.maintenance.is_none())
+                .unwrap_or(true);
+            if back {
+                if let Some(t) = sg.temp_machine.and_then(|t| s.machines.get_mut(&t)) {
+                    t.status = MachineStatus::Draining;
+                    t.maintenance = Some(MaintenanceTask { id: random_id(8), kind: "remove".into(), started_at: now });
+                }
+                next.phase = "returning".into();
+                cx.info(format!("{} is updated; moving apps back and removing the temporary server", machine_name(s, target)));
+            }
+        }
+        "returning" => {
+            if sg.temp_machine.map(|t| !s.machines.contains_key(&t)).unwrap_or(true) {
+                s.surge = None;
+                cx.info("temporary server removed; maintenance complete");
+                return;
+            }
+        }
+        _ => {
+            // failed: update in place (with a short interruption), remove any temp server
+            if let Some(t) = sg.temp_machine.and_then(|t| s.machines.get_mut(&t)) {
+                if t.maintenance.is_none() {
+                    t.status = MachineStatus::Draining;
+                    t.maintenance = Some(MaintenanceTask { id: random_id(8), kind: "remove".into(), started_at: now });
+                }
+            }
+            if s.machines.get(&target).map(|m| m.status == MachineStatus::Ready).unwrap_or(false) {
+                start_maintenance(s, target, now);
+            }
+            s.surge = None;
+            return;
+        }
+    }
+    s.surge = Some(next);
 }
 
 fn load(s: &ClusterState, live: &LiveView, m: &Machine) -> f64 {
@@ -1189,6 +1300,7 @@ mod tests {
             joined_at: 0,
             maintenance: None,
             last_maintenance: 0,
+            temporary: false,
         }
     }
 
@@ -1482,6 +1594,68 @@ mod tests {
         assert_eq!(w.s.volumes["db__data"].primary, 2);
         assert_eq!(w.active("db").len(), 1);
         assert_eq!(w.active("db")[0].machine, 2);
+    }
+
+    #[test]
+    fn temporary_server_for_maintenance() {
+        let mut w = World::new(1);
+        w.s.settings.autopilot = true;
+        w.s.settings.update_window = String::new();
+        w.s.provider_tokens.insert("hetzner".into(), "t".into());
+        app(&mut w.s, "web", 2, false);
+        app(&mut w.s, "db", 1, true);
+        w.s.apps.get_mut("db").unwrap().vip = "10.78.0.2".into();
+        w.run(3);
+        // the single machine has updates pending
+        let step = |w: &mut World, done: Option<&str>| {
+            w.agents();
+            let r = w.reports.get_mut(&1).unwrap();
+            r.updates = UpdateInfo { pending: 3, reboot_required: true, checked_at: 1, package_manager: "apt-get".into() };
+            r.maintenance_done = done.map(String::from);
+            let live = LiveView { now: w.now, alive: &w.alive, dead_since: &w.dead_since, reports: &w.reports, leader_for: 1000 };
+            let ev = reconcile(&mut w.s, &live, &mut w.mem);
+            w.s.version += 1;
+            w.now += 5;
+            ev
+        };
+        w.now = 30 * 3600; // long after the last maintenance
+        step(&mut w, None);
+        let sg = w.s.surge.clone().expect("a temporary server is requested instead of draining");
+        assert_eq!((sg.for_machine, sg.phase.as_str()), (1, "buying"));
+        assert_eq!(w.s.machines[&1].status, MachineStatus::Ready, "nothing moves before the temp server exists");
+
+        // the autopilot bought machine 2
+        let mut m2 = machine(2);
+        m2.temporary = true;
+        w.s.machines.insert(2, m2);
+        w.alive.insert(2);
+        let sg = w.s.surge.as_mut().unwrap();
+        sg.temp_machine = Some(2);
+        sg.phase = "ready".into();
+        for _ in 0..30 {
+            step(&mut w, None);
+        }
+        assert_eq!(w.s.machines[&1].status, MachineStatus::Maintenance, "drained onto the temporary server");
+        assert!(w.active("web").iter().all(|i| i.machine == 2));
+        assert_eq!(w.active("db")[0].machine, 2, "the volume app moved with a final sync");
+
+        // machine 1 finishes its updates
+        let task = w.s.machines[&1].maintenance.clone().unwrap().id;
+        for _ in 0..40 {
+            step(&mut w, Some(&task));
+        }
+        assert_eq!(w.s.machines[&1].status, MachineStatus::Ready);
+        assert_eq!(w.s.surge.as_ref().map(|s| s.phase.as_str()), Some("returning"));
+        assert_eq!(w.s.machines[&2].maintenance.as_ref().map(|t| t.kind.as_str()), Some("remove"));
+        assert!(w.active("web").iter().all(|i| i.machine == 1), "apps moved back");
+        assert_eq!(w.active("db")[0].machine, 1, "volume app moved back");
+
+        // the autopilot deletes the temporary server
+        w.s.machines.remove(&2);
+        w.alive.remove(&2);
+        step(&mut w, Some(&task));
+        assert!(w.s.surge.is_none());
+        assert_eq!(w.active("web").len(), 2);
     }
 
     #[test]

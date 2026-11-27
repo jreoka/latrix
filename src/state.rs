@@ -36,6 +36,9 @@ pub struct ClusterState {
     /// Cloud provider API tokens the autopilot uses (never shown in status).
     #[serde(default)]
     pub provider_tokens: BTreeMap<String, String>,
+    /// A temporary server bought so a machine can be updated without downtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub surge: Option<Surge>,
     /// Extra SSH public keys installed on servers the autopilot creates
     /// (yours, so `latrix` on your computer can reach them).
     #[serde(default)]
@@ -75,6 +78,19 @@ pub struct MaintenanceTask {
     pub started_at: u64,
 }
 
+/// "Buy a temporary server, move work there, update the machine, move work
+/// back, delete the temporary server."
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Surge {
+    /// The machine to update.
+    pub for_machine: u32,
+    pub requested_at: u64,
+    #[serde(default)]
+    pub temp_machine: Option<u32>,
+    /// buying | ready | maintaining | returning | failed
+    pub phase: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProviderRef {
     pub provider: String,
@@ -111,6 +127,9 @@ pub struct Machine {
     pub maintenance: Option<MaintenanceTask>,
     #[serde(default)]
     pub last_maintenance: u64,
+    /// Bought only to hold apps while another machine is updated; deleted after.
+    #[serde(default)]
+    pub temporary: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

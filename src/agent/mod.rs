@@ -200,6 +200,7 @@ pub fn init_first(
             joined_at: now(),
             maintenance: None,
             last_maintenance: now(),
+            temporary: false,
         },
     );
     if dev {

@@ -349,6 +349,12 @@ pub async fn action(client: &Client, name: &str, action: &str) -> Result<()> {
         .await?;
     match action {
         "drain" => println!("{} is draining — instances move to other machines first, then it is cordoned.", m.name),
+        "update" if m.status == crate::state::MachineStatus::Ready => println!(
+            "No other machine can take {}'s apps, so the autopilot is buying a temporary server first.\n\
+             Then {} drains onto it, installs OS updates (rebooting if needed), takes its apps back,\n\
+             and the temporary server is deleted. Follow along with `latrix events`.",
+            m.name, m.name
+        ),
         "update" => println!("{} will drain, install OS updates (rebooting if needed), then rejoin automatically.", m.name),
         "cordon" => println!("{} is cordoned: keeps running what it has, gets nothing new.", m.name),
         _ => println!("{} is {}", m.name, m.status),

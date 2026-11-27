@@ -196,6 +196,12 @@ servers by itself once a minute. It compares what your apps ask for
 - **Right-sizes:** after an hour, a server much bigger than its load is
   replaced with one at least 30% cheaper. The new server starts first, then
   the old one is drained and deleted.
+- **Covers maintenance:** when a server needs OS updates and no other
+  machine can take its apps (for example on a one-server cluster), it buys a
+  temporary server first. Apps move there (volumes with a final sync), the
+  server updates and reboots, apps move back, and the temporary server is
+  deleted. It's billed by the hour, so it costs cents. This also applies to
+  `latrix machine update`. If buying fails, it updates in place instead.
 - **Heals:** a server it bought that stops responding for 15 minutes is
   rebooted through the provider API. If it's still dead 30 minutes later,
   it's replaced.

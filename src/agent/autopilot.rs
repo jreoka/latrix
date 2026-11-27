@@ -194,6 +194,9 @@ fn decide_with(
     if offers.is_empty() {
         return nothing("no provider prices available (is a provider token set?)");
     }
+    if s.surge.is_some() {
+        return nothing("a temporary server for maintenance is in use");
+    }
     if s.machines.values().any(|m| matches!(m.status, MachineStatus::Draining | MachineStatus::Maintenance)) {
         return nothing("waiting for a drain / maintenance to finish");
     }
@@ -250,7 +253,7 @@ fn decide_with(
     let mut candidates: Vec<&Machine> = s
         .machines
         .values()
-        .filter(|m| managed(m) && m.id != leader && m.status == MachineStatus::Ready && live.alive.contains(&m.id))
+        .filter(|m| managed(m) && !m.temporary && m.id != leader && m.status == MachineStatus::Ready && live.alive.contains(&m.id))
         .collect();
     candidates.sort_by(|a, b| {
         b.monthly_cost
@@ -405,7 +408,7 @@ pub async fn provision(
     bail!("{name} joined but did not come online within 2 minutes")
 }
 
-async fn buy(agent: &Arc<Agent>, offer: &Offer, replaces: Option<u32>) -> Result<()> {
+async fn buy(agent: &Arc<Agent>, offer: &Offer, replaces: Option<u32>, temporary: bool) -> Result<Machine> {
     let s = agent.snapshot();
     let token = s
         .provider_tokens
@@ -439,12 +442,20 @@ async fn buy(agent: &Arc<Agent>, offer: &Offer, replaces: Option<u32>) -> Result
         Ok(m) => {
             agent.event(
                 "info",
-                format!("autopilot: {} is online ({} {} in {}, {:.2}/month)", m.name, offer.provider, offer.size, offer.location, offer.price),
+                format!(
+                    "autopilot: {} is online ({} {} in {}, {:.2}/month{})",
+                    m.name,
+                    offer.provider,
+                    offer.size,
+                    offer.location,
+                    offer.price,
+                    if temporary { ", temporary: billed by the hour, deleted after maintenance" } else { "" }
+                ),
             );
             if let Some(old) = replaces {
                 mark_for_removal(agent, old, "replaced by a cheaper server").await?;
             }
-            Ok(())
+            Ok(m)
         }
         Err(e) => {
             // Don't leave a half-set-up server running (and billing).
@@ -563,6 +574,70 @@ async fn heal(agent: &Arc<Agent>, live: &LiveView<'_>, mem: &mut Memory) {
     }
 }
 
+/// Buy a temporary server big enough to hold what runs on `for_machine`
+/// while it is updated (cheapest that fits; billed by the hour).
+fn buy_temporary(agent: &Arc<Agent>, s: &ClusterState, offers: &[Offer], for_machine: u32) {
+    let need_mem = (s.reserved_mb(for_machine) as f64 * 1.25 + OVERHEAD_MB).max(MIN_SERVER_MB as f64) as u64;
+    let need_cpu = s.reserved_cpu(for_machine).max(1.0);
+    let arch = s.machines.get(&agent.me.machine_id).map(|m| providers::provider_arch(&m.arch)).unwrap_or("x86");
+    let prefer: Vec<String> = s.machines.get(&for_machine).and_then(|m| m.region.clone()).into_iter().collect();
+    let Some(offer) = providers::cheapest(offers, need_mem, need_cpu, arch, &prefer, None).cloned() else {
+        let a = agent.clone();
+        tokio::spawn(async move { set_surge(&a, None, "failed").await });
+        agent.event("warn", "autopilot: no server type fits the work to hold during maintenance; updating in place");
+        return;
+    };
+    agent.event(
+        "info",
+        format!(
+            "autopilot: buying a temporary {} {} in {} (~{:.3}/hour) to hold apps during maintenance",
+            offer.provider,
+            offer.size,
+            offer.location,
+            offer.price / 730.0
+        ),
+    );
+    agent.autopilot.busy.store(true, Ordering::SeqCst);
+    let a = agent.clone();
+    tokio::spawn(async move {
+        match buy(&a, &offer, None, true).await {
+            Ok(m) => {
+                let id = m.id;
+                let _ = a
+                    .mutate(move |s| {
+                        if let Some(mm) = s.machines.get_mut(&id) {
+                            mm.temporary = true;
+                        }
+                        Ok(())
+                    })
+                    .await;
+                set_surge(&a, Some(id), "ready").await;
+            }
+            Err(e) => {
+                a.event("warn", format!("autopilot: temporary server failed ({e:#}); updating in place"));
+                set_surge(&a, None, "failed").await;
+            }
+        }
+        a.autopilot.status.lock().unwrap().working_on = None;
+        a.autopilot.busy.store(false, Ordering::SeqCst);
+    });
+}
+
+async fn set_surge(agent: &Arc<Agent>, temp: Option<u32>, phase: &str) {
+    let phase = phase.to_string();
+    let _ = agent
+        .mutate(move |s| {
+            if let Some(sg) = s.surge.as_mut() {
+                if temp.is_some() {
+                    sg.temp_machine = temp;
+                }
+                sg.phase = phase;
+            }
+            Ok(())
+        })
+        .await;
+}
+
 pub async fn run(agent: Arc<Agent>) {
     tokio::time::sleep(Duration::from_secs(90)).await;
     let mut mem = Memory::default();
@@ -613,6 +688,11 @@ pub async fn run(agent: Arc<Agent>) {
         }
         let offers = catalog.as_ref().map(|(_, o)| o.clone()).unwrap_or_default();
         let s = agent.snapshot();
+        if let Some(sg) = s.surge.clone().filter(|sg| sg.phase == "buying" && sg.temp_machine.is_none()) {
+            if !agent.autopilot.busy.load(Ordering::SeqCst) {
+                buy_temporary(&agent, &s, &offers, sg.for_machine);
+            }
+        }
         let (cap, decision) = decide(&s, &live.view(), &offers, agent.me.machine_id, &mut mem, now());
         let arch = s
             .machines
@@ -660,7 +740,7 @@ pub async fn run(agent: Arc<Agent>) {
                 agent.autopilot.busy.store(true, Ordering::SeqCst);
                 let a = agent.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = buy(&a, &offer, replaces).await {
+                    if let Err(e) = buy(&a, &offer, replaces, false).await {
                         a.event("warn", format!("autopilot: adding a server failed: {e:#}"));
                     }
                     a.autopilot.status.lock().unwrap().working_on = None;
@@ -698,6 +778,7 @@ mod tests {
             joined_at: 0,
             maintenance: None,
             last_maintenance: 0,
+            temporary: false,
         }
     }
 

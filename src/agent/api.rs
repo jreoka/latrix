@@ -462,6 +462,7 @@ pub fn register_machine(s: &mut ClusterState, req: &JoinRequest) -> anyhow::Resu
         joined_at: now(),
         maintenance: None,
         last_maintenance: now(),
+        temporary: false,
     };
     s.machines.insert(id, m.clone());
     Ok(m)
@@ -472,8 +473,23 @@ async fn machine_action(
     Path(name): Path<String>,
     Json(req): Json<MachineAction>,
 ) -> ApiResult<Machine> {
+    let live = agent.live();
     let m = agent
         .mutate(|s| {
+            // Updating a machine nothing else can stand in for: with the
+            // autopilot on, buy a temporary server first (no downtime).
+            if req.action == "update" {
+                if let Some(id) = s.machine_by_name(&name).map(|m| m.id) {
+                    if s.surge.is_none()
+                        && scheduler::surge_possible(s)
+                        && !scheduler::can_absorb(s, &live.view(), id)
+                        && s.machines[&id].status == MachineStatus::Ready
+                    {
+                        s.surge = Some(Surge { for_machine: id, requested_at: now(), temp_machine: None, phase: "buying".into() });
+                        return Ok(s.machines[&id].clone());
+                    }
+                }
+            }
             let id = s
                 .machine_by_name(&name)
                 .map(|m| m.id)
