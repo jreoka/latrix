@@ -22,6 +22,7 @@ check "registry on $ov:7471 (other machines pull here)" "[ -n \"$ov\" ] && curl 
 check "Docker trusts the mesh registries" "timeout 5 docker info 2>/dev/null | grep -Fq '10.77.0.0/16'" "add \"insecure-registries\": [\"10.77.0.0/16\"] to /etc/docker/daemon.json, then systemctl restart docker"
 check "free disk space above 2 GB" "avail=\$(df -Pk /var/lib/latrix 2>/dev/null | awk 'NR==2{print \$4}'); [ -n \"\$avail\" ] && [ \"\$avail\" -gt 2097152 ]" "free some space: docker system prune"
 echo "INFO|system|$(. /etc/os-release 2>/dev/null; echo "${PRETTY_NAME:-Linux}"), kernel $(uname -r)"
+echo "INFO|swap|$(awk '/SwapTotal/ {t=$2} /SwapFree/ {f=$2} END {if (t>0) printf "%.1fGB total, %.1fGB used", t/1048576, (t-f)/1048576; else print "none"}' /proc/meminfo)"
 echo "INFO|docker|$(timeout 5 docker version --format '{{.Server.Version}}' 2>/dev/null)"
 echo "INFO|latrix|$(/usr/local/bin/latrix --version 2>/dev/null)"
 echo "INFO|mesh peers|$(wg show latrix0 peers 2>/dev/null | wc -l)"

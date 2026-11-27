@@ -39,7 +39,7 @@ fn cpus() -> f64 {
     std::thread::available_parallelism().map(|n| n.get() as f64).unwrap_or(1.0)
 }
 
-fn meminfo() -> (u64, u64) {
+fn meminfo() -> (u64, u64, u64, u64) {
     let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     let get = |k: &str| {
         text.lines()
@@ -50,7 +50,9 @@ fn meminfo() -> (u64, u64) {
     };
     let total = get("MemTotal:") / 1024;
     let avail = get("MemAvailable:") / 1024;
-    (total, total.saturating_sub(avail))
+    let swap_total = get("SwapTotal:") / 1024;
+    let swap_free = get("SwapFree:") / 1024;
+    (total, total.saturating_sub(avail), swap_total, swap_total.saturating_sub(swap_free))
 }
 
 pub async fn local_facts() -> Facts {
@@ -106,7 +108,7 @@ pub async fn run(agent: Arc<Agent>) {
     let mut tick = tokio::time::interval(Duration::from_secs(5));
     loop {
         tick.tick().await;
-        let (total, used) = meminfo();
+        let (total, used, swap_total, swap_used) = meminfo();
         let cpu_pct = match cpu_times() {
             Some((t, i)) => {
                 let mut prev = agent.sampler.prev_cpu.lock().unwrap();
@@ -133,6 +135,8 @@ pub async fn run(agent: Arc<Agent>) {
             cpu_pct,
             mem_total_mb: total,
             mem_used_mb: used,
+            swap_total_mb: swap_total,
+            swap_used_mb: swap_used,
             disk_total_gb: dt,
             disk_used_gb: du,
             load1,

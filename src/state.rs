@@ -407,6 +407,13 @@ pub struct Settings {
     /// Default TTL in seconds for Cloudflare DNS records (1 = Auto, or 60-86400).
     #[serde(default = "default_cf_ttl")]
     pub cloudflare_ttl: u32,
+    /// Managed swap: "auto" (half of RAM, clamped to 1–8GB), "off", or a size
+    /// like "2GB". Only latrix's own swap file is managed.
+    #[serde(default = "default_swap")]
+    pub swap: String,
+    /// vm.swappiness while latrix manages swap (0-100).
+    #[serde(default = "default_swappiness")]
+    pub swappiness: u32,
 }
 
 fn seven() -> u32 {
@@ -422,6 +429,12 @@ fn five() -> u32 {
     5
 }
 fn default_cf_ttl() -> u32 {
+    60
+}
+fn default_swap() -> String {
+    "auto".into()
+}
+fn default_swappiness() -> u32 {
     60
 }
 
@@ -452,6 +465,8 @@ impl Default for Settings {
             max_machines: 5,
             cloudflare_proxied: false,
             cloudflare_ttl: default_cf_ttl(),
+            swap: default_swap(),
+            swappiness: default_swappiness(),
         }
     }
 }
@@ -503,6 +518,10 @@ pub struct Metrics {
     pub cpu_pct: f64,
     pub mem_total_mb: u64,
     pub mem_used_mb: u64,
+    #[serde(default)]
+    pub swap_total_mb: u64,
+    #[serde(default)]
+    pub swap_used_mb: u64,
     pub disk_total_gb: f64,
     pub disk_used_gb: f64,
     pub load1: f64,

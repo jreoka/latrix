@@ -22,6 +22,7 @@ pub mod runtime;
 pub mod scheduler;
 pub mod selfupdate;
 pub mod store;
+pub mod swap;
 pub mod transfer;
 pub mod volumes;
 
@@ -363,6 +364,7 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
         tokio::spawn(dns::run(agent.clone()));
         tokio::spawn(cloudflare::run(agent.clone()));
         tokio::spawn(maintenance::run(agent.clone()));
+        tokio::spawn(swap::run(agent.clone()));
         tokio::spawn(autopilot::run(agent.clone()));
     }
 

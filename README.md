@@ -303,6 +303,10 @@ Besides deploys, failover, OS updates and the autopilot, every cluster:
   `latrix volumes rollback <app> <snapshot>` puts one back.
 - **Frees disk space** when a disk passes 90%: unused images, build cache
   and stopped containers go first, and you get a warning.
+- **Keeps a swap file on every machine** (half of RAM, 1–8 GB) so memory
+  pressure spills into swap instead of OOM-killing containers, and warns when
+  it fills up. Size it with `latrix settings swap=4GB` or turn it off with
+  `swap=off`; swap the machine's owner set up is left alone.
 - **Cleans up after itself:** data of deleted apps (after
   `volume_retention_days`), old images and build cache, and certificates no
   app uses (after 7 days).
@@ -488,6 +492,8 @@ latrix settings alert_webhook=https://discord.com/api/webhooks/...  # warnings g
 latrix settings auto_upgrade=false           # don't upgrade latrix automatically
 latrix settings cloudflare_proxied=true      # proxy Cloudflare DNS records (orange cloud) by default
 latrix settings cloudflare_ttl=60            # default TTL for Cloudflare records (1 = auto, or 60-86400)
+latrix settings swap=4GB                     # managed swap file (default "auto" = half of RAM, clamped to 1-8GB; "off" = none)
+latrix settings swappiness=60                # vm.swappiness while latrix manages swap (0-100)
 ```
 
 ## How it works

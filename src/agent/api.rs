@@ -1306,6 +1306,10 @@ async fn set_settings(
             if new.cloudflare_ttl != 1 && !(60..=86400).contains(&new.cloudflare_ttl) {
                 bail!("cloudflare_ttl must be 1 (auto) or between 60 and 86400 seconds");
             }
+            if new.swappiness > 100 {
+                bail!("swappiness must be between 0 and 100");
+            }
+            super::swap::desired_mb(&new.swap, 4096)?;
             s.settings = new.clone();
             Ok(new)
         })

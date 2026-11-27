@@ -1191,11 +1191,21 @@ async fn status(cfg: &CliConfig, cl: Option<&str>) -> Result<()> {
         .map(|m| {
             let met = m.metrics.clone().unwrap_or_default();
             let mem = if met.mem_total_mb > 0 { met.mem_used_mb as f64 / met.mem_total_mb as f64 } else { 0.0 };
+            let mem_cell = if met.swap_total_mb > 0 {
+                format!(
+                    "mem {} {:>3.0}% sw {:>2.0}%",
+                    bar(mem),
+                    mem * 100.0,
+                    met.swap_used_mb as f64 / met.swap_total_mb as f64 * 100.0
+                )
+            } else {
+                format!("mem {} {:>3.0}%", bar(mem), mem * 100.0)
+            };
             vec![
                 format!("{}{}", m.machine.name, if m.leader { " *" } else { "" }),
                 if m.alive { m.machine.status.to_string() } else { "DOWN".into() },
                 format!("cpu {} {:>3.0}%", bar(met.cpu_pct / 100.0), met.cpu_pct),
-                format!("mem {} {:>3.0}%", bar(mem), mem * 100.0),
+                mem_cell,
                 format!("{} inst", m.instances),
                 m.updates
                     .as_ref()
