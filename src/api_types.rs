@@ -62,6 +62,10 @@ pub struct BuildRequest {
     pub context: Option<String>,
     #[serde(default)]
     pub cache_from: Vec<String>,
+    /// Your terminal's width: when set, Docker's live colored progress view
+    /// is streamed as-is (built in a pseudo-terminal of that width).
+    #[serde(default)]
+    pub tty_cols: Option<u16>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

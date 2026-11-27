@@ -77,9 +77,10 @@ pub async fn handle_build(State(agent): State<Arc<Agent>>, req: Request) -> Resp
         let started = Instant::now();
         agent.rt.builds_running.fetch_add(1, Ordering::SeqCst);
         let image = format!("{}/{}:{}", agent.registry(), spec.app, spec.tag);
+        let arrow = if spec.tty_cols.is_some() { "\x1b[1;34m==>\x1b[0m" } else { "==>" };
         let _ = tx
             .send(format!(
-                "==> building {} on machine #{} ({:.1} MB context)\n",
+                "{arrow} building {} on machine #{} ({:.1} MB context)\n",
                 spec.app,
                 agent.me.machine_id,
                 received as f64 / 1048576.0
@@ -153,7 +154,8 @@ async fn build(
 
     // Warm the cache from the previous release if it isn't local yet.
     for c in &spec.cache_from {
-        let _ = tx.send(format!("==> using cache from {c}\n")).await;
+        let arrow = if spec.tty_cols.is_some() { "\x1b[1;34m==>\x1b[0m" } else { "==>" };
+        let _ = tx.send(format!("{arrow} using cache from {c}\n")).await;
     }
     // BuildKit needs the buildx plugin; without it fall back to the classic builder.
     let buildkit = cmd("docker", &["buildx", "version"]).await.is_ok();
@@ -163,6 +165,10 @@ async fn build(
     let mut args: Vec<String> = vec!["build".into()];
     if buildkit {
         args.push("--progress=plain".into());
+        // Plain image manifests (no provenance attestation index), so the
+        // inline build cache can be imported by the next build on any machine.
+        args.push("--provenance=false".into());
+        args.push("--sbom=false".into());
     }
     args.extend([
         "-t".into(),
@@ -186,6 +192,20 @@ async fn build(
     }
     args.push(ctx.display().to_string());
     let bk = if buildkit { "1" } else { "0" };
+    let tty = match spec.tty_cols {
+        Some(cols) if buildkit && cmd("sh", &["-c", "command -v script"]).await.is_ok() => Some(cols.clamp(40, 400)),
+        _ => None,
+    };
+    if let Some(cols) = tty {
+        // Docker's own live, colored progress view (it needs a terminal).
+        let mut a = args.clone();
+        a.insert(1, "--progress=tty".into());
+        a.retain(|x| x != "--progress=plain");
+        run_in_pty(&format!("DOCKER_BUILDKIT=1 docker {}", shell_join(&a)), cols, tx).await?;
+        let _ = tx.send(format!("\n\x1b[1;34m==>\x1b[0m pushing {image} to the cluster registry\n")).await;
+        run_in_pty(&format!("docker push {}", crate::util::shell_quote(image)), cols, tx).await?;
+        return Ok(());
+    }
     run_streaming("docker", &args, &[("DOCKER_BUILDKIT", bk)], tx).await?;
     let _ = tx.send(format!("==> pushing {image} to the cluster registry\n")).await;
     run_streaming("docker", &["push".to_string(), image.to_string()], &[], tx).await?;
@@ -237,6 +257,51 @@ async fn checkout(url: &str, branch: Option<&str>, repo: &Path, tx: &mpsc::Sende
         .await
         .unwrap_or_default();
     let _ = tx.send(format!("==> at commit {}\n", sha.trim())).await;
+    Ok(())
+}
+
+fn shell_join(args: &[String]) -> String {
+    args.iter().map(|a| crate::util::shell_quote(a)).collect::<Vec<_>>().join(" ")
+}
+
+/// Run a shell command in a pseudo-terminal of `cols` columns (via util-linux
+/// `script`) and forward its raw output, escape sequences included.
+async fn run_in_pty(command: &str, cols: u16, tx: &mpsc::Sender<String>) -> Result<()> {
+    use tokio::io::AsyncReadExt;
+    let inner = format!("stty cols {cols} rows 50 2>/dev/null; {command}");
+    let mut child = tokio::process::Command::new("script")
+        .args(["-qfec", &inner, "/dev/null"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .context("running script")?;
+    let mut out = child.stdout.take().unwrap();
+    let mut buf = vec![0u8; 16 * 1024];
+    let mut carry: Vec<u8> = vec![];
+    loop {
+        let n = out.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        carry.extend_from_slice(&buf[..n]);
+        // Only forward complete UTF-8; keep a split character for the next read.
+        let valid = match std::str::from_utf8(&carry) {
+            Ok(_) => carry.len(),
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => carry.len(),
+        };
+        let chunk: Vec<u8> = carry.drain(..valid).collect();
+        let _ = tx.send(String::from_utf8_lossy(&chunk).into_owned()).await;
+    }
+    if !carry.is_empty() {
+        let _ = tx.send(String::from_utf8_lossy(&carry).into_owned()).await;
+    }
+    let status = child.wait().await?;
+    if !status.success() {
+        bail!("{} exited with {status}", command.split_whitespace().nth(1).unwrap_or("command"));
+    }
     Ok(())
 }
 

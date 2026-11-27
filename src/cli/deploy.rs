@@ -32,6 +32,33 @@ fn sanitize(name: &str) -> String {
     }
 }
 
+/// Terminal width when stdout is an interactive terminal (and colors aren't
+/// disabled with NO_COLOR / LATRIX_PLAIN); None means plain text output.
+pub fn tty_width() -> Option<u16> {
+    use std::io::IsTerminal;
+    if !std::io::stdout().is_terminal()
+        || std::env::var_os("NO_COLOR").is_some()
+        || std::env::var_os("LATRIX_PLAIN").is_some()
+        || std::env::var("TERM").map(|t| t == "dumb").unwrap_or(false)
+    {
+        return None;
+    }
+    #[cfg(windows)]
+    if enable_ansi_support::enable_ansi_support().is_err() {
+        return None;
+    }
+    Some(terminal_size::terminal_size().map(|(w, _)| w.0).unwrap_or(100))
+}
+
+/// "==>" in bold blue on a terminal, plain otherwise.
+pub fn arrow() -> &'static str {
+    if tty_width().is_some() {
+        "\x1b[1;34m==>\x1b[0m"
+    } else {
+        "==>"
+    }
+}
+
 pub fn launch(name: Option<String>, image: Option<String>, port: Option<u16>, force: bool) -> Result<()> {
     let path = Path::new("latrix.toml");
     if path.exists() && !force {
@@ -131,6 +158,7 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
         branch: app.build.branch.clone(),
         context: app.build.context.clone(),
         cache_from: plan.cache_from.clone(),
+        tty_cols: tty_width(),
     };
     let header = base64::engine::general_purpose::STANDARD.encode(serde_json::to_vec(&req)?);
     let mut rb = client
@@ -144,7 +172,8 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
         }
         let (archive, size, files) = pack_context(&ctx)?;
         println!(
-            "==> Uploading build context ({files} files, {:.1} MB) to {}",
+            "{} Uploading build context ({files} files, {:.1} MB) to {}",
+            arrow(),
             size as f64 / 1048576.0,
             plan.machine_name
         );
@@ -152,7 +181,7 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
         rb = rb.body(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(f)));
         cleanup = Some(archive);
     } else {
-        println!("==> Building {} from git on {}", app.build.git.as_deref().unwrap(), plan.machine_name);
+        println!("{} Building {} from git on {}", arrow(), app.build.git.as_deref().unwrap(), plan.machine_name);
     }
     let resp = rb.send().await;
     if let Some(p) = cleanup {
@@ -165,9 +194,36 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
     let mut stream = resp.bytes_stream();
     let mut buf = String::new();
     let mut result: Option<BuildResult> = None;
-    let mut tail: Vec<String> = vec![];
+    let raw = req.tty_cols.is_some();
+    let mut out = std::io::stdout();
     while let Some(chunk) = stream.next().await {
         buf.push_str(&String::from_utf8_lossy(&chunk?));
+        if raw {
+            // Docker's live view: print everything as it arrives, except the
+            // final result line (which may be split across chunks).
+            match buf.find(BUILD_RESULT_PREFIX) {
+                Some(i) => {
+                    out.write_all(buf[..i].as_bytes())?;
+                    buf.drain(..i);
+                    if let Some(end) = buf.find('\n') {
+                        let line: String = buf.drain(..=end).collect();
+                        result = serde_json::from_str(line.trim_end().trim_start_matches(BUILD_RESULT_PREFIX)).ok();
+                    }
+                }
+                None => {
+                    // Keep a possible partial marker at the end.
+                    let keep = (BUILD_RESULT_PREFIX.len()).min(buf.len());
+                    let mut cut = buf.len() - keep;
+                    while !buf.is_char_boundary(cut) {
+                        cut -= 1;
+                    }
+                    out.write_all(buf[..cut].as_bytes())?;
+                    buf.drain(..cut);
+                }
+            }
+            out.flush()?;
+            continue;
+        }
         while let Some(i) = buf.find('\n') {
             let line: String = buf.drain(..=i).collect();
             let line = line.trim_end();
@@ -175,24 +231,24 @@ pub async fn build(client: &Client, app: &AppConfig, base: &Path) -> Result<(Str
                 result = serde_json::from_str(json).ok();
             } else if !line.is_empty() {
                 println!("    {line}");
-                tail.push(line.to_string());
-                if tail.len() > 20 {
-                    tail.remove(0);
-                }
             }
         }
+    }
+    if raw {
+        print!("\x1b[0m\x1b[?25h"); // reset colors, show the cursor
+        let _ = out.flush();
     }
     let r = result.ok_or_else(|| anyhow!("build connection closed before finishing"))?;
     if !r.ok {
         bail!("build failed: {}", r.error.unwrap_or_default());
     }
-    println!("==> Built {} in {}s", r.image, r.seconds);
+    println!("{} Built {} in {}s", arrow(), r.image, r.seconds);
     Ok((r.image, plan.machine))
 }
 
 pub async fn deploy_one(client: &Client, app: &AppConfig, base: &Path, detach: bool, message: Option<String>) -> Result<()> {
     app.validate()?;
-    println!("==> Deploying {}", app.app);
+    println!("{} Deploying {}", arrow(), app.app);
     let (image, builder) = match &app.build.image {
         Some(img) => (img.clone(), None),
         None => {
@@ -211,7 +267,7 @@ pub async fn deploy_one(client: &Client, app: &AppConfig, base: &Path, detach: b
             },
         )
         .await?;
-    println!("==> Release v{} created", resp.version);
+    println!("{} Release v{} created", arrow(), resp.version);
     if detach {
         return Ok(());
     }
@@ -256,9 +312,11 @@ pub async fn watch(client: &Client, app: &str, version: u64, health_timeout: u64
         }
         match status {
             Some(ReleaseStatus::Active) => {
-                println!("\n✓ {app} v{version} is live");
+                let color = tty_width().is_some();
+                let (g, c, r) = if color { ("\x1b[1;32m", "\x1b[36m", "\x1b[0m") } else { ("", "", "") };
+                println!("\n{g}✓ {app} v{version} is live{r}");
                 for u in &v.urls {
-                    println!("  {u}");
+                    println!("  {c}{u}{r}");
                 }
                 if !v.internal.is_empty() {
                     println!("  internal: {}", v.internal.join(", "));

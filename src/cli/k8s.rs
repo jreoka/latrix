@@ -490,6 +490,7 @@ async fn build_and_push(cfg: &AppConfig, base: &Path, t: &K8sTarget) -> Result<S
         "--build-arg".into(),
         "BUILDKIT_INLINE_CACHE=1".into(),
         "--push".into(),
+        "--provenance=false".into(),
     ];
     if let Some(tg) = &cfg.build.target {
         args.push("--target".into());

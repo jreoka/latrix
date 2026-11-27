@@ -1,6 +1,6 @@
 [package]
 name = "latrix"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "A tiny self-managing cluster: deploy apps across your servers as if they were one machine."
 license = "MIT"
@@ -35,6 +35,10 @@ dirs = "5"
 serde_yaml = "0.9"
 base64 = "0.22"
 libc = "0.2"
+terminal_size = "0.4"
+
+[target.'cfg(windows)'.dependencies]
+enable-ansi-support = "0.3"
 
 [profile.release]
 opt-level = 3

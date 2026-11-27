@@ -25,7 +25,9 @@ $ latrix up --budget 30          # cheapest server + autopilot
 $ cd my-app && latrix launch && latrix deploy
 ==> Deploying my-app
 ==> Uploading build context (14 files, 0.1 MB) to hel1
-    ...
+[+] Building 21.4s (9/9) FINISHED        ← Docker's own live, colored build view
+ => [internal] load build definition from Dockerfile               0.0s
+ ...
 ==> Built 10.77.0.1:7471/my-app:1795738097-onbk in 21s
 ==> Release v1 created
     2/2 healthy  [running@hel1, running@fsn2]
