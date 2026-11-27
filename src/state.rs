@@ -243,6 +243,9 @@ pub struct Cert {
     pub key_pem: String,
     pub not_after: u64,
     pub issued_at: u64,
+    /// When no app used this domain any more (0 = in use). Deleted 7 days later.
+    #[serde(default)]
+    pub unused_since: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

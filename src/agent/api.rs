@@ -370,7 +370,15 @@ async fn status(State(agent): AgentState) -> ApiResult<StatusView> {
             domain: c.domain.clone(),
             not_after: c.not_after,
             issued_at: c.issued_at,
+            unused_since: c.unused_since,
         })
+        .collect();
+    let certs_pending = agent
+        .acme_pending
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(d, (reason, retry_at))| PendingCert { domain: d.clone(), reason: reason.clone(), retry_at: *retry_at })
         .collect();
     let mut events: Vec<Event> = agent.events.lock().unwrap().iter().cloned().collect();
     events.reverse();
@@ -388,6 +396,7 @@ async fn status(State(agent): AgentState) -> ApiResult<StatusView> {
         events,
         monthly_cost,
         autopilot: Some(agent.autopilot.status.lock().unwrap().clone()),
+        certs_pending,
     }))
 }
 

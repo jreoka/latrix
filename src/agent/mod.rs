@@ -69,6 +69,8 @@ pub struct Agent {
     pub autopilot: autopilot::Shared,
     pub mesh_up: std::sync::atomic::AtomicBool,
     pub outbox: Mutex<Vec<Event>>,
+    /// Domains waiting for a certificate: domain -> (reason, next attempt).
+    pub acme_pending: Mutex<std::collections::BTreeMap<String, (String, u64)>>,
 }
 
 impl Agent {
@@ -293,6 +295,7 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
         autopilot: Default::default(),
         mesh_up: std::sync::atomic::AtomicBool::new(false),
         outbox: Mutex::new(vec![]),
+        acme_pending: Mutex::new(Default::default()),
     });
 
     if !dev {

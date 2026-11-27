@@ -353,6 +353,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         Cmd::Certs { .. } => {
             let (_, _, c) = connect(&cfg, cl).await?;
             let st: StatusView = c.get("/v1/status").await?;
+            let now = util::now();
             let rows = st
                 .certs
                 .iter()
@@ -360,12 +361,40 @@ pub async fn run(cli: Cli) -> Result<()> {
                     vec![
                         x.domain.clone(),
                         ago(x.issued_at),
-                        format!("in {}", human_duration(x.not_after.saturating_sub(util::now()))),
+                        format!("in {}", human_duration(x.not_after.saturating_sub(now))),
+                        if x.unused_since == 0 {
+                            "in use (renewed 30 days before expiry)".into()
+                        } else {
+                            format!(
+                                "unused, removed in {}",
+                                human_duration((x.unused_since + 7 * 86400).saturating_sub(now))
+                            )
+                        },
                     ]
                 })
                 .collect();
-            print_table(&["DOMAIN", "ISSUED", "EXPIRES"], rows);
-            if st.certs.is_empty() {
+            if !st.certs.is_empty() {
+                print_table(&["DOMAIN", "ISSUED", "EXPIRES", "STATUS"], rows);
+            }
+            if !st.certs_pending.is_empty() {
+                if !st.certs.is_empty() {
+                    println!();
+                }
+                println!("WAITING FOR A CERTIFICATE");
+                let rows = st
+                    .certs_pending
+                    .iter()
+                    .map(|p| {
+                        vec![
+                            p.domain.clone(),
+                            if p.retry_at <= now { "now".into() } else { format!("in {}", human_duration(p.retry_at - now)) },
+                            p.reason.chars().take(110).collect(),
+                        ]
+                    })
+                    .collect();
+                print_table(&["DOMAIN", "NEXT TRY", "WHY"], rows);
+            }
+            if st.certs.is_empty() && st.certs_pending.is_empty() {
                 println!("(no certificates yet — add [http] domains to an app and point DNS at any machine)");
             }
             Ok(())

@@ -187,6 +187,16 @@ pub struct CertView {
     pub domain: String,
     pub not_after: u64,
     pub issued_at: u64,
+    #[serde(default)]
+    pub unused_since: u64,
+}
+
+/// A domain still waiting for its certificate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PendingCert {
+    pub domain: String,
+    pub reason: String,
+    pub retry_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,6 +213,8 @@ pub struct StatusView {
     pub monthly_cost: f64,
     #[serde(default)]
     pub autopilot: Option<crate::agent::autopilot::Status>,
+    #[serde(default)]
+    pub certs_pending: Vec<PendingCert>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
