@@ -14,6 +14,7 @@ a NUC under your desk...) and it:
 - **deploys with zero downtime**: rolling updates, with automatic rollback if the new version isn't healthy
 - **replicates volumes** across machines, and moves them with a final sync (no data loss) when a machine is drained
 - **does HTTPS for you**: Let's Encrypt certificates, renewed automatically and served by every machine
+- **handles Cloudflare DNS for you**: give it a Cloudflare API token and it creates, updates and cleans up DNS records for your apps automatically (including failover and autopilot server changes)
 - **updates the OS for you**: one machine at a time, in a time window. It moves work off first, reboots if needed, then moves work back
 - **buys and sizes servers for you (autopilot)**: give it a cloud token and a budget. It picks the cheapest server that fits, adds servers when apps need room, removes or downsizes ones you don't need, and replaces dead ones
 - **runs the control plane on your servers**, so nothing has to keep running on your PC
@@ -136,6 +137,13 @@ health = "/healthz"                 # optional; otherwise a TCP check
 port = 9000                         # reachable as shop.internal:9000 from other apps
 public = true                       # ...and on every machine's public IP
 
+# [[dns]]                           # optional DNS records (managed automatically with Cloudflare DNS)
+# name = "www.shop.example.com"     # omit type/content to auto-point at cluster (or UDP app) IPs
+# type = "CNAME"
+# content = "shop.example.com"
+# proxied = true                    # orange cloud (overrides settings.cloudflare_proxied)
+# ttl = 60                          # 1 = auto, or 60-86400 seconds
+
 regions = ["ash"]                   # only run in these locations (default: anywhere)
 
 [scale]
@@ -248,6 +256,26 @@ latrix autopilot off       # servers stay as they are
 Your provider token is stored in the cluster's state, which is root-only
 (0600) on your servers and never shown in status output. Use a token
 scoped to a dedicated project.
+
+## Automatic Cloudflare DNS
+
+Give latrix a Cloudflare API token (with **Zone:Read** and **Zone:DNS:Edit**) and it manages DNS records for your cluster and apps automatically:
+
+```bash
+latrix dns cloudflare <api-token>          # or set CLOUDFLARE_API_TOKEN / `latrix provider set cloudflare <token>`
+latrix dns                                 # show zones and managed records
+latrix dns add myapp play.example.com      # auto-points at cluster IPs (or the app's machine for UDP apps)
+latrix dns add myapp www.example.com --type CNAME --content app.example.com --proxied
+latrix dns add myapp app.example.com --type TXT --content "v=spf1 -all"
+latrix dns rm myapp app.example.com --type TXT
+latrix dns sync                            # force an immediate sync
+latrix dns off                             # disable (leaves existing Cloudflare records untouched)
+```
+
+- **`[http] domains`** and **`settings.base_domain`** (`*.<base_domain>`) get A/AAAA records automatically, updated with zero downtime whenever machines join, leave, drain, fail over, or get replaced by the autopilot.
+- **`[[dns]]`** in `latrix.toml` (and `latrix dns add`) lets you manage extra records (`A`, `AAAA`, `CNAME`, `TXT`, `MX`, `SRV`, `CAA`) per app, override `proxied` / `ttl` on any HTTP domain, or give UDP apps a stable hostname that follows the app's machine.
+- **HTTPS works with Cloudflare proxy too:** if a domain is proxied (orange cloud) and HTTP-01 cannot reach the cluster directly, latrix automatically falls back to Let's Encrypt **DNS-01** using the same Cloudflare token.
+- **Unrelated records stay untouched:** latrix tags records it creates (`latrix:<cluster>`) and only removes records it owns when apps or domains are removed.
 
 ## Backups
 
@@ -409,6 +437,7 @@ latrix --cluster prod status
 | `latrix machine list\|add\|create\|remove\|drain\|cordon\|uncordon\|update\|ssh` | machines |
 | `latrix doctor [machine]` | check every machine over SSH and explain what's wrong |
 | `latrix certs` | certificates, plus domains still waiting for one (with the reason and next retry) |
+| `latrix dns [cloudflare\|off\|add\|rm\|sync]` | automatic Cloudflare DNS and per-app DNS records |
 | `latrix volumes`, `latrix certs`, `latrix events` | the rest of the state |
 | `latrix settings [key=value ...]` | cluster settings (see below) |
 | `latrix self-update` | update this CLI and the cluster to the newest release |
@@ -435,6 +464,8 @@ latrix settings volume_retention_days=0      # delete volume data no app uses ri
 latrix settings volume_snapshots=14          # daily snapshots to keep per volume (0 = off)
 latrix settings alert_webhook=https://discord.com/api/webhooks/...  # warnings go here
 latrix settings auto_upgrade=false           # don't upgrade latrix automatically
+latrix settings cloudflare_proxied=true      # proxy Cloudflare DNS records (orange cloud) by default
+latrix settings cloudflare_ttl=60            # default TTL for Cloudflare records (1 = auto, or 60-86400)
 ```
 
 ## How it works

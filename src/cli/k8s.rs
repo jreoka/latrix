@@ -965,7 +965,7 @@ pub async fn dispatch(cfg: &CliConfig, name: &str, t: K8sTarget, cmd: Cmd) -> Re
             "'{name}' is a Kubernetes cluster: its nodes are managed by Kubernetes / your provider. \
              `latrix machine list` shows them."
         ),
-        Cmd::Upgrade { .. } | Cmd::Settings { .. } | Cmd::Dashboard { .. } => bail!(
+        Cmd::Upgrade { .. } | Cmd::Settings { .. } | Cmd::Dashboard { .. } | Cmd::Dns { .. } => bail!(
             "this command is for latrix's own clusters; '{name}' is a Kubernetes target (try `latrix status`, or your usual Kubernetes tools)"
         ),
         _ => {

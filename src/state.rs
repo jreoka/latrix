@@ -46,6 +46,32 @@ pub struct ClusterState {
     /// Keys removed with `latrix keys remove`: deleted from every machine.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revoked_ssh_keys: Vec<String>,
+    /// Cloudflare API token for automatic DNS management (never shown in status).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cloudflare_token: Option<String>,
+    /// Cloudflare DNS records created/managed by latrix, replicated so any leader
+    /// knows what to update or clean up when apps/domains/machines change.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub managed_dns: Vec<ManagedDnsRecord>,
+}
+
+/// A DNS record currently managed by latrix in Cloudflare.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ManagedDnsRecord {
+    pub zone_id: String,
+    pub zone_name: String,
+    pub record_id: String,
+    pub name: String,
+    pub record_type: String,
+    pub content: String,
+    #[serde(default)]
+    pub proxied: bool,
+    #[serde(default)]
+    pub ttl: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Copy)]
@@ -171,6 +197,9 @@ pub struct App {
     pub created_at: u64,
     #[serde(default)]
     pub last_builder: Option<u32>,
+    /// Extra DNS records configured via `latrix dns add` (preserved across deploys).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_records: Vec<crate::config::DnsRecordConfig>,
 }
 
 impl App {
@@ -300,6 +329,12 @@ pub struct Settings {
     /// ...and never more than this many.
     #[serde(default = "five")]
     pub max_machines: u32,
+    /// Proxy Cloudflare DNS records through Cloudflare (orange cloud) by default.
+    #[serde(default)]
+    pub cloudflare_proxied: bool,
+    /// Default TTL in seconds for Cloudflare DNS records (1 = Auto, or 60-86400).
+    #[serde(default = "default_cf_ttl")]
+    pub cloudflare_ttl: u32,
 }
 
 fn seven() -> u32 {
@@ -313,6 +348,9 @@ fn one() -> u32 {
 }
 fn five() -> u32 {
     5
+}
+fn default_cf_ttl() -> u32 {
+    60
 }
 
 fn yes() -> bool {
@@ -340,6 +378,8 @@ impl Default for Settings {
             autopilot: false,
             min_machines: 1,
             max_machines: 5,
+            cloudflare_proxied: false,
+            cloudflare_ttl: default_cf_ttl(),
         }
     }
 }

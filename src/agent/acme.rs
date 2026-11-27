@@ -28,9 +28,23 @@ pub async fn run(agent: Arc<Agent>) {
     let mut backoff: HashMap<String, Instant> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(120));
     loop {
-        tick.tick().await;
+        let woken = tokio::select! {
+            _ = tick.tick() => false,
+            _ = agent.acme_wake.notified() => true,
+        };
         if !agent.is_leader() {
             continue;
+        }
+        if woken {
+            // Cloudflare DNS just updated: give records a brief moment to propagate and clear DNS backoffs.
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            let pending = agent.acme_pending.lock().unwrap().clone();
+            backoff.retain(|d, _| {
+                pending
+                    .get(d)
+                    .map(|(reason, _)| !reason.contains("does not point"))
+                    .unwrap_or(false)
+            });
         }
         let s = agent.snapshot();
         let routes = agent.routes.read().unwrap().clone();
@@ -157,8 +171,16 @@ async fn issue(agent: &Arc<Agent>, domain: &str) -> Result<()> {
         Err(_) => false,
     };
     set_challenge(agent, &probe, None).await?;
-    if !ok {
-        bail!("DNS for {domain} does not point at this cluster yet (add an A record for one of your machines)");
+    // If HTTP-01 can't reach us directly (e.g. Cloudflare proxy orange cloud with
+    // Always-HTTPS, or DNS still propagating), fall back to DNS-01 via Cloudflare
+    // when a Cloudflare token manages this domain's zone.
+    let cf_dns01 = if !ok {
+        super::cloudflare::find_zone_for_domain(agent, domain).await
+    } else {
+        None
+    };
+    if !ok && cf_dns01.is_none() {
+        bail!("DNS for {domain} does not point at this cluster yet (add an A record for one of your machines, or configure Cloudflare DNS with `latrix dns cloudflare <token>`)");
     }
 
     // 2. Account (created once, stored in the cluster state).
@@ -199,11 +221,15 @@ async fn issue(agent: &Arc<Agent>, domain: &str) -> Result<()> {
         }
     };
 
-    // 3. Order + HTTP-01 challenges.
-    info!("requesting certificate for {domain}");
+    // 3. Order + HTTP-01 (or Cloudflare DNS-01) challenges.
+    info!(
+        "requesting certificate for {domain} ({})",
+        if cf_dns01.is_some() { "dns-01 via Cloudflare" } else { "http-01" }
+    );
     let ids = [Identifier::Dns(domain.to_string())];
     let mut order = account.new_order(&NewOrder::new(&ids)).await?;
-    let mut tokens = vec![];
+    let mut http_tokens = vec![];
+    let mut dns_records: Vec<(String, String, String)> = vec![]; // (token, zone_id, record_id)
     {
         let mut auths = order.authorizations();
         while let Some(a) = auths.next().await {
@@ -213,15 +239,28 @@ async fn issue(agent: &Arc<Agent>, domain: &str) -> Result<()> {
                 AuthorizationStatus::Valid => continue,
                 other => bail!("authorization is {other:?}"),
             }
-            let mut ch = authz
-                .challenge(ChallengeType::Http01)
-                .ok_or_else(|| anyhow!("no http-01 challenge offered"))?;
-            let token = ch.token.clone();
-            let key_auth = ch.key_authorization().as_str().to_string();
-            set_challenge(agent, &token, Some(&key_auth)).await?;
-            tokens.push(token);
-            tokio::time::sleep(Duration::from_secs(3)).await;
-            ch.set_ready().await?;
+            if let Some((cf_token, _, zone)) = &cf_dns01 {
+                let mut ch = authz
+                    .challenge(ChallengeType::Dns01)
+                    .ok_or_else(|| anyhow!("no dns-01 challenge offered"))?;
+                let txt = ch.key_authorization().dns_value();
+                let cf = super::cloudflare::CfClient::new(agent.http.clone(), cf_token);
+                let rec_id = cf.create_acme_txt(&zone.id, domain, &txt).await?;
+                dns_records.push((cf_token.clone(), zone.id.clone(), rec_id));
+                // Give Cloudflare edge DNS a moment to propagate the TXT record.
+                tokio::time::sleep(Duration::from_secs(15)).await;
+                ch.set_ready().await?;
+            } else {
+                let mut ch = authz
+                    .challenge(ChallengeType::Http01)
+                    .ok_or_else(|| anyhow!("no http-01 challenge offered"))?;
+                let token = ch.token.clone();
+                let key_auth = ch.key_authorization().as_str().to_string();
+                set_challenge(agent, &token, Some(&key_auth)).await?;
+                http_tokens.push(token);
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                ch.set_ready().await?;
+            }
         }
     }
     let result = async {
@@ -234,8 +273,12 @@ async fn issue(agent: &Arc<Agent>, domain: &str) -> Result<()> {
         Ok((key_pem, cert_pem))
     }
     .await;
-    for t in &tokens {
+    for t in &http_tokens {
         let _ = set_challenge(agent, t, None).await;
+    }
+    for (cf_token, zone_id, rec_id) in &dns_records {
+        let cf = super::cloudflare::CfClient::new(agent.http.clone(), cf_token);
+        let _ = cf.delete_record(zone_id, rec_id).await;
     }
     let (key_pem, cert_pem) = result?;
     let not_after = not_after(&cert_pem).unwrap_or(now() + 60 * 86400);

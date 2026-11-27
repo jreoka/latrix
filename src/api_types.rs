@@ -180,6 +180,8 @@ pub struct AppView {
     pub volumes: Vec<VolumeView>,
     pub secret_names: Vec<String>,
     pub config: Option<AppConfig>,
+    #[serde(default)]
+    pub dns_records: Vec<crate::config::DnsRecordConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -215,6 +217,8 @@ pub struct StatusView {
     pub autopilot: Option<crate::agent::autopilot::Status>,
     #[serde(default)]
     pub certs_pending: Vec<PendingCert>,
+    #[serde(default)]
+    pub dns: Option<DnsSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -281,6 +285,92 @@ pub struct AppExport {
     pub secrets: BTreeMap<String, String>,
     pub count: u32,
     pub volumes: Vec<Volume>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_records: Vec<crate::config::DnsRecordConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// Cloudflare DNS management
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct CloudflareSetupRequest {
+    #[serde(default)]
+    pub token: Option<String>,
+    #[serde(default)]
+    pub remove: bool,
+    #[serde(default)]
+    pub proxied: Option<bool>,
+    #[serde(default)]
+    pub ttl: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DnsRecordRemove {
+    pub name: String,
+    #[serde(default, rename = "type")]
+    pub record_type: Option<String>,
+    #[serde(default)]
+    pub content: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct AppDnsRequest {
+    #[serde(default)]
+    pub add: Vec<crate::config::DnsRecordConfig>,
+    #[serde(default)]
+    pub remove: Vec<DnsRecordRemove>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DnsRecordStatus {
+    pub app: Option<String>,
+    pub name: String,
+    pub record_type: String,
+    pub content: String,
+    pub proxied: bool,
+    pub ttl: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u16>,
+    /// Where this record came from: "http" | "config" | "cli" | "base_domain"
+    pub source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zone: Option<String>,
+    /// "synced" | "pending" | "disabled" | "no_zone" | "error"
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DnsStatusView {
+    pub configured: bool,
+    pub proxied_default: bool,
+    pub ttl_default: u32,
+    pub base_domain: String,
+    pub zones: Vec<String>,
+    pub last_sync: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
+    pub records: Vec<DnsRecordStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DnsSyncResult {
+    pub created: usize,
+    pub updated: usize,
+    pub deleted: usize,
+    pub errors: Vec<String>,
+    pub status: DnsStatusView,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DnsSummary {
+    pub configured: bool,
+    pub zones: Vec<String>,
+    pub records: Vec<DnsRecordStatus>,
+    pub last_sync: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

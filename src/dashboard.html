@@ -69,6 +69,7 @@ code { font: .8rem ui-monospace, SFMono-Regular, Menlo, monospace; }
 <main>
   <section><h2>Machines</h2><div class="grid" id="machines"></div></section>
   <section><h2>Apps</h2><div class="tablewrap"><table class="table" id="apps"></table></div></section>
+  <section id="dns-section" style="display:none"><h2>DNS</h2><div class="tablewrap"><table class="table" id="dns"></table></div></section>
   <section><h2>Volumes</h2><div class="tablewrap"><table class="table" id="volumes"></table></div></section>
   <section><h2>Recent events</h2><div class="events" id="events"></div></section>
 </main>
@@ -103,6 +104,10 @@ function render(st) {
   if (st.settings.autopilot) {
     const ap = st.autopilot || {};
     meta += `<span>autopilot <b class="ok">on</b>${ap.working_on ? " · " + esc(ap.working_on) : ap.last_decision ? " · " + esc(ap.last_decision) : ""}</span>`;
+  }
+  if (st.dns && st.dns.configured) {
+    const errs = (st.dns.records || []).filter((r) => r.status === "error").length;
+    meta += `<span>cloudflare DNS <b class="${st.dns.last_error || errs ? "warn" : "ok"}">${st.dns.last_error || errs ? "error" : "on"}</b> · ${(st.dns.records || []).length} record${(st.dns.records || []).length === 1 ? "" : "s"}</span>`;
   }
   meta += `<span>auto-updates <b>${st.settings.auto_updates ? "on" : "off"}</b>${st.settings.auto_updates && st.settings.update_window ? " (" + esc(st.settings.update_window) + " UTC)" : ""}</span>`;
   $("meta").innerHTML = meta;
@@ -147,6 +152,27 @@ function render(st) {
   }).join("");
   $("apps").innerHTML = `<tr><th>App</th><th>Release</th><th>Instances</th><th>Resources</th><th>Address</th></tr>` +
     (rows || `<tr><td colspan="5" class="empty">No apps yet — run <code>latrix launch</code> and <code>latrix deploy</code>.</td></tr>`);
+
+  const dns = st.dns || {};
+  const dnsRecs = dns.records || [];
+  if (dns.configured || dnsRecs.length) {
+    $("dns-section").style.display = "";
+    const dnsRows = dnsRecs.map((r) => {
+      const sc = r.status === "synced" ? "ok" : r.status === "error" || r.status === "no_zone" ? "bad" : "warn";
+      return `<tr>
+        <td><b>${esc(r.app || "(cluster)")}</b><div class="sub">${esc(r.source)}</div></td>
+        <td><code>${esc(r.name)}</code></td>
+        <td><code>${esc(r.record_type)}</code></td>
+        <td><code>${esc(r.content)}</code></td>
+        <td class="sub">${r.proxied ? "proxied" : "DNS only"} · ${r.ttl === 1 ? "auto" : r.ttl + "s"}</td>
+        <td><span class="badge ${sc}">${esc(r.status)}</span>${r.error ? `<div class="sub">${esc(r.error)}</div>` : ""}</td>
+      </tr>`;
+    }).join("");
+    $("dns").innerHTML = `<tr><th>App</th><th>Name</th><th>Type</th><th>Content</th><th>Options</th><th>Status</th></tr>` +
+      (dnsRows || `<tr><td colspan="6" class="empty">Cloudflare DNS is enabled (zones: ${esc((dns.zones || []).join(", ") || "none")}), no app DNS records yet.</td></tr>`);
+  } else {
+    $("dns-section").style.display = "none";
+  }
 
   const vols = st.apps.flatMap((a) => a.volumes);
   $("volumes").innerHTML = `<tr><th>Volume</th><th>Primary</th><th>Replicas</th><th>Size</th><th>Last sync</th></tr>` +

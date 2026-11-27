@@ -407,6 +407,7 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             Ok(())
         }
+        Cmd::Dns { action } => dns_cmd(&cfg, cl, action.unwrap_or(DnsCmd::Status { app: None })).await,
         Cmd::Events { .. } => {
             let (_, _, c) = connect(&cfg, cl).await?;
             let ev: Vec<crate::state::Event> = c.get("/v1/events").await?;
@@ -724,6 +725,14 @@ async fn provider_cmd(p: ProviderCmd) -> Result<()> {
     let mut cfg = CliConfig::load()?;
     match p {
         ProviderCmd::Set { provider, token } => {
+            let lower = provider.to_ascii_lowercase();
+            if lower == "cloudflare" || lower == "cf" {
+                cfg.providers.insert("cloudflare".into(), token);
+                cfg.save()?;
+                println!("saved cloudflare token in {}", CliConfig::path().display());
+                println!("next: run `latrix dns cloudflare` to enable automatic DNS on your cluster");
+                return Ok(());
+            }
             let p = providers::canonical(&provider)?;
             cfg.providers.insert(p.into(), token);
             cfg.save()?;
@@ -732,6 +741,155 @@ async fn provider_cmd(p: ProviderCmd) -> Result<()> {
         ProviderCmd::Sizes { provider } => {
             let p = providers::canonical(&provider)?;
             providers::sizes(p, &providers::token(&cfg, p)?).await?;
+        }
+    }
+    Ok(())
+}
+
+fn print_dns_status(v: &DnsStatusView, only_app: Option<&str>) {
+    if v.configured {
+        println!(
+            "Cloudflare DNS: ON · zones: {} · default: {}, TTL {}{}",
+            if v.zones.is_empty() { "(none accessible)".into() } else { v.zones.join(", ") },
+            if v.proxied_default { "proxied" } else { "DNS only" },
+            if v.ttl_default == 1 { "auto".into() } else { format!("{}s", v.ttl_default) },
+            if v.last_sync > 0 { format!(" · synced {}", ago(v.last_sync)) } else { String::new() }
+        );
+    } else {
+        println!("Cloudflare DNS: off");
+        println!("  enable: latrix dns cloudflare <api-token>   (token needs Zone:Read + Zone:DNS:Edit)");
+    }
+    if let Some(err) = &v.last_error {
+        println!("  ! last error: {err}");
+    }
+    let records: Vec<&DnsRecordStatus> = v
+        .records
+        .iter()
+        .filter(|r| only_app.map(|a| r.app.as_deref() == Some(a)).unwrap_or(true))
+        .collect();
+    if records.is_empty() {
+        println!(
+            "\n(no DNS records{} — add [http] domains or [[dns]] to latrix.toml, or run `latrix dns add <app> <name>`)",
+            only_app.map(|a| format!(" for '{a}'")).unwrap_or_default()
+        );
+        return;
+    }
+    println!();
+    let rows = records
+        .iter()
+        .map(|r| {
+            let status = match r.status.as_str() {
+                "synced" => "synced".into(),
+                "error" => format!("error: {}", r.error.as_deref().unwrap_or("")),
+                "no_zone" => "no matching CF zone".into(),
+                other => other.into(),
+            };
+            vec![
+                r.app.clone().unwrap_or_else(|| "(cluster)".into()),
+                r.name.clone(),
+                r.record_type.clone(),
+                r.content.clone(),
+                if r.proxied { "yes".into() } else { "no".into() },
+                if r.ttl == 1 { "auto".into() } else { format!("{}s", r.ttl) },
+                r.source.clone(),
+                status,
+            ]
+        })
+        .collect();
+    print_table(&["APP", "NAME", "TYPE", "CONTENT", "PROXIED", "TTL", "SOURCE", "STATUS"], rows);
+}
+
+async fn dns_cmd(cfg: &CliConfig, cl: Option<&str>, action: DnsCmd) -> Result<()> {
+    let (_, _, c) = connect(cfg, cl).await?;
+    match action {
+        DnsCmd::Status { app } => {
+            let v: DnsStatusView = c.get("/v1/dns").await?;
+            print_dns_status(&v, app.as_deref());
+        }
+        DnsCmd::Cloudflare { token, proxied, no_proxied, ttl } => {
+            let prox = if proxied { Some(true) } else if no_proxied { Some(false) } else { None };
+            let resolved_token = token
+                .or_else(|| std::env::var("CLOUDFLARE_API_TOKEN").ok().filter(|s| !s.trim().is_empty()))
+                .or_else(|| std::env::var("CF_API_TOKEN").ok().filter(|s| !s.trim().is_empty()))
+                .or_else(|| cfg.providers.get("cloudflare").cloned());
+            if resolved_token.is_none() && prox.is_none() && ttl.is_none() {
+                bail!(
+                    "pass a Cloudflare API token:\n  latrix dns cloudflare <token>\n  (or set CLOUDFLARE_API_TOKEN, or run `latrix provider set cloudflare <token>`)\n  Create a token with Zone:Read and Zone:DNS:Edit at https://dash.cloudflare.com/profile/api-tokens"
+                );
+            }
+            let v: DnsStatusView = c
+                .post(
+                    "/v1/dns/cloudflare",
+                    &CloudflareSetupRequest {
+                        token: resolved_token,
+                        remove: false,
+                        proxied: prox,
+                        ttl,
+                    },
+                )
+                .await?;
+            println!("✓ Cloudflare DNS configured");
+            print_dns_status(&v, None);
+        }
+        DnsCmd::Off => {
+            let _: DnsStatusView = c
+                .post(
+                    "/v1/dns/cloudflare",
+                    &CloudflareSetupRequest { remove: true, ..Default::default() },
+                )
+                .await?;
+            println!("✓ Cloudflare DNS disabled (existing records in Cloudflare were left as-is)");
+        }
+        DnsCmd::Add { app, name, record_type, content, proxied, no_proxied, ttl, priority } => {
+            let prox = if proxied { Some(true) } else if no_proxied { Some(false) } else { None };
+            let rec = crate::config::DnsRecordConfig {
+                name: name.clone(),
+                record_type,
+                content,
+                proxied: prox,
+                ttl,
+                priority,
+            };
+            crate::config::validate_dns_record(&rec)?;
+            let v: DnsStatusView = c
+                .post(
+                    &format!("/v1/apps/{app}/dns"),
+                    &AppDnsRequest { add: vec![rec], remove: vec![] },
+                )
+                .await?;
+            println!("✓ saved DNS record '{name}' for {app}");
+            print_dns_status(&v, Some(&app));
+        }
+        DnsCmd::Remove { app, name, record_type, content } => {
+            let v: DnsStatusView = c
+                .post(
+                    &format!("/v1/apps/{app}/dns"),
+                    &AppDnsRequest {
+                        add: vec![],
+                        remove: vec![DnsRecordRemove { name: name.clone(), record_type, content }],
+                    },
+                )
+                .await?;
+            println!("✓ removed DNS record '{name}' from {app}");
+            print_dns_status(&v, Some(&app));
+        }
+        DnsCmd::Sync => {
+            let r: DnsSyncResult = c.post("/v1/dns/sync", &serde_json::json!({})).await?;
+            if r.created == 0 && r.updated == 0 && r.deleted == 0 && r.errors.is_empty() {
+                println!("✓ Cloudflare DNS is already up to date");
+            } else {
+                println!(
+                    "✓ Cloudflare DNS synced: {} created, {} updated, {} deleted{}",
+                    r.created,
+                    r.updated,
+                    r.deleted,
+                    if r.errors.is_empty() { String::new() } else { format!(", {} error(s)", r.errors.len()) }
+                );
+            }
+            for e in &r.errors {
+                println!("  ! {e}");
+            }
+            print_dns_status(&r.status, None);
         }
     }
     Ok(())
@@ -838,6 +996,17 @@ async fn status(cfg: &CliConfig, cl: Option<&str>) -> Result<()> {
         head.push_str(&format!(" · est. {:.2}/month", st.monthly_cost));
         if st.settings.monthly_budget > 0.0 && st.monthly_cost > st.settings.monthly_budget {
             head.push_str(&format!(" (over budget of {:.2}!)", st.settings.monthly_budget));
+        }
+    }
+    if let Some(d) = &st.dns {
+        if d.configured {
+            let errs = d.records.iter().filter(|r| r.status == "error").count();
+            head.push_str(&format!(
+                " · cloudflare DNS ({} record{}{})",
+                d.records.len(),
+                if d.records.len() == 1 { "" } else { "s" },
+                if errs > 0 { format!(", {errs} error(s)") } else { String::new() }
+            ));
         }
     }
     println!("{head}\n");
@@ -956,6 +1125,18 @@ async fn ps(cfg: &CliConfig, cl: Option<&str>, app: &str) -> Result<()> {
     }
     if !v.internal.is_empty() {
         println!("  internal: {}", v.internal.join(", "));
+    }
+    if !v.dns_records.is_empty() {
+        let desc: Vec<String> = v
+            .dns_records
+            .iter()
+            .map(|r| match (&r.record_type, &r.content) {
+                (Some(t), Some(c)) => format!("{} ({t} -> {c})", r.name),
+                (Some(t), None) => format!("{} ({t} auto)", r.name),
+                _ => format!("{} (auto)", r.name),
+            })
+            .collect();
+        println!("  dns:      {}", desc.join(", "));
     }
     println!();
     let rows = v

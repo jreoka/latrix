@@ -45,6 +45,9 @@ pub struct AppConfig {
     /// Extra TCP ports (internal by default, reachable as `<app>.internal:<port>`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<PortConfig>,
+    /// Custom DNS records managed automatically when Cloudflare DNS is enabled.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns: Vec<DnsRecordConfig>,
     #[serde(default)]
     pub scale: ScaleConfig,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -126,6 +129,101 @@ pub struct PortConfig {
     /// voice, ...): no proxy hop, at most one instance per machine.
     #[serde(default = "tcp", skip_serializing_if = "is_tcp")]
     pub protocol: String,
+}
+
+/// A DNS record managed for an app (e.g. via Cloudflare DNS).
+///
+/// Omit `type` and `content` to automatically point A/AAAA records at the
+/// cluster's machines (or for UDP apps, at the machine(s) running the app).
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct DnsRecordConfig {
+    /// Fully-qualified DNS name, e.g. "play.example.com" or "_minecraft._tcp.play.example.com".
+    pub name: String,
+    /// Record type: "A", "AAAA", "CNAME", "TXT", "MX", "SRV", "CAA".
+    /// Omit to auto-manage A/AAAA records pointing at the cluster/app IPs.
+    #[serde(default, rename = "type", skip_serializing_if = "Option::is_none")]
+    pub record_type: Option<String>,
+    /// Record target/value. Omit for auto-managed A/AAAA records pointing at cluster/app IPs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    /// Cloudflare proxy (orange cloud). Omit to use `settings.cloudflare_proxied`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub proxied: Option<bool>,
+    /// TTL in seconds (1 = Auto in Cloudflare, or 60..=86400). Omit to use `settings.cloudflare_ttl`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl: Option<u32>,
+    /// Priority for MX / SRV records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u16>,
+}
+
+/// Normalize a DNS hostname (trim, lowercase, strip trailing dot).
+pub fn normalize_dns_name(name: &str) -> String {
+    name.trim().trim_end_matches('.').to_ascii_lowercase()
+}
+
+/// Validate a DNS record configuration (used by `latrix.toml` and `latrix dns add`).
+pub fn validate_dns_record(r: &DnsRecordConfig) -> Result<()> {
+    let name = normalize_dns_name(&r.name);
+    if name.is_empty()
+        || !name.contains('.')
+        || name.contains('/')
+        || name.contains(':')
+        || name.chars().any(|c| c.is_whitespace())
+    {
+        bail!("invalid DNS record name '{}'", r.name);
+    }
+    let ty = r.record_type.as_deref().map(|t| t.trim().to_ascii_uppercase());
+    let content = r.content.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    let resolved_ty = match (ty.as_deref(), content) {
+        (Some(t), _) => {
+            if !matches!(t, "A" | "AAAA" | "CNAME" | "TXT" | "MX" | "SRV" | "CAA") {
+                bail!("DNS record '{}': unsupported type '{t}' (supported: A, AAAA, CNAME, TXT, MX, SRV, CAA)", r.name);
+            }
+            Some(t)
+        }
+        (None, Some(c)) => {
+            if c.parse::<std::net::Ipv4Addr>().is_ok() {
+                Some("A")
+            } else if c.parse::<std::net::Ipv6Addr>().is_ok() {
+                Some("AAAA")
+            } else {
+                bail!("DNS record '{}': set `type` (e.g. CNAME, TXT, MX, SRV, CAA) when providing `content`", r.name);
+            }
+        }
+        (None, None) => None, // auto A/AAAA
+    };
+    match (resolved_ty, content) {
+        (Some("A"), Some(c)) => {
+            if c.parse::<std::net::Ipv4Addr>().is_err() {
+                bail!("DNS record '{}': A record content '{c}' must be an IPv4 address", r.name);
+            }
+        }
+        (Some("AAAA"), Some(c)) => {
+            if c.parse::<std::net::Ipv6Addr>().is_err() {
+                bail!("DNS record '{}': AAAA record content '{c}' must be an IPv6 address", r.name);
+            }
+        }
+        (Some(t @ ("CNAME" | "TXT" | "MX" | "SRV" | "CAA")), None) => {
+            bail!("DNS record '{}': {t} record requires `content`", r.name);
+        }
+        _ => {}
+    }
+    if let Some(true) = r.proxied {
+        if matches!(resolved_ty, Some("TXT" | "MX" | "SRV" | "CAA")) {
+            bail!(
+                "DNS record '{}': only A, AAAA and CNAME records can be proxied by Cloudflare",
+                r.name
+            );
+        }
+    }
+    if let Some(ttl) = r.ttl {
+        if ttl != 1 && !(60..=86400).contains(&ttl) {
+            bail!("DNS record '{}': ttl must be 1 (auto) or between 60 and 86400 seconds", r.name);
+        }
+    }
+    Ok(())
 }
 
 fn tcp() -> String {
@@ -364,6 +462,9 @@ impl AppConfig {
                 bail!("invalid domain '{d}'");
             }
         }
+        for r in &self.dns {
+            validate_dns_record(r)?;
+        }
         Ok(())
     }
 
@@ -494,5 +595,53 @@ mod tests {
     #[test]
     fn unknown_fields_rejected() {
         assert!(toml::from_str::<AppConfig>("app = \"x\"\nbogus = 1\n").is_err());
+    }
+
+    #[test]
+    fn dns_records_parse_and_validate() {
+        let c: AppConfig = toml::from_str(
+            r#"
+app = "shop"
+[http]
+port = 3000
+domains = ["shop.example.com"]
+[[dns]]
+name = "play.example.com"
+[[dns]]
+name = "www.shop.example.com"
+type = "CNAME"
+content = "shop.example.com"
+proxied = true
+[[dns]]
+name = "shop.example.com"
+type = "TXT"
+content = "v=spf1 -all"
+ttl = 300
+"#,
+        )
+        .unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.dns.len(), 3);
+
+        // TXT cannot be proxied
+        let bad_proxy: AppConfig = toml::from_str(
+            "app = \"x\"\n[[dns]]\nname = \"a.example.com\"\ntype = \"TXT\"\ncontent = \"hi\"\nproxied = true\n",
+        )
+        .unwrap();
+        assert!(bad_proxy.validate().is_err());
+
+        // CNAME requires content
+        let bad_cname: AppConfig = toml::from_str(
+            "app = \"x\"\n[[dns]]\nname = \"a.example.com\"\ntype = \"CNAME\"\n",
+        )
+        .unwrap();
+        assert!(bad_cname.validate().is_err());
+
+        // Invalid TTL
+        let bad_ttl: AppConfig = toml::from_str(
+            "app = \"x\"\n[[dns]]\nname = \"a.example.com\"\nttl = 10\n",
+        )
+        .unwrap();
+        assert!(bad_ttl.validate().is_err());
     }
 }

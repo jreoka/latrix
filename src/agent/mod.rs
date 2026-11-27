@@ -10,6 +10,7 @@ pub mod alerts;
 pub mod autopilot;
 pub mod api;
 pub mod builder;
+pub mod cloudflare;
 pub mod dns;
 pub mod keys;
 pub mod maintenance;
@@ -70,10 +71,12 @@ pub struct Agent {
     pub maintenance_done: Mutex<Option<String>>,
     pub sampler: metrics::Sampler,
     pub autopilot: autopilot::Shared,
+    pub cloudflare: cloudflare::Shared,
     pub mesh_up: std::sync::atomic::AtomicBool,
     pub outbox: Mutex<Vec<Event>>,
     pub alert_queue: Mutex<Vec<String>>,
     pub upgrade_now: tokio::sync::Notify,
+    pub acme_wake: tokio::sync::Notify,
     /// Domains waiting for a certificate: domain -> (reason, next attempt).
     pub acme_pending: Mutex<std::collections::BTreeMap<String, (String, u64)>>,
 }
@@ -301,11 +304,13 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
         maintenance_done: Mutex::new(maintenance::read_done_marker(&data)),
         sampler: Default::default(),
         autopilot: Default::default(),
+        cloudflare: Default::default(),
         mesh_up: std::sync::atomic::AtomicBool::new(false),
         outbox: Mutex::new(vec![]),
         acme_pending: Mutex::new(Default::default()),
         alert_queue: Mutex::new(vec![]),
         upgrade_now: tokio::sync::Notify::new(),
+        acme_wake: tokio::sync::Notify::new(),
     });
 
     if !dev {
@@ -341,6 +346,7 @@ pub async fn run(data: PathBuf, dev: bool) -> Result<()> {
     if !dev {
         tokio::spawn(mesh::sync_loop(agent.clone()));
         tokio::spawn(dns::run(agent.clone()));
+        tokio::spawn(cloudflare::run(agent.clone()));
         tokio::spawn(maintenance::run(agent.clone()));
         tokio::spawn(autopilot::run(agent.clone()));
     }

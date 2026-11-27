@@ -40,6 +40,8 @@ pub struct Manifest {
     pub count: u32,
     #[serde(default)]
     pub volumes: Vec<ManifestVolume>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_records: Vec<crate::config::DnsRecordConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -196,6 +198,7 @@ pub async fn backup_app(c: &Client, app: &str, out_dir: &Path, with_image: bool,
         secrets: ex.secrets.clone(),
         count: ex.count,
         volumes: vec![],
+        dns_records: ex.dns_records.clone(),
     };
     println!("==> {app}");
 
@@ -342,6 +345,14 @@ pub async fn restore_bundle(c: &Client, m: &Manifest, dir: &Path, name: &str, me
         println!("==> restored {} secret(s)", m.secrets.len());
     }
 
+    // 3b. CLI-managed DNS records
+    if !m.dns_records.is_empty() {
+        let _: DnsStatusView = c
+            .post(&format!("/v1/apps/{name}/dns"), &AppDnsRequest { add: m.dns_records.clone(), remove: vec![] })
+            .await?;
+        println!("==> restored {} DNS record(s)", m.dns_records.len());
+    }
+
     // 4. volume data onto the volume's primary machine
     if !m.volumes.is_empty() {
         let v: AppView = c.get(&format!("/v1/apps/{name}")).await?;
@@ -413,6 +424,7 @@ mod tests {
             secrets: [("PW".to_string(), "s3cret".to_string())].into(),
             count: 1,
             volumes: vec![ManifestVolume { name: "data".into(), path: "/data".into(), file: "volumes/data.tar.gz".into() }],
+            dns_records: vec![],
         };
         let out = dir.join("b.tar");
         write_archive(&out, &m, &[("volumes/data.tar.gz".into(), data)]).unwrap();

@@ -184,6 +184,11 @@ pub enum Cmd {
         #[command(subcommand)]
         action: Option<ListCmd>,
     },
+    /// Automatic Cloudflare DNS management and per-app DNS records
+    Dns {
+        #[command(subcommand)]
+        action: Option<DnsCmd>,
+    },
     /// Recent cluster events (deploys, failovers, moves, updates)
     #[command(alias = "event")]
     Events {
@@ -319,6 +324,76 @@ pub enum ListCmd {
     /// List them (same as without a subcommand)
     #[command(alias = "ls")]
     List,
+}
+
+#[derive(Subcommand)]
+pub enum DnsCmd {
+    /// Show Cloudflare DNS status and managed records (default)
+    #[command(alias = "ls", alias = "list")]
+    Status {
+        /// Only show records for this app
+        app: Option<String>,
+    },
+    /// Configure automatic Cloudflare DNS with an API token (needs Zone:Read + Zone:DNS:Edit)
+    #[command(visible_alias = "cf", alias = "setup", alias = "token")]
+    Cloudflare {
+        /// Cloudflare API token (or set CLOUDFLARE_API_TOKEN / `latrix provider set cloudflare <token>`)
+        token: Option<String>,
+        /// Proxy records through Cloudflare (orange cloud) by default
+        #[arg(long, conflicts_with = "no_proxied")]
+        proxied: bool,
+        /// Do not proxy records through Cloudflare by default (DNS only)
+        #[arg(long)]
+        no_proxied: bool,
+        /// Default TTL in seconds (1 = Auto, or 60-86400)
+        #[arg(long)]
+        ttl: Option<u32>,
+    },
+    /// Disable automatic Cloudflare DNS (existing records in Cloudflare are left untouched)
+    #[command(alias = "disable")]
+    Off,
+    /// Add or update a DNS record for an app (omit --type/--content to auto-point at cluster/app IPs)
+    #[command(alias = "set")]
+    Add {
+        /// App name
+        app: String,
+        /// Fully-qualified DNS name (e.g. play.example.com or www.shop.example.com)
+        name: String,
+        /// Record type: A, AAAA, CNAME, TXT, MX, SRV, CAA (omit for auto A/AAAA)
+        #[arg(short = 't', long = "type")]
+        record_type: Option<String>,
+        /// Record value/target (omit for auto-managed cluster/app IPs)
+        #[arg(short = 'c', long)]
+        content: Option<String>,
+        /// Proxy through Cloudflare (orange cloud)
+        #[arg(long, conflicts_with = "no_proxied")]
+        proxied: bool,
+        /// Do not proxy through Cloudflare (DNS only)
+        #[arg(long)]
+        no_proxied: bool,
+        /// TTL in seconds (1 = Auto, or 60-86400)
+        #[arg(long)]
+        ttl: Option<u32>,
+        /// Priority (for MX / SRV records)
+        #[arg(long)]
+        priority: Option<u16>,
+    },
+    /// Remove a CLI-managed DNS record from an app
+    #[command(alias = "rm", alias = "delete")]
+    Remove {
+        /// App name
+        app: String,
+        /// DNS record name to remove
+        name: String,
+        /// Only remove this record type (e.g. TXT, CNAME, A)
+        #[arg(short = 't', long = "type")]
+        record_type: Option<String>,
+        /// Only remove a record with this exact content
+        #[arg(short = 'c', long)]
+        content: Option<String>,
+    },
+    /// Sync all app DNS records with Cloudflare now
+    Sync,
 }
 
 #[derive(Args)]

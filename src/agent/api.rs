@@ -74,7 +74,11 @@ pub fn router(agent: Arc<Agent>) -> Router {
         .route("/v1/apps/{app}/restart", post(restart))
         .route("/v1/apps/{app}/rollback", post(rollback))
         .route("/v1/apps/{app}/secrets", post(secrets))
+        .route("/v1/apps/{app}/dns", post(set_app_dns))
         .route("/v1/apps/{app}/export", get(export_app))
+        .route("/v1/dns", get(get_dns))
+        .route("/v1/dns/cloudflare", post(setup_cloudflare))
+        .route("/v1/dns/sync", post(sync_dns))
         .route("/v1/settings", get(get_settings).post(set_settings))
         .route("/v1/autopilot", get(get_autopilot).post(set_autopilot))
         .route("/v1/ssh-keys", get(get_ssh_keys).post(set_ssh_keys))
@@ -355,6 +359,7 @@ fn app_view(agent: &Agent, s: &ClusterState, live: &LiveView, app: &App) -> AppV
         volumes,
         secret_names: app.secrets.keys().cloned().collect(),
         config: cfg,
+        dns_records: app.dns_records.clone(),
     }
 }
 
@@ -417,6 +422,7 @@ async fn status(State(agent): AgentState) -> ApiResult<StatusView> {
         monthly_cost,
         autopilot: Some(agent.autopilot.status.lock().unwrap().clone()),
         certs_pending,
+        dns: Some(super::cloudflare::summary(&agent)),
     }))
 }
 
@@ -738,6 +744,7 @@ async fn deploy(
                         count: cfg.scale.initial(),
                         created_at: now(),
                         last_builder: None,
+                        dns_records: vec![],
                     },
                 );
             }
@@ -1005,10 +1012,19 @@ async fn set_settings(
             if !new.update_window.is_empty() && !new.update_window.contains('-') {
                 bail!("update_window looks like \"02:00-05:00\" (UTC), or empty for any time");
             }
+            if new.cloudflare_ttl != 1 && !(60..=86400).contains(&new.cloudflare_ttl) {
+                bail!("cloudflare_ttl must be 1 (auto) or between 60 and 86400 seconds");
+            }
             s.settings = new.clone();
             Ok(new)
         })
         .await?;
+    if req.contains_key("cloudflare_proxied")
+        || req.contains_key("cloudflare_ttl")
+        || req.contains_key("base_domain")
+    {
+        agent.cloudflare.wake.notify_one();
+    }
     if req.contains_key("alert_webhook") && !settings.alert_webhook.is_empty() {
         let lines = vec!["alerts are connected: you'll hear about machines going down, failed deploys, certificate problems, full disks and crash loops".to_string()];
         if let Err(e) = super::alerts::send(&agent, &settings.alert_webhook, &lines).await {
@@ -1123,7 +1139,231 @@ async fn export_app(State(agent): AgentState, Path(app): Path<String>) -> ApiRes
         secrets: a.secrets.clone(),
         count: a.count,
         volumes: s.volumes_of(&app).cloned().collect(),
+        dns_records: a.dns_records.clone(),
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Cloudflare DNS
+
+async fn get_dns(State(agent): AgentState) -> ApiResult<DnsStatusView> {
+    Ok(Json(super::cloudflare::status_view(&agent)))
+}
+
+async fn setup_cloudflare(
+    State(agent): AgentState,
+    Json(req): Json<CloudflareSetupRequest>,
+) -> ApiResult<DnsStatusView> {
+    if let Some(ttl) = req.ttl {
+        if ttl != 1 && !(60..=86400).contains(&ttl) {
+            return Err(anyhow!("ttl must be 1 (auto) or between 60 and 86400 seconds").into());
+        }
+    }
+    if req.remove {
+        agent
+            .mutate(|s| {
+                s.cloudflare_token = None;
+                Ok(())
+            })
+            .await?;
+        {
+            let mut rt = agent.cloudflare.status.lock().unwrap();
+            *rt = Default::default();
+        }
+        agent.event("info", "cloudflare DNS disabled (existing DNS records in Cloudflare were left as-is)");
+        return Ok(Json(super::cloudflare::status_view(&agent)));
+    }
+
+    let verified_zones = if let Some(tok) = req.token.as_deref() {
+        Some(super::cloudflare::verify_token(&agent.http, tok).await?)
+    } else {
+        None
+    };
+
+    let zone_names: Vec<String> = verified_zones
+        .as_ref()
+        .map(|zs| zs.iter().map(|z| z.name.clone()).collect())
+        .unwrap_or_default();
+
+    agent
+        .mutate(|s| {
+            if let Some(tok) = &req.token {
+                s.cloudflare_token = Some(tok.trim().to_string());
+            }
+            if let Some(p) = req.proxied {
+                s.settings.cloudflare_proxied = p;
+            }
+            if let Some(t) = req.ttl {
+                s.settings.cloudflare_ttl = t;
+            }
+            Ok(())
+        })
+        .await?;
+
+    if let Some(zones) = verified_zones {
+        {
+            let mut rt = agent.cloudflare.status.lock().unwrap();
+            rt.zones = zones;
+            rt.last_error = None;
+            rt.last_fingerprint.clear();
+        }
+        agent.event(
+            "info",
+            format!(
+                "cloudflare DNS enabled ({} zone(s){})",
+                zone_names.len(),
+                if zone_names.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", zone_names.join(", "))
+                }
+            ),
+        );
+    }
+
+    if agent.snapshot().cloudflare_token.is_some() {
+        let _ = super::cloudflare::sync_now(&agent).await;
+    }
+    Ok(Json(super::cloudflare::status_view(&agent)))
+}
+
+async fn sync_dns(State(agent): AgentState) -> ApiResult<DnsSyncResult> {
+    if agent.snapshot().cloudflare_token.is_none() {
+        return Err(anyhow!("Cloudflare DNS is not configured yet (run `latrix dns cloudflare <token>`)").into());
+    }
+    let res = super::cloudflare::sync_now(&agent).await?;
+    Ok(Json(res))
+}
+
+fn normalize_dns_record(mut r: crate::config::DnsRecordConfig) -> crate::config::DnsRecordConfig {
+    r.name = crate::config::normalize_dns_name(&r.name);
+    r.record_type = r
+        .record_type
+        .map(|t| t.trim().to_ascii_uppercase())
+        .filter(|t| !t.is_empty());
+    r.content = r.content.map(|c| c.trim().to_string()).filter(|c| !c.is_empty());
+    r
+}
+
+fn same_dns_slot(a: &crate::config::DnsRecordConfig, b: &crate::config::DnsRecordConfig) -> bool {
+    if crate::config::normalize_dns_name(&a.name) != crate::config::normalize_dns_name(&b.name) {
+        return false;
+    }
+    let ta = a.record_type.as_deref().map(|s| s.to_ascii_uppercase());
+    let tb = b.record_type.as_deref().map(|s| s.to_ascii_uppercase());
+    if ta != tb {
+        return false;
+    }
+    // Auto-IP records (no content) and CNAMEs occupy one slot per (name, type).
+    if a.content.is_none() && b.content.is_none() {
+        return true;
+    }
+    if ta.as_deref() == Some("CNAME") {
+        return true;
+    }
+    let ty = ta.as_deref().unwrap_or("");
+    match (&a.content, &b.content) {
+        (Some(ca), Some(cb)) => {
+            super::cloudflare::normalize_content(ty, ca)
+                == super::cloudflare::normalize_content(ty, cb)
+        }
+        _ => false,
+    }
+}
+
+async fn set_app_dns(
+    State(agent): AgentState,
+    Path(app): Path<String>,
+    Json(req): Json<AppDnsRequest>,
+) -> ApiResult<DnsStatusView> {
+    let mut to_add = vec![];
+    for r in req.add {
+        crate::config::validate_dns_record(&r)?;
+        to_add.push(normalize_dns_record(r));
+    }
+    let to_remove = req.remove;
+    let added_n = to_add.len();
+    let removed_n = agent
+        .mutate(|s| {
+            let a = s
+                .apps
+                .get_mut(&app)
+                .ok_or_else(|| anyhow!("app '{app}' not found"))?;
+            for rec in &to_add {
+                if let Some(pos) = a.dns_records.iter().position(|x| same_dns_slot(x, rec)) {
+                    a.dns_records[pos] = rec.clone();
+                } else {
+                    a.dns_records.push(rec.clone());
+                }
+            }
+            let mut removed = 0usize;
+            for rm in &to_remove {
+                let name = crate::config::normalize_dns_name(&rm.name);
+                let ty = rm
+                    .record_type
+                    .as_deref()
+                    .map(|t| t.trim().to_ascii_uppercase())
+                    .filter(|t| !t.is_empty());
+                let content = rm.content.as_deref().map(str::trim).filter(|c| !c.is_empty());
+                let before = a.dns_records.len();
+                a.dns_records.retain(|r| {
+                    let rn = crate::config::normalize_dns_name(&r.name);
+                    if rn != name {
+                        return true;
+                    }
+                    if let Some(want_ty) = &ty {
+                        let rty = r
+                            .record_type
+                            .as_deref()
+                            .map(|t| t.to_ascii_uppercase())
+                            .unwrap_or_else(|| "AUTO".into());
+                        if &rty != want_ty && !(rty == "AUTO" && (want_ty == "A" || want_ty == "AAAA")) {
+                            return true;
+                        }
+                    }
+                    if let Some(want_c) = content {
+                        let rty = r.record_type.as_deref().unwrap_or("");
+                        let rc = r.content.as_deref().unwrap_or("");
+                        if super::cloudflare::normalize_content(rty, rc)
+                            != super::cloudflare::normalize_content(rty, want_c)
+                        {
+                            return true;
+                        }
+                    }
+                    false
+                });
+                let diff = before - a.dns_records.len();
+                if diff == 0 {
+                    let in_cfg = a.config().map(|c| {
+                        c.http
+                            .iter()
+                            .flat_map(|h| h.domains.iter())
+                            .any(|d| crate::config::normalize_dns_name(d) == name)
+                            || c.dns
+                                .iter()
+                                .any(|d| crate::config::normalize_dns_name(&d.name) == name)
+                    }).unwrap_or(false);
+                    if in_cfg {
+                        bail!("'{name}' is defined in {app}'s latrix.toml — remove it there and redeploy");
+                    }
+                    bail!("no CLI-managed DNS record matching '{name}' on app '{app}'");
+                }
+                removed += diff;
+            }
+            Ok(removed)
+        })
+        .await?;
+
+    if added_n > 0 || removed_n > 0 {
+        agent.event(
+            "info",
+            format!("{app}: updated DNS records (+{added_n}/-{removed_n})"),
+        );
+        if agent.snapshot().cloudflare_token.is_some() {
+            let _ = super::cloudflare::sync_now(&agent).await;
+        }
+    }
+    Ok(Json(super::cloudflare::status_view(&agent)))
 }
 
 // ---------------------------------------------------------------------------

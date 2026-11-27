@@ -1545,6 +1545,7 @@ mod tests {
                 count,
                 created_at: 0,
                 last_builder: None,
+                dns_records: vec![],
             },
         );
     }

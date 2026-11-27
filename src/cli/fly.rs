@@ -7,7 +7,9 @@
 //!   machine's environment (Fly never returns secret values)
 //! * image: the deployed image, pulled with Docker after `fly auth docker`
 //!   (or `--from-source` to build from the current directory)
-//! * data: each volume is tarred on the machine and copied with sftp
+//! * data: each volume is streamed directly over SSH as a tar.gz (uses no
+//!   temp disk space on the Fly machine, falling back to recursive SFTP if
+//!   `tar` is not installed in the container)
 //! * domains: `fly certs list` → [http] domains (latrix gets new certificates)
 //!
 //! Everything is first written as a normal latrix backup file in
@@ -23,7 +25,7 @@ use crate::util::{self, now};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
@@ -325,6 +327,166 @@ fn save_image(image: &str, dest: &Path) -> Result<u64> {
     Ok(std::fs::metadata(dest)?.len())
 }
 
+/// Copy a gzip stream from `src` to `dst`, stripping any plain-text banner
+/// (such as "Connecting to ...") that `flyctl` might print before the gzip
+/// magic bytes `\x1f\x8b\x08`. Calls `on_progress(bytes)` as data arrives.
+pub fn copy_gzip_stream<R: Read, W: Write>(
+    mut src: R,
+    mut dst: W,
+    mut on_progress: impl FnMut(u64),
+) -> Result<u64> {
+    const MAGIC: [u8; 3] = [0x1f, 0x8b, 0x08];
+    let mut buf = [0u8; 65536];
+    let mut head: Vec<u8> = Vec::new();
+    let mut total = 0u64;
+    let mut found = false;
+
+    loop {
+        let n = src.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        if !found {
+            head.extend_from_slice(&buf[..n]);
+            if let Some(pos) = head.windows(3).position(|w| w == MAGIC) {
+                found = true;
+                let slice = &head[pos..];
+                dst.write_all(slice)?;
+                total += slice.len() as u64;
+                on_progress(total);
+                head.clear();
+            } else if head.len() > 8192 {
+                bail!(
+                    "expected a gzip tar stream from the Fly machine, got: {}",
+                    String::from_utf8_lossy(&head[..head.len().min(200)]).trim()
+                );
+            }
+        } else {
+            dst.write_all(&buf[..n])?;
+            total += n as u64;
+            on_progress(total);
+        }
+    }
+    if !found {
+        bail!(
+            "empty or non-gzip volume stream from the Fly machine{}",
+            if head.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", String::from_utf8_lossy(&head[..head.len().min(200)]).trim())
+            }
+        );
+    }
+    dst.flush()?;
+    Ok(total)
+}
+
+/// Verify a `.tar.gz` file decompresses cleanly to EOF (catches truncated streams).
+pub fn verify_gzip(path: &Path) -> Result<()> {
+    let f = std::fs::File::open(path)?;
+    let mut gz = flate2::read::GzDecoder::new(f);
+    std::io::copy(&mut gz, &mut std::io::sink()).context("downloaded volume archive is truncated or corrupt")?;
+    Ok(())
+}
+
+/// Pack a local directory into a `.tar.gz` file (used by the SFTP fallback).
+fn pack_dir_tgz(dir: &Path, dest: &Path) -> Result<u64> {
+    let f = std::fs::File::create(dest)?;
+    let gz = flate2::write::GzEncoder::new(f, flate2::Compression::fast());
+    let mut tar = tar::Builder::new(gz);
+    tar.follow_symlinks(false);
+    tar.append_dir_all(".", dir)?;
+    let gz = tar.into_inner()?;
+    gz.finish()?.flush()?;
+    Ok(std::fs::metadata(dest)?.len())
+}
+
+/// Stream a Fly volume straight to a local `.tar.gz` without writing any
+/// temporary file on the Fly machine (Fly's rootfs/tmp is often much smaller
+/// than mounted volumes). Falls back to `fly ssh sftp get -R` if `tar` is not
+/// installed in the container.
+fn copy_volume_from_fly(bin: &str, app: &str, remote_path: &str, dest: &Path, work: &Path) -> Result<u64> {
+    let cmd = format!("tar czf - -C {} .", util::shell_quote(remote_path));
+    let mut child = std::process::Command::new(bin)
+        .args(["ssh", "console", "--pty=false", "-q", "-a", app, "-C", &cmd])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("running {bin} ssh console"))?;
+
+    let mut stderr_pipe = child.stderr.take().unwrap();
+    let stderr_thread = std::thread::spawn(move || {
+        let mut s = String::new();
+        let _ = stderr_pipe.read_to_string(&mut s);
+        s
+    });
+
+    let stdout_pipe = child.stdout.take().unwrap();
+    let show_progress = super::deploy::tty_width().is_some();
+    let mut last_print = std::time::Instant::now();
+    let stream_res = (|| -> Result<u64> {
+        let f = std::fs::File::create(dest)?;
+        let n = copy_gzip_stream(stdout_pipe, f, |bytes| {
+            if show_progress && last_print.elapsed() >= std::time::Duration::from_millis(250) {
+                print!("\r    streaming {:.1} MB...", bytes as f64 / 1048576.0);
+                let _ = std::io::stdout().flush();
+                last_print = std::time::Instant::now();
+            }
+        })?;
+        Ok(n)
+    })();
+    if show_progress {
+        print!("\r                        \r");
+        let _ = std::io::stdout().flush();
+    }
+
+    let status = child.wait()?;
+    let stderr = stderr_thread.join().unwrap_or_default();
+    let stderr_trim = stderr.trim();
+
+    let missing_tar = !status.success()
+        && (stderr_trim.contains("executable file not found")
+            || stderr_trim.contains("tar: not found")
+            || (stderr_trim.contains("tar") && stderr_trim.contains("No such file or directory")));
+
+    if missing_tar {
+        let _ = std::fs::remove_file(dest);
+        println!("    (`tar` not found in the Fly container; falling back to recursive SFTP)");
+        let sftp_dir = work.join(format!("sftp-{}", util::random_id(6)));
+        fly(bin, &["ssh", "sftp", "get", "-R", remote_path, &sftp_dir.display().to_string(), "-a", app])
+            .context("could not copy the volume over SFTP from the Fly machine (is it running?)")?;
+        let n = pack_dir_tgz(&sftp_dir, dest)?;
+        let _ = std::fs::remove_dir_all(&sftp_dir);
+        return Ok(n);
+    }
+
+    // GNU tar exits with status 1 when a file changes while being read (common on live apps).
+    let live_change_only = status.code() == Some(1)
+        && (stderr_trim.contains("file changed as we read it")
+            || stderr_trim.contains("file removed before we read it"));
+
+    if let Err(e) = stream_res {
+        let _ = std::fs::remove_file(dest);
+        if !stderr_trim.is_empty() {
+            bail!("could not stream volume {remote_path} from the Fly machine (is it running?): {stderr_trim}");
+        }
+        return Err(e).context("could not stream volume from the Fly machine (is it running?)");
+    }
+    if !status.success() && !live_change_only {
+        let _ = std::fs::remove_file(dest);
+        bail!(
+            "could not archive volume {remote_path} on the Fly machine (is it running?): {}",
+            if stderr_trim.is_empty() { format!("exit status {status}") } else { stderr_trim.to_string() }
+        );
+    }
+    verify_gzip(dest)?;
+    if live_change_only {
+        println!("    note: some files changed while reading {remote_path} (the app is still running)");
+    }
+    Ok(std::fs::metadata(dest)?.len())
+}
+
 pub struct ImportOptions {
     pub fly_app: String,
     pub name: Option<String>,
@@ -412,13 +574,8 @@ pub async fn import(cfg: &CliConfig, cl: Option<&str>, o: ImportOptions) -> Resu
     if !o.no_data {
         for v in &config.volumes {
             println!("==> copying volume '{}' ({})", v.name, v.path);
-            let remote = format!("/tmp/latrix-{}.tgz", v.name);
-            fly(bin, &["ssh", "console", "-a", app, "-C", &format!("tar czf {remote} -C {} .", v.path)])
-                .context("could not archive the volume on the Fly machine (is it running?)")?;
             let local = work.join(format!("vol-{}.tar.gz", v.name));
-            fly(bin, &["ssh", "sftp", "get", &remote, &local.display().to_string(), "-a", app])?;
-            let _ = fly(bin, &["ssh", "console", "-a", app, "-C", &format!("rm -f {remote}")]);
-            let size = std::fs::metadata(&local).map(|m| m.len()).unwrap_or(0);
+            let size = copy_volume_from_fly(bin, app, &v.path, &local, &work)?;
             println!("    {:.1} MB", size as f64 / 1048576.0);
             let file = format!("volumes/{}.tar.gz", v.name);
             files.push((file.clone(), local));
@@ -438,6 +595,7 @@ pub async fn import(cfg: &CliConfig, cl: Option<&str>, o: ImportOptions) -> Resu
         secrets: secrets.clone(),
         count: config.scale.count.unwrap_or(1),
         volumes,
+        dns_records: vec![],
     };
     let archive = backup::default_dir().join(format!("fly-{app}-{}.latrix-backup.tar", backup::stamp(now())));
     backup::write_archive(&archive, &manifest, &files)?;
@@ -584,5 +742,41 @@ primary_region = "ams"
         let m = json!([{"state": "started", "config": {"metadata": {"fly_process_group": "app"}}}, {"state": "stopped", "config": {"metadata": {"fly_process_group": "worker"}}}, {"state": "destroyed"}]);
         assert_eq!(count_machines(&m), 1);
         assert_eq!(hostnames(&json!([{"Hostname": "shop.com"}, {"Hostname": "x.fly.dev"}])), vec!["shop.com"]);
+    }
+
+    #[test]
+    fn streams_gzip_with_or_without_banner() {
+        let mut gz_bytes = Vec::new();
+        {
+            let mut enc = flate2::write::GzEncoder::new(&mut gz_bytes, flate2::Compression::fast());
+            enc.write_all(b"hello volume data").unwrap();
+            enc.finish().unwrap();
+        }
+        // Pure gzip stream
+        let mut out = Vec::new();
+        let n = copy_gzip_stream(gz_bytes.as_slice(), &mut out, |_| {}).unwrap();
+        assert_eq!(n as usize, gz_bytes.len());
+        assert_eq!(out, gz_bytes);
+
+        // With leading flyctl banner text before the gzip bytes
+        let mut prefixed = b"Connecting to fdaa:8:7bb3::2...\n".to_vec();
+        prefixed.extend_from_slice(&gz_bytes);
+        let mut out2 = Vec::new();
+        copy_gzip_stream(prefixed.as_slice(), &mut out2, |_| {}).unwrap();
+        assert_eq!(out2, gz_bytes);
+
+        // Non-gzip output fails cleanly
+        let mut out3 = Vec::new();
+        assert!(copy_gzip_stream(&b"Error: something went wrong\n"[..], &mut out3, |_| {}).is_err());
+
+        // verify_gzip catches truncated archive
+        let dir = backup::temp_dir("fly-gz-test").unwrap();
+        let ok_path = dir.join("ok.tgz");
+        std::fs::write(&ok_path, &gz_bytes).unwrap();
+        verify_gzip(&ok_path).unwrap();
+        let bad_path = dir.join("bad.tgz");
+        std::fs::write(&bad_path, &gz_bytes[..gz_bytes.len() - 4]).unwrap();
+        assert!(verify_gzip(&bad_path).is_err());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
